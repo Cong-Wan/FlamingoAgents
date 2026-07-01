@@ -1,29 +1,31 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
+Version: 1.1
+Date: 2026-07-01
 Description: Routes validated tool calls through guard checks and concrete tool implementations.
 '''
 
 from __future__ import annotations
 
-from agentTypes import toolCall, toolExecutionContext, toolResult
-from toolGuard import checkToolCall
-from toolRegistry import toolRegistry
+from flamingoAgents.core.types import toolCall, toolContext, toolResult
+from flamingoAgents.tools.guard import checkToolCall
+from flamingoAgents.tools.registry import registry
 
 
-class deletionConfirmationNeeded(Exception):
+class confirmationNeeded(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
 
 
-class toolRouter:
-    def __init__(self, registry: toolRegistry, context: toolExecutionContext):
+class router:
+    def __init__(self, registry: registry, context: toolContext):
         self.registry = registry
         self.context = context
 
     def executeTool(self, call: toolCall, approvedDeletion: bool = False) -> toolResult:
+        if self.context.debugConsole:
+            self.context.debugConsole.debug(f'路由工具调用 tool={call.toolName} callId={call.id}')
         definition = self.registry.get(call.toolName)
         if definition is None:
             return toolResult(
@@ -44,12 +46,14 @@ class toolRouter:
 
         guard = checkToolCall(call)
         if guard.requiresConfirmation and not approvedDeletion:
-            raise deletionConfirmationNeeded(guard.reason)
+            raise confirmationNeeded(guard.reason)
 
         try:
             result = definition.execute(call.arguments, self.context)
             result.toolCallId = call.id
             result.toolName = call.toolName
+            if self.context.debugConsole:
+                self.context.debugConsole.debug(f'工具返回 tool={call.toolName} callId={call.id} isError={result.isError}')
             return result
         except Exception as error:
             return toolResult(

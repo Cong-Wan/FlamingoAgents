@@ -1,28 +1,28 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
+Version: 1.1
+Date: 2026-07-01
 Description: Registers local tools and exposes OpenAI-compatible tool schemas.
 '''
 
 from __future__ import annotations
 
-from agentTypes import toolDefinition
-from bashTool import executeBash
-from fileTools import executeEdit, executeRead, executeWrite
+from flamingoAgents.core.types import toolSpec
+from flamingoAgents.tools.bash import executeBash
+from flamingoAgents.tools.file import executeEdit, executeRead, executeWrite
 
 
-class toolRegistry:
+class registry:
     def __init__(self):
-        self.tools: dict[str, toolDefinition] = {}
+        self.tools: dict[str, toolSpec] = {}
 
-    def register(self, definition: toolDefinition) -> None:
+    def register(self, definition: toolSpec) -> None:
         self.tools[definition.name] = definition
 
-    def get(self, name: str) -> toolDefinition | None:
+    def get(self, name: str) -> toolSpec | None:
         return self.tools.get(name)
 
-    def listDefinitions(self) -> list[toolDefinition]:
+    def listDefinitions(self) -> list[toolSpec]:
         return list(self.tools.values())
 
     def listModelTools(self) -> list[dict]:
@@ -39,9 +39,9 @@ class toolRegistry:
         return modelTools
 
 
-def createDefaultToolRegistry() -> toolRegistry:
-    registry = toolRegistry()
-    registry.register(toolDefinition(
+def createDefaultRegistry() -> registry:
+    catalog = registry()
+    catalog.register(toolSpec(
         name='read',
         description='读取本地文本文件，可通过 offset 和 limit 控制读取的行范围。',
         parameters={
@@ -56,7 +56,7 @@ def createDefaultToolRegistry() -> toolRegistry:
         },
         execute=executeRead,
     ))
-    registry.register(toolDefinition(
+    catalog.register(toolSpec(
         name='write',
         description='创建或完整覆盖本地文本文件。',
         parameters={
@@ -70,7 +70,7 @@ def createDefaultToolRegistry() -> toolRegistry:
         },
         execute=executeWrite,
     ))
-    registry.register(toolDefinition(
+    catalog.register(toolSpec(
         name='edit',
         description='对已有文本文件进行精确文本替换。每个 oldText 必须唯一匹配。',
         parameters={
@@ -96,7 +96,7 @@ def createDefaultToolRegistry() -> toolRegistry:
         },
         execute=executeEdit,
     ))
-    registry.register(toolDefinition(
+    catalog.register(toolSpec(
         name='bash',
         description='在工作目录中执行原生 bash 命令。curl、python、grep、open 均通过此工具执行。',
         parameters={
@@ -110,4 +110,4 @@ def createDefaultToolRegistry() -> toolRegistry:
         },
         execute=executeBash,
     ))
-    return registry
+    return catalog

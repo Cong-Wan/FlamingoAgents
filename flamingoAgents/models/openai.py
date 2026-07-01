@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
+Version: 1.1
+Date: 2026-07-01
 Description: Converts internal messages and tools to OpenAI-compatible chat completion requests.
 '''
 
@@ -13,13 +13,13 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from agentTypes import chatMessage, modelConfig, toolCall
+from flamingoAgents.core.types import chatMessage, modelConfig, toolCall
 
 
-class openaiCompatibleAdapter:
-    def __init__(self, config: modelConfig, debugPrinter=None):
+class openaiAdapter:
+    def __init__(self, config: modelConfig, debugConsole=None):
         self.config = config
-        self.debugPrinter = debugPrinter
+        self.debugConsole = debugConsole
 
     def complete(self, messages: list[chatMessage], tools: list[dict[str, Any]]) -> chatMessage:
         apiKey = os.getenv(self.config.apiKeyEnv, '').strip()
@@ -43,8 +43,11 @@ class openaiCompatibleAdapter:
                 'Content-Type': 'application/json',
             },
         )
-        if self.debugPrinter:
-            self.debugPrinter.debug(f'调用模型：provider={self.config.provider} model={self.config.model}')
+        if self.debugConsole:
+            self.debugConsole.debug(
+                f'调用模型 provider={self.config.provider} model={self.config.model} '
+                f'messages={len(messages)} tools={len(tools)} url={requestUrl}'
+            )
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 responseText = response.read().decode('utf-8')

@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
-Description: Executes bash commands with timeout, captured output, and truncated previews.
+Version: 1.1
+Date: 2026-07-01
+Description: Executes bash commands with timeout, captured output, debug logs, and truncated previews.
 '''
 
 from __future__ import annotations
@@ -10,14 +10,14 @@ from __future__ import annotations
 import subprocess
 from typing import Any
 
-from agentTypes import toolExecutionContext, toolResult
-from jsonlLogger import makePreview
+from flamingoAgents.core.types import toolContext, toolResult
+from flamingoAgents.utils.jsonl import makePreview
 
 maxTimeoutSeconds = 120
 defaultTimeoutSeconds = 30
 
 
-def executeBash(arguments: dict[str, Any], context: toolExecutionContext) -> toolResult:
+def executeBash(arguments: dict[str, Any], context: toolContext) -> toolResult:
     command = arguments.get('command')
     if not isinstance(command, str) or not command.strip():
         return toolResult('', 'bash', True, 'bash.command 必须是非空字符串。')
@@ -28,8 +28,8 @@ def executeBash(arguments: dict[str, Any], context: toolExecutionContext) -> too
     if timeout > maxTimeoutSeconds:
         timeout = maxTimeoutSeconds
 
-    if context.debugPrinter:
-        context.debugPrinter.debug(f'执行 bash：{command}')
+    if context.debugConsole:
+        context.debugConsole.debug(f'执行 bash：{command}')
 
     try:
         completedProcess = subprocess.run(

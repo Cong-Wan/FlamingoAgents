@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
-Description: Provides --debug controlled diagnostic printing for the agent.
+Version: 1.1
+Date: 2026-07-01
+Description: Provides --debug controlled diagnostic printing for Flamingo Agents.
 '''
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from datetime import datetime
 
 
 @dataclass
-class debugPrinter:
+class debugConsole:
     isDebug: bool = False
 
     def debug(self, message: str) -> None:

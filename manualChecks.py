@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
-Description: Runs framework-free manual validation checks for the system tool chat agent.
+Version: 1.1
+Date: 2026-07-01
+Description: Runs framework-free manual validation checks for Flamingo Agents.
 '''
 
 from __future__ import annotations
@@ -16,20 +16,20 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from agentCore import agentCore
-from agentTypes import chatMessage, toolCall, toolExecutionContext
-from agentTypes import modelConfig
-from bashTool import executeBash
-from debugPrinter import debugPrinter
-from fileTools import executeEdit, executeRead, executeWrite
-from httpServer import makeHttpHandler
-from jsonlLogger import jsonlLogger
-from openaiAdapter import openaiCompatibleAdapter
-from toolGuard import detectDeletionCommand
-from toolRegistry import createDefaultToolRegistry
+from flamingoAgents.core.agent import agent
+from flamingoAgents.core.types import chatMessage, toolCall, toolContext
+from flamingoAgents.core.types import modelConfig
+from flamingoAgents.tools.bash import executeBash
+from flamingoAgents.utils.debug import debugConsole
+from flamingoAgents.tools.file import executeEdit, executeRead, executeWrite
+from flamingoAgents.app.server import makeHttpHandler
+from flamingoAgents.utils.jsonl import jsonlLog
+from flamingoAgents.models.openai import openaiAdapter
+from flamingoAgents.tools.guard import detectDeletionCommand
+from flamingoAgents.tools.registry import createDefaultRegistry
 
 
-class fakeModelAdapter:
+class fakeModel:
     def complete(self, messages: list[chatMessage], tools: list[dict[str, Any]]) -> chatMessage:
         lastMessage = messages[-1]
         if lastMessage.role == 'user' and 'read sample' in lastMessage.content:
@@ -76,9 +76,15 @@ def printPass(name: str) -> None:
     print(f'PASS {name}')
 
 
+def printDebug(debugEnabled: bool, message: str) -> None:
+    if debugEnabled:
+        print(f'[manual debug] {message}', flush=True)
+
+
 def runFileToolCheck(debugEnabled: bool) -> None:
+    printDebug(debugEnabled, '开始 file tools 检查')
     with tempfile.TemporaryDirectory() as tempDir:
-        context = toolExecutionContext(workDir=Path(tempDir), debugPrinter=debugPrinter(debugEnabled))
+        context = toolContext(workDir=Path(tempDir), debugConsole=debugConsole(debugEnabled))
         writeResult = executeWrite({'path': 'sample.txt', 'content': 'alpha sample\nbeta sample\n'}, context)
         expect(not writeResult.isError, writeResult.content)
         readResult = executeRead({'path': 'sample.txt', 'offset': 1, 'limit': 1}, context)
@@ -93,8 +99,9 @@ def runFileToolCheck(debugEnabled: bool) -> None:
 
 
 def runBashCheck(debugEnabled: bool) -> None:
+    printDebug(debugEnabled, '开始 bash 检查')
     with tempfile.TemporaryDirectory() as tempDir:
-        context = toolExecutionContext(workDir=Path(tempDir), debugPrinter=debugPrinter(debugEnabled))
+        context = toolContext(workDir=Path(tempDir), debugConsole=debugConsole(debugEnabled))
         okResult = executeBash({'command': 'printf hello', 'timeout': 5}, context)
         expect(not okResult.isError and 'hello' in okResult.content, okResult.content)
         timeoutResult = executeBash({'command': 'sleep 2', 'timeout': 1}, context)
@@ -121,7 +128,7 @@ def runGuardCheck() -> None:
 def runLoggerCheck() -> None:
     with tempfile.TemporaryDirectory() as tempDir:
         logPath = Path(tempDir) / 'agent.jsonl'
-        logger = jsonlLogger(logPath)
+        logger = jsonlLog(logPath)
         logger.logEvent({'type': 'sample', 'token': 'sk-12345678901234567890', 'content': 'x' * 4100})
         logText = logPath.read_text(encoding='utf-8')
         expect('<redacted>' in logText, 'secret 未脱敏')
@@ -130,7 +137,7 @@ def runLoggerCheck() -> None:
 
 
 def runAdapterParseCheck() -> None:
-    adapter = openaiCompatibleAdapter(modelConfig(
+    adapter = openaiAdapter(modelConfig(
         provider='openaiCompatible',
         model='manual-check-model',
         baseUrl='http://127.0.0.1:9/v1',
@@ -155,18 +162,19 @@ def runAdapterParseCheck() -> None:
     printPass('openai adapter parse')
 
 
-def buildFakeAgent(workDir: Path, debugEnabled: bool) -> agentCore:
-    return agentCore(
-        modelAdapter=fakeModelAdapter(),
-        registry=createDefaultToolRegistry(),
+def buildFakeAgent(workDir: Path, debugEnabled: bool) -> agent:
+    return agent(
+        modelAdapter=fakeModel(),
+        registry=createDefaultRegistry(),
         workDir=workDir,
         logDir=workDir / '.agentLogs',
-        debugPrinter=debugPrinter(debugEnabled),
+        debugConsole=debugConsole(debugEnabled),
         confirmDeletion=None,
     )
 
 
 def runAgentCheck(debugEnabled: bool) -> None:
+    printDebug(debugEnabled, '开始 agent 检查')
     with tempfile.TemporaryDirectory() as tempDir:
         workDir = Path(tempDir)
         (workDir / 'sample.txt').write_text('alpha sample\n', encoding='utf-8')
@@ -186,6 +194,7 @@ def runAgentCheck(debugEnabled: bool) -> None:
 
 
 def runHttpCheck(debugEnabled: bool) -> None:
+    printDebug(debugEnabled, '开始 http 检查')
     with tempfile.TemporaryDirectory() as tempDir:
         workDir = Path(tempDir)
         (workDir / 'sample.txt').write_text('alpha sample\n', encoding='utf-8')

@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
-Description: Provides local HTTP chat and confirmation endpoints backed by the shared agentCore.
+Version: 1.2
+Date: 2026-07-01
+Description: Provides local HTTP chat and confirmation endpoints with unified model config loading.
 '''
 
 from __future__ import annotations
@@ -13,11 +13,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from agentCore import agentCore
-from debugPrinter import debugPrinter
-from modelRegistry import loadModelConfigFromEnv
-from openaiAdapter import openaiCompatibleAdapter
-from toolRegistry import createDefaultToolRegistry
+from flamingoAgents.core.agent import agent
+from flamingoAgents.utils.debug import debugConsole
+from flamingoAgents.models.registry import loadModelConfig
+from flamingoAgents.models.openai import openaiAdapter
+from flamingoAgents.tools.registry import createDefaultRegistry
 
 
 def resultToDict(result) -> dict[str, Any]:
@@ -35,11 +35,13 @@ def resultToDict(result) -> dict[str, Any]:
     return data
 
 
-def makeHttpHandler(agent: agentCore):
+def makeHttpHandler(agent: agent):
     class agentHttpHandler(BaseHTTPRequestHandler):
-        server_version = 'SystemToolChatAgent/0.1'
+        server_version = 'FlamingoAgents/0.1'
 
         def do_POST(self) -> None:
+            if getattr(agent, 'debugConsole', None):
+                agent.debugConsole.debug(f'HTTP POST path={self.path}')
             if self.path == '/chat':
                 self.handleChat()
                 return
@@ -58,6 +60,8 @@ def makeHttpHandler(agent: agentCore):
             if sessionId is not None and not isinstance(sessionId, str):
                 self.respondJson(400, {'status': 'error', 'message': 'sessionId 必须是字符串。'})
                 return
+            if getattr(agent, 'debugConsole', None):
+                agent.debugConsole.debug(f'HTTP chat sessionId={sessionId or "<new>"} chars={len(message)}')
             result = agent.runUserMessage(message, sessionId=sessionId)
             statusCode = 200 if result.status != 'error' else 500
             self.respondJson(statusCode, resultToDict(result))
@@ -76,6 +80,8 @@ def makeHttpHandler(agent: agentCore):
             if not isinstance(approved, bool):
                 self.respondJson(400, {'status': 'error', 'message': 'approved 必须是布尔值。'})
                 return
+            if getattr(agent, 'debugConsole', None):
+                agent.debugConsole.debug(f'HTTP confirm sessionId={sessionId} confirmationId={confirmationId} approved={approved}')
             result = agent.continueConfirmation(sessionId, confirmationId, approved)
             statusCode = 200 if result.status != 'error' else 500
             self.respondJson(statusCode, resultToDict(result))
@@ -98,29 +104,29 @@ def makeHttpHandler(agent: agentCore):
             self.wfile.write(responseBytes)
 
         def log_message(self, format: str, *args) -> None:
-            if getattr(agent, 'debugPrinter', None) and agent.debugPrinter.isDebug:
+            if getattr(agent, 'debugConsole', None) and agent.debugConsole.isDebug:
                 super().log_message(format, *args)
 
     return agentHttpHandler
 
 
-def buildAgent(debugEnabled: bool, workDir: Path) -> agentCore:
-    printer = debugPrinter(debugEnabled)
-    config = loadModelConfigFromEnv()
-    adapter = openaiCompatibleAdapter(config, printer)
-    registry = createDefaultToolRegistry()
-    return agentCore(
+def buildAgent(debugEnabled: bool, workDir: Path) -> agent:
+    printer = debugConsole(debugEnabled)
+    config = loadModelConfig()
+    adapter = openaiAdapter(config, printer)
+    registry = createDefaultRegistry()
+    return agent(
         modelAdapter=adapter,
         registry=registry,
         workDir=workDir,
         logDir=workDir / '.agentLogs',
-        debugPrinter=printer,
+        debugConsole=printer,
         confirmDeletion=None,
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='本地系统工具对话 Agent HTTP 服务')
+    parser = argparse.ArgumentParser(description='Flamingo Agents HTTP 服务')
     parser.add_argument('--debug', action='store_true', help='启用详细调试输出')
     parser.add_argument('--host', default='127.0.0.1', help='监听地址')
     parser.add_argument('--port', type=int, default=8765, help='监听端口')

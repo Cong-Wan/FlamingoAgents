@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
+Version: 1.1
+Date: 2026-07-01
 Description: Writes JSONL audit events with preview truncation and obvious secret redaction.
 '''
 
@@ -53,7 +53,7 @@ def toJsonable(value: Any) -> Any:
     return value
 
 
-class jsonlLogger:
+class jsonlLog:
     def __init__(self, logPath: Path):
         self.logPath = logPath
         self.logPath.parent.mkdir(parents=True, exist_ok=True)

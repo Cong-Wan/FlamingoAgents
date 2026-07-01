@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
+Version: 1.1
+Date: 2026-07-01
 Description: Defines shared lower-camel-case data structures for messages, tools, models, and agent results.
 '''
 
@@ -41,17 +41,17 @@ class toolResult:
 
 
 @dataclass
-class toolExecutionContext:
+class toolContext:
     workDir: Path
-    debugPrinter: Any | None = None
+    debugConsole: Any | None = None
 
 
 @dataclass
-class toolDefinition:
+class toolSpec:
     name: str
     description: str
     parameters: dict[str, Any]
-    execute: Callable[[dict[str, Any], toolExecutionContext], toolResult]
+    execute: Callable[[dict[str, Any], toolContext], toolResult]
 
 
 @dataclass
@@ -65,7 +65,7 @@ class modelConfig:
 
 
 @dataclass
-class agentRunResult:
+class runResult:
     sessionId: str
     status: agentStatus
     message: str = ''
@@ -76,7 +76,7 @@ class agentRunResult:
 
 
 @dataclass
-class pendingConfirmation:
+class pendingConfirm:
     sessionId: str
     confirmationId: str
     reason: str

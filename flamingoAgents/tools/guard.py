@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
+Version: 1.1
+Date: 2026-07-01
 Description: Detects deletion-related shell commands before bash execution.
 '''
 
@@ -10,11 +10,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from agentTypes import toolCall, toolResult
+from flamingoAgents.core.types import toolCall, toolResult
 
 
 @dataclass
-class guardResult:
+class guardDecision:
     allowed: bool
     requiresConfirmation: bool = False
     reason: str = ''
@@ -38,17 +38,17 @@ def detectDeletionCommand(command: str) -> bool:
     return any(pattern.search(commandText) for pattern in deletePatterns)
 
 
-def checkToolCall(call: toolCall) -> guardResult:
+def checkToolCall(call: toolCall) -> guardDecision:
     if call.toolName != 'bash':
-        return guardResult(allowed=True)
+        return guardDecision(allowed=True)
     command = str(call.arguments.get('command', ''))
     if detectDeletionCommand(command):
-        return guardResult(
+        return guardDecision(
             allowed=False,
             requiresConfirmation=True,
             reason='删除命令需要用户确认',
         )
-    return guardResult(allowed=True)
+    return guardDecision(allowed=True)
 
 
 def makeBlockedToolResult(call: toolCall, reason: str) -> toolResult:

@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
-Description: Provides the command-line chat entrypoint backed by the shared agentCore.
+Version: 1.2
+Date: 2026-07-01
+Description: Provides the command-line chat entrypoint for Flamingo Agents with unified model config loading.
 '''
 
 from __future__ import annotations
@@ -10,12 +10,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from agentCore import agentCore
-from agentTypes import toolCall
-from debugPrinter import debugPrinter
-from modelRegistry import loadModelConfigFromEnv
-from openaiAdapter import openaiCompatibleAdapter
-from toolRegistry import createDefaultToolRegistry
+from flamingoAgents.core.agent import agent
+from flamingoAgents.core.types import toolCall
+from flamingoAgents.utils.debug import debugConsole
+from flamingoAgents.models.registry import loadModelConfig
+from flamingoAgents.models.openai import openaiAdapter
+from flamingoAgents.tools.registry import createDefaultRegistry
 
 
 def askDeletionConfirmation(call: toolCall, reason: str) -> bool:
@@ -27,23 +27,23 @@ def askDeletionConfirmation(call: toolCall, reason: str) -> bool:
     return answer in {'y', 'yes'}
 
 
-def buildAgent(debugEnabled: bool, workDir: Path) -> agentCore:
-    printer = debugPrinter(debugEnabled)
-    config = loadModelConfigFromEnv()
-    adapter = openaiCompatibleAdapter(config, printer)
-    registry = createDefaultToolRegistry()
-    return agentCore(
+def buildAgent(debugEnabled: bool, workDir: Path) -> agent:
+    printer = debugConsole(debugEnabled)
+    config = loadModelConfig()
+    adapter = openaiAdapter(config, printer)
+    registry = createDefaultRegistry()
+    return agent(
         modelAdapter=adapter,
         registry=registry,
         workDir=workDir,
         logDir=workDir / '.agentLogs',
-        debugPrinter=printer,
+        debugConsole=printer,
         confirmDeletion=askDeletionConfirmation,
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='本地系统工具对话 Agent CLI')
+    parser = argparse.ArgumentParser(description='Flamingo Agents CLI')
     parser.add_argument('--debug', action='store_true', help='启用详细调试输出')
     parser.add_argument('--session-id', default='cliSession', help='CLI 会话 ID')
     parser.add_argument('--work-dir', default='.', help='工具执行工作目录')
@@ -52,7 +52,9 @@ def main() -> None:
     workDir = Path(args.work_dir).resolve()
     agent = buildAgent(args.debug, workDir)
     sessionId = args.session_id
-    print('系统工具对话 Agent 已启动。输入 /help 查看命令，输入 /exit 退出。')
+    printer = agent.debugConsole
+    printer.debug(f'CLI 启动 workDir={workDir} sessionId={sessionId}')
+    print('Flamingo Agents 已启动。输入 /help 查看命令，输入 /exit 退出。')
     while True:
         userInput = input('你> ').strip()
         if not userInput:
@@ -61,8 +63,10 @@ def main() -> None:
             print('已退出。')
             return
         if userInput == '/help':
-            print('/exit 退出；/help 查看帮助；其他输入会发送给 Agent。')
+            print('/exit 退出；/help 查看帮助；其他输入会发送给 Flamingo Agents。')
             continue
+        if args.debug:
+            print(f'[debug input] sessionId={sessionId} chars={len(userInput)}', flush=True)
         result = agent.runUserMessage(userInput, sessionId=sessionId)
         if result.status == 'completed':
             print(f'Agent> {result.message}')

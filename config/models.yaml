@@ -1,0 +1,24 @@
+providers:
+  "101":
+    baseUrl: http://192.168.0.101:8080/v1
+    api: openai-completions
+    apiKey: llama.cpp
+    compat:
+      supportsDeveloperRole: false
+      supportsReasoningEffort: false
+      supportsUsageInStreaming: false
+      maxTokensField: max_tokens
+      supportsStrictMode: false
+    models:
+      - id: Qwen3.6-27B-MTP-IQ4_KS
+        name: Qwen3.6 27B MTP IQ4_KS - LAN
+        input:
+          - text
+        contextWindow: 98304
+        maxTokens: 65536
+        reasoning: false
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0

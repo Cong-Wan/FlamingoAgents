@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
+Version: 1.1
+Date: 2026-07-01
 Description: Maintains in-memory conversation state and mirrors key events to JSONL logs.
 '''
 
@@ -9,14 +9,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agentTypes import chatMessage, toolResult
-from jsonlLogger import jsonlLogger, makePreview
+from flamingoAgents.core.types import chatMessage, toolResult
+from flamingoAgents.utils.jsonl import jsonlLog, makePreview
 
 
-class conversationManager:
+class conversation:
     def __init__(self, sessionId: str, logPath: Path, systemPrompt: str):
         self.sessionId = sessionId
-        self.logger = jsonlLogger(logPath)
+        self.logger = jsonlLog(logPath)
         self.messages: list[chatMessage] = []
         self.addMessage(chatMessage(role='system', content=systemPrompt))
 

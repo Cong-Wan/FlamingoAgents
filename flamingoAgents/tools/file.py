@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-06-29
-Description: Implements read, write, and edit tools for local text files.
+Version: 1.1
+Date: 2026-07-01
+Description: Implements read, write, and edit tools for local text files with debug logs.
 '''
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ import difflib
 from pathlib import Path
 from typing import Any
 
-from agentTypes import toolExecutionContext, toolResult
-from jsonlLogger import makePreview
+from flamingoAgents.core.types import toolContext, toolResult
+from flamingoAgents.utils.jsonl import makePreview
 
 
 def normalizePath(pathValue: str, workDir: Path) -> Path:
@@ -22,7 +22,7 @@ def normalizePath(pathValue: str, workDir: Path) -> Path:
     return path
 
 
-def executeRead(arguments: dict[str, Any], context: toolExecutionContext) -> toolResult:
+def executeRead(arguments: dict[str, Any], context: toolContext) -> toolResult:
     pathValue = arguments.get('path')
     if not isinstance(pathValue, str) or not pathValue.strip():
         return toolResult('', 'read', True, 'read.path 必须是非空字符串。')
@@ -33,6 +33,8 @@ def executeRead(arguments: dict[str, Any], context: toolExecutionContext) -> too
         return toolResult('', 'read', True, 'read.offset 和 read.limit 必须大于 0。')
 
     path = normalizePath(pathValue, context.workDir)
+    if context.debugConsole:
+        context.debugConsole.debug(f'读取文件 path={path} offset={offset} limit={limit}')
     if not path.exists() or not path.is_file():
         return toolResult('', 'read', True, f'文件不存在或不是普通文件：{path}')
 
@@ -58,7 +60,7 @@ def executeRead(arguments: dict[str, Any], context: toolExecutionContext) -> too
     )
 
 
-def executeWrite(arguments: dict[str, Any], context: toolExecutionContext) -> toolResult:
+def executeWrite(arguments: dict[str, Any], context: toolContext) -> toolResult:
     pathValue = arguments.get('path')
     content = arguments.get('content')
     if not isinstance(pathValue, str) or not pathValue.strip():
@@ -67,6 +69,8 @@ def executeWrite(arguments: dict[str, Any], context: toolExecutionContext) -> to
         return toolResult('', 'write', True, 'write.content 必须是字符串。')
 
     path = normalizePath(pathValue, context.workDir)
+    if context.debugConsole:
+        context.debugConsole.debug(f'写入文件 path={path} bytes={len(content.encode("utf-8"))}')
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding='utf-8')
     previewText, truncated = makePreview(content)
@@ -84,7 +88,7 @@ def executeWrite(arguments: dict[str, Any], context: toolExecutionContext) -> to
     )
 
 
-def executeEdit(arguments: dict[str, Any], context: toolExecutionContext) -> toolResult:
+def executeEdit(arguments: dict[str, Any], context: toolContext) -> toolResult:
     pathValue = arguments.get('path')
     edits = arguments.get('edits')
     if not isinstance(pathValue, str) or not pathValue.strip():
@@ -93,6 +97,8 @@ def executeEdit(arguments: dict[str, Any], context: toolExecutionContext) -> too
         return toolResult('', 'edit', True, 'edit.edits 必须是非空数组。')
 
     path = normalizePath(pathValue, context.workDir)
+    if context.debugConsole:
+        context.debugConsole.debug(f'编辑文件 path={path} editCount={len(edits)}')
     if not path.exists() or not path.is_file():
         return toolResult('', 'edit', True, f'文件不存在或不是普通文件：{path}')
 
