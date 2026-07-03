@@ -1,15 +1,11 @@
 [project]
 name = "flamingo-agents"
 version = "0.1.0"
-description = "Local Flamingo Agents with CLI and HTTP entrypoints"
+description = "Local Flamingo Agents as a pure library"
 requires-python = ">=3.12"
 dependencies = [
     "pyyaml>=6.0.3",
 ]
-
-[project.scripts]
-flamingo-agents = "flamingoAgents.app.cli:main"
-flamingo-agents-server = "flamingoAgents.app.server:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,8 +1,12 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-07-01
-Description: Exposes package metadata for Flamingo Agents after package restructuring.
+Version: 1.2
+Date: 2026-07-02
+Description: Exposes the pure-library public API for Flamingo Agents.
 '''
 
+from flamingoAgents.builder import createAgent
+
 packageVersion = '0.1.0'
+
+__all__ = ['createAgent', 'packageVersion']

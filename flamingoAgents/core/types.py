@@ -1,15 +1,15 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-07-01
-Description: Defines shared lower-camel-case data structures for messages, tools, models, and agent results.
+Version: 1.2
+Date: 2026-07-02
+Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, and agent results.
 '''
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 messageRole = Literal['system', 'user', 'assistant', 'tool']
 agentStatus = Literal['completed', 'confirmationRequired', 'error']
@@ -47,24 +47,6 @@ class toolContext:
 
 
 @dataclass
-class toolSpec:
-    name: str
-    description: str
-    parameters: dict[str, Any]
-    execute: Callable[[dict[str, Any], toolContext], toolResult]
-
-
-@dataclass
-class modelConfig:
-    provider: str
-    model: str
-    baseUrl: str
-    apiKeyEnv: str
-    apiType: str
-    supportsToolCalling: bool = True
-
-
-@dataclass
 class runResult:
     sessionId: str
     status: agentStatus
@@ -80,4 +62,5 @@ class pendingConfirm:
     sessionId: str
     confirmationId: str
     reason: str
-    toolCall: toolCall
+    toolCalls: list[toolCall]
+    currentIndex: int

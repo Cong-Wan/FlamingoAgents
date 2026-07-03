@@ -1,31 +1,45 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-07-01
-Description: Converts internal messages and tools to OpenAI-compatible chat completion requests.
+Version: 1.4
+Date: 2026-07-02
+Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth.
 '''
 
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
 
-from flamingoAgents.core.types import chatMessage, modelConfig, toolCall
+from flamingoAgents.core.types import chatMessage, toolCall
+from flamingoAgents.models.modelAuth import modelAuth
+from flamingoAgents.models.modelConfig import modelConfig
 
 
-class openaiAdapter:
-    def __init__(self, config: modelConfig, debugConsole=None):
+@dataclass
+class modelCompletion:
+    message: chatMessage
+    requestPayload: dict[str, Any]
+    responsePayload: dict[str, Any]
+
+
+class modelRequestError(Exception):
+    def __init__(self, message: str, requestPayload: dict[str, Any], statusCode: int | None = None, responseBody: str = ''):
+        super().__init__(message)
+        self.requestPayload = requestPayload
+        self.statusCode = statusCode
+        self.responseBody = responseBody
+
+
+class chatCompletionsAdapter:
+    def __init__(self, config: modelConfig, auth: modelAuth, debugConsole=None):
         self.config = config
+        self.auth = auth
         self.debugConsole = debugConsole
 
-    def complete(self, messages: list[chatMessage], tools: list[dict[str, Any]]) -> chatMessage:
-        apiKey = os.getenv(self.config.apiKeyEnv, '').strip()
-        if not apiKey:
-            raise RuntimeError(f'环境变量缺失：{self.config.apiKeyEnv}')
-
+    def complete(self, messages: list[chatMessage], tools: list[dict[str, Any]]) -> modelCompletion:
         requestPayload = {
             'model': self.config.model,
             'messages': [self.convertMessage(message) for message in messages],
@@ -39,7 +53,7 @@ class openaiAdapter:
             data=requestBytes,
             method='POST',
             headers={
-                'Authorization': f'Bearer {apiKey}',
+                'Authorization': self.auth.authorizationHeader,
                 'Content-Type': 'application/json',
             },
         )
@@ -53,12 +67,29 @@ class openaiAdapter:
                 responseText = response.read().decode('utf-8')
         except urllib.error.HTTPError as error:
             errorText = error.read().decode('utf-8', errors='replace')
-            raise RuntimeError(f'模型请求失败：status={error.code} body={errorText[:1000]}') from error
+            raise modelRequestError(
+                message=f'模型请求失败：status={error.code} body={errorText[:1000]}',
+                requestPayload=requestPayload,
+                statusCode=error.code,
+                responseBody=errorText,
+            ) from error
         except urllib.error.URLError as error:
-            raise RuntimeError(f'模型请求失败：{error.reason}') from error
+            raise modelRequestError(
+                message=f'模型请求失败：{error.reason}',
+                requestPayload=requestPayload,
+                statusCode=None,
+                responseBody=str(error.reason),
+            ) from error
 
         payload = json.loads(responseText)
-        return self.parseAssistantPayload(payload)
+        if self.debugConsole:
+            usage = payload.get('usage') if isinstance(payload, dict) else None
+            self.debugConsole.debug(f'模型响应完成 model={self.config.model} usage={usage}')
+        return modelCompletion(
+            message=self.parseAssistantPayload(payload),
+            requestPayload=requestPayload,
+            responsePayload=payload,
+        )
 
     def convertMessage(self, message: chatMessage) -> dict[str, Any]:
         if message.role == 'tool':
@@ -95,13 +126,23 @@ class openaiAdapter:
 
         parsedToolCalls: list[toolCall] = []
         rawToolCalls = rawMessage.get('tool_calls') or []
+        if not isinstance(rawToolCalls, list):
+            raise RuntimeError('模型响应 tool_calls 必须是数组。')
         for index, rawCall in enumerate(rawToolCalls):
+            if not isinstance(rawCall, dict):
+                raise RuntimeError(f'第 {index + 1} 个 tool_call 必须是对象。')
             functionValue = rawCall.get('function') or {}
+            if not isinstance(functionValue, dict):
+                raise RuntimeError(f'第 {index + 1} 个 tool_call.function 必须是对象。')
             argumentsText = functionValue.get('arguments') or '{}'
+            if not isinstance(argumentsText, str):
+                raise RuntimeError(f'第 {index + 1} 个 tool_call.arguments 必须是字符串。')
             try:
                 arguments = json.loads(argumentsText)
             except json.JSONDecodeError as error:
                 raise RuntimeError(f'第 {index + 1} 个 tool_call.arguments 不是合法 JSON。') from error
+            if not isinstance(arguments, dict):
+                raise RuntimeError(f'第 {index + 1} 个 tool_call.arguments 必须是 JSON 对象。')
             parsedToolCalls.append(toolCall(
                 id=rawCall.get('id') or f'call_{index + 1}',
                 toolName=functionValue.get('name') or '',

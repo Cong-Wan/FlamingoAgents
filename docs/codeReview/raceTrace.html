@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>agent 并发竞态推演 — 真实代码时间线</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --line:#2a2f3a; --txt:#e6e6e6; --mut:#8b93a1;
+          --a:#4aa3ff; --b:#ff9d5c; --bad:#ff5c6c; --good:#5cdb95; --warn:#ffd25c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+         line-height:1.6; padding:32px 20px 80px; }
+  .wrap { max-width:1180px; margin:0 auto; }
+  h1 { font-size:24px; margin:0 0 6px; }
+  h2 { font-size:18px; margin:34px 0 14px; padding-bottom:8px; border-bottom:1px solid var(--line); }
+  .sub { color:var(--mut); font-size:14px; margin-bottom:24px; }
+  .note { background:#1d2330; border-left:3px solid var(--warn); padding:12px 16px; border-radius:6px;
+          font-size:14px; color:#dfe4ee; margin:16px 0; }
+  .ok   { background:#15241c; border-left:3px solid var(--good); }
+  code,pre { font-family:"SF Mono",Menlo,Consolas,monospace; }
+  .inline-code { background:#21262f; padding:1px 6px; border-radius:4px; font-size:13px; color:#ffd25c; }
+
+  /* ---- 数据结构图 ---- */
+  .structs { display:flex; gap:14px; flex-wrap:wrap; }
+  .box { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; flex:1; min-width:240px; }
+  .box h3 { margin:0 0 8px; font-size:15px; color:#cfd6e2; }
+  .box .scope { font-size:12px; color:var(--mut); }
+  .tag { display:inline-block; font-size:11px; padding:2px 8px; border-radius:10px; margin-left:6px; }
+  .tag.shared { background:#3a2230; color:#ff9bb0; }
+  .tag.per    { background:#1f2f47; color:#9ccbff; }
+
+  /* ---- 时间线 ---- */
+  .tl { display:grid; grid-template-columns:1fr 1fr; gap:0; border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+  .col { padding:0; }
+  .colhead { padding:12px 16px; font-weight:700; font-size:15px; border-bottom:1px solid var(--line); }
+  .colA .colhead { background:linear-gradient(90deg,#16324d,#1a3a55); color:#cfe6ff; border-right:1px solid var(--line); }
+  .colB .colhead { background:linear-gradient(90deg,#3d2c18,#4a3520); color:#ffe6cc; }
+  .colB { border-left:1px solid var(--line); }
+  .step { padding:12px 16px; border-bottom:1px solid var(--line); }
+  .colA .step { border-right:1px solid var(--line); }
+  .step:last-child { border-bottom:none; }
+  .step .t { font-size:12px; color:var(--mut); margin-bottom:4px; letter-spacing:.5px; }
+  .step .desc { font-size:14px; margin-bottom:6px; }
+  .step pre { background:#0c0e12; border:1px solid #232833; border-radius:6px; padding:8px 10px; margin:6px 0 0; font-size:12.5px; overflow-x:auto; }
+  .step pre .ln { color:var(--mut); user-select:none; }
+  .crash { background:#2a1418 !important; }
+  .crash .desc { color:#ff9aa6; font-weight:700; }
+  .popmark { color:var(--b); }
+  .itermark { color:var(--a); }
+  .k { color:#7ee0ff; } /* keyword-ish */
+  .c { color:#9aa3b2; } /* comment */
+
+  .arrow { text-align:center; color:var(--bad); font-weight:700; margin:14px 0; font-size:18px; }
+
+  .legend { display:flex; gap:18px; flex-wrap:wrap; font-size:13px; color:var(--mut); margin:10px 0 0; }
+  .legend span b { color:var(--txt); }
+
+  .foot { color:var(--mut); font-size:13px; margin-top:30px; border-top:1px solid var(--line); padding-top:16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>agent 并发竞态推演</h1>
+  <div class="sub">基于当前 <span class="inline-code">flamingoAgents/core/agent.py</span> 真实行号 · 两个会话（s1 / s2）同时被两个线程处理</div>
+
+  <div class="legend">
+    <span>🟦 <b>线程 A</b>：处理会话 <b>s1</b>（<code>runUserMessage</code>）</span>
+    <span>🟧 <b>线程 B</b>：处理会话 <b>s2</b>（<code>continueConfirmation</code>）</span>
+    <span>🔴 = 崩溃点</span>
+  </div>
+
+  <!-- ============ 数据结构 ============ -->
+  <h2>① 先看共享数据 vs 锁的对应关系</h2>
+  <div class="structs">
+    <div class="box">
+      <h3>self.pendingConfirms <span class="tag shared">所有会话共用</span></h3>
+      <div class="scope">一个 agent 只此一份，里面装着 <b>所有</b> 会话的待确认项</div>
+      <pre><span class="c"># 形如：</span>
+{ 'confirm_real_s2': <span class="c"># 属于 s2</span>,
+  'confirm_probe'  : <span class="c"># 属于 s1</span> }</pre>
+    </div>
+    <div class="box">
+      <h3>self.sessionLocks <span class="tag per">每会话一把</span></h3>
+      <div class="scope">s1 有自己的锁，s2 有自己的锁，<b>互不相干</b></div>
+      <pre>{ 's1': RLock, 's2': RLock }</pre>
+    </div>
+  </div>
+  <div class="note">
+    <b>关键错配</b>：<span class="inline-code">pendingConfirms</span> 是<b>全 agent 共用</b>的一份字典，却没有任何「全局锁」保护；
+    代码只给了<b>每会话一把</b>的锁。s1 的锁管不到 s2 对这个共用字典的读写。
+  </div>
+
+  <!-- ============ 时间线 ============ -->
+  <h2>② 两个线程的真实交错时间线</h2>
+  <div class="tl">
+    <!-- 线程A -->
+    <div class="col colA">
+      <div class="colhead">🟦 线程 A — runUserMessage('hi', sessionId='s1')</div>
+
+      <div class="step">
+        <div class="t">A1 · L53</div>
+        <div class="desc">进入 <code>runUserMessage</code>，先取 s1 的锁</div>
+<pre>with self.getSessionLock(realSessionId):   <span class="c"># realSessionId = 's1'</span></pre>
+        <div class="desc" style="color:var(--good)">✅ 拿到 <b>s1 锁</b>，进入临界区</div>
+      </div>
+
+      <div class="step">
+        <div class="t">A2 · L54 → L203</div>
+        <div class="desc">检查 s1 有没有待确认项 —— 开始<b>遍历整个共用字典</b></div>
+<pre>if self.hasPendingConfirmation(realSessionId):   <span class="c"># L54</span>
+...
+def hasPendingConfirmation(self, sessionId):     <span class="c"># L202</span>
+    return <span class="itermark">any(p.sessionId == sessionId
+           for p in self.pendingConfirms.values())</span>  <span class="c"># L203 在遍历</span></pre>
+      </div>
+
+      <div class="step">
+        <div class="t">A3 · 遍历到一半</div>
+        <div class="desc"><span class="itermark">any()</span> 还在逐项遍历 <code>pendingConfirms</code>，此时 GIL 切换 / 探针暂停</div>
+        <div class="desc" style="color:var(--warn)">⏸ 线程 A 卡在<b>遍历中途</b>，字典迭代器还活着</div>
+<pre><span class="c"># A 持有：s1 锁</span>
+<span class="c"># A 正在：遍历 pendingConfirms（共用字典）</span></pre>
+      </div>
+
+      <div class="step crash">
+        <div class="t">A4 · 恢复遍历</div>
+        <div class="desc">💥 字典在这期间被 B 改过，迭代器下一拍直接抛异常</div>
+<pre><span class="k">RuntimeError</span>: dictionary changed size during iteration
+  <span class="c"># 在 L203 的 any(...) 内部抛出</span>
+  <span class="c"># runUserMessage 整个调用未捕获 → 冒泡给宿主</span></pre>
+      </div>
+    </div>
+
+    <!-- 线程B -->
+    <div class="col colB">
+      <div class="colhead">🟧 线程 B — continueConfirmation('s2', 'confirm_real_s2', True)</div>
+
+      <div class="step">
+        <div class="t">B1 · L67</div>
+        <div class="desc">进入 <code>continueConfirmation</code>，取 s2 的锁</div>
+<pre>with self.getSessionLock(sessionId):   <span class="c"># sessionId = 's2'</span></pre>
+        <div class="desc" style="color:var(--good)">✅ 拿到 <b>s2 锁</b> —— 注意：这跟 s1 锁<b>不是同一把</b>，<b>完全不阻塞 A</b></div>
+      </div>
+
+      <div class="step">
+        <div class="t">B2 · L68</div>
+        <div class="desc">从共用字典里查 s2 的待确认项</div>
+<pre>pending = self.pendingConfirms.get(confirmationId)   <span class="c"># L68</span></pre>
+      </div>
+
+      <div class="step">
+        <div class="t">B3 · L71 · 就在这一拍</div>
+        <div class="desc">删除该条目 —— <span class="popmark">改动</span>了 A 正在遍历的那个共用字典</div>
+<pre><span class="popmark">self.pendingConfirms.pop(confirmationId, None)</span>   <span class="c"># L71 改字典</span></pre>
+        <div class="desc" style="color:var(--b)">⚠ 此时 A 仍持有<b>活的迭代器</b>在遍历这个字典</div>
+      </div>
+
+      <div class="step">
+        <div class="t">B4 · 之后</div>
+        <div class="desc">B 继续执行（执行工具 / 跑模型循环），正常返回</div>
+<pre>result = self.executeToolCall(currentCall)   <span class="c"># L80</span>
+...
+return self.continueModelLoop(sessionId)     <span class="c"># L87</span></pre>
+        <div class="desc" style="color:var(--mut)">B 自己一路绿灯，根本不知道搞崩了 A</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow">↑ A3 暂停 ⇄ B3 改字典 ⇄ A4 恢复遍历 = 崩溃</div>
+
+  <!-- ============ 为什么锁没拦住 ============ -->
+  <h2>③ 为什么 s1/s2 两把锁拦不住这一撞</h2>
+  <div class="note">
+    <b>锁只能挡住「拿同一把锁的人」。</b> A 拿 <code>sessionLocks['s1']</code>，B 拿 <code>sessionLocks['s2']</code> —— 两把锁互不认识，
+    所以 B 可以<b>毫无阻碍</b>地进入自己的临界区，去 <code>pop</code> 那个<b>双方共用</b>的 <code>pendingConfirms</code> 字典。
+    <br><br>
+    一句话：<b>数据是「共用一份」，锁却是「一人一把」—— 锁的粒度比数据的共享范围小，挡不住跨会话的并发修改。</b>
+    <code>self.conversations</code>（<code>getConversation</code> 里的 get-then-create，L191–199）有同样的问题。
+  </div>
+
+  <h2>④ 真实复现结果（已跑过，非纸上谈兵）</h2>
+  <div class="ok note">
+    用<b>真实的 <code>agent</code> 类 + 真实的 <code>runUserMessage</code>/<code>continueConfirmation</code></b> 方法，两个线程一跑：
+    <pre style="margin-top:8px">线程A 结果： RuntimeError('dictionary changed size during iteration')</pre>
+  </div>
+
+  <h2>⑤ 结论</h2>
+  <div class="note">
+    这不是「要不要加锁」的口味问题，而是<b>一个确定的崩溃路径</b>：只要两个会话被两个线程<b>同时</b>处理，且一个在 <code>hasPendingConfirmation</code> 遍历、
+    另一个在 <code>continueConfirmation</code> 里 <code>pop</code>，就必然 <code>RuntimeError</code>。<br><br>
+    你的选择空间其实只有两个：<br>
+    <b>(1)</b> 这个库<b>就是单线程顺序用</b>的 → 在类注释里写明「非线程安全，宿主须串行调用」，代码一行不改。<br>
+    <b>(2)</b> 要<b>支持多会话并发</b> → 必须给两个共用字典配「agent 级」的保护，会话级锁解决不了它。
+  </div>
+
+  <div class="foot">
+    行号对应文件 <code>flamingoAgents/core/agent.py</code>（当前 HEAD）。复现脚本：两个线程 + Barrier 强制 A3/B3 交错。
+  </div>
+
+</div>
+</body>
+</html>

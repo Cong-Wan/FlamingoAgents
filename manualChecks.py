@@ -1,70 +1,64 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-07-01
-Description: Runs framework-free manual validation checks for Flamingo Agents.
+Version: 2.0
+Date: 2026-07-02
+Description: Framework-free manual validation entrypoint for the pure-library Flamingo Agents runtime, with --debug controlled output.
 '''
 
 from __future__ import annotations
 
 import argparse
-import http.client
-import json
-import tempfile
-import threading
-from http.server import ThreadingHTTPServer
+import os
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from flamingoAgents.core.agent import agent
 from flamingoAgents.core.types import chatMessage, toolCall, toolContext
-from flamingoAgents.core.types import modelConfig
-from flamingoAgents.tools.bash import executeBash
+from flamingoAgents.models.chatCompletions import chatCompletionsAdapter, modelCompletion
+from flamingoAgents.models.modelAuth import createModelAuth
+from flamingoAgents.models.modelConfig import loadModelConfigFromYaml, modelConfig
+from flamingoAgents.tools.toolConfig import loadToolConfig
+from flamingoAgents.tools.toolPolicy import evaluateToolCall
+from flamingoAgents.tools.toolRuntime import executeTool
+from flamingoAgents.tools.toolSchema import buildModelTools
 from flamingoAgents.utils.debug import debugConsole
-from flamingoAgents.tools.file import executeEdit, executeRead, executeWrite
-from flamingoAgents.app.server import makeHttpHandler
 from flamingoAgents.utils.jsonl import jsonlLog
-from flamingoAgents.models.openai import openaiAdapter
-from flamingoAgents.tools.guard import detectDeletionCommand
-from flamingoAgents.tools.registry import createDefaultRegistry
 
 
 class fakeModel:
-    def complete(self, messages: list[chatMessage], tools: list[dict[str, Any]]) -> chatMessage:
-        lastMessage = messages[-1]
-        if lastMessage.role == 'user' and 'read sample' in lastMessage.content:
-            return chatMessage(
-                role='assistant',
-                content='',
-                toolCalls=[toolCall(id='call_read_sample', toolName='read', arguments={'path': 'sample.txt'})],
+    def complete(self, messages: list[chatMessage], tools: list[dict[str, Any]]) -> modelCompletion:
+        last = messages[-1]
+        if last.role == 'user':
+            if 'read sample' in last.content:
+                return modelCompletion(
+                    message=chatMessage(role='assistant', content='', toolCalls=[toolCall('call_read', 'read', {'path': 'sample.txt'})]),
+                    requestPayload={},
+                    responsePayload={},
+                )
+            if 'delete sample' in last.content:
+                return modelCompletion(
+                    message=chatMessage(role='assistant', content='', toolCalls=[toolCall('call_delete', 'bash', {'command': 'rm sample.txt'})]),
+                    requestPayload={},
+                    responsePayload={},
+                )
+            if 'batch' in last.content:
+                return modelCompletion(
+                    message=chatMessage(role='assistant', content='', toolCalls=[
+                        toolCall('c1', 'read', {'path': 'sample.txt'}),
+                        toolCall('c2', 'bash', {'command': 'rm sample.txt'}),
+                        toolCall('c3', 'read', {'path': 'sample.txt'}),
+                    ]),
+                    requestPayload={},
+                    responsePayload={},
+                )
+        if last.role == 'tool' and 'alpha sample' in last.content:
+            return modelCompletion(
+                message=chatMessage(role='assistant', content='sample content: alpha sample'),
+                requestPayload={},
+                responsePayload={},
             )
-        if lastMessage.role == 'user' and 'delete sample' in lastMessage.content:
-            return chatMessage(
-                role='assistant',
-                content='',
-                toolCalls=[toolCall(id='call_delete_sample', toolName='bash', arguments={'command': 'rm sample.txt'})],
-            )
-        if lastMessage.role == 'user' and 'bash harmless' in lastMessage.content:
-            return chatMessage(
-                role='assistant',
-                content='',
-                toolCalls=[toolCall(id='call_bash_harmless', toolName='bash', arguments={'command': 'printf harmless', 'timeout': 5})],
-            )
-        if lastMessage.role == 'user' and 'curl fail' in lastMessage.content:
-            return chatMessage(
-                role='assistant',
-                content='',
-                toolCalls=[toolCall(id='call_curl_fail', toolName='bash', arguments={'command': 'curl -fsSL http://127.0.0.1:1', 'timeout': 5})],
-            )
-        if lastMessage.role == 'tool' and '命令已被用户拒绝' in lastMessage.content:
-            return chatMessage(role='assistant', content='删除已被拒绝，文件没有被删除。')
-        if lastMessage.role == 'tool' and 'alpha sample' in lastMessage.content:
-            return chatMessage(role='assistant', content='sample content: alpha sample')
-        if lastMessage.role == 'tool' and 'harmless' in lastMessage.content:
-            return chatMessage(role='assistant', content='bash result: harmless')
-        if lastMessage.role == 'tool' and lastMessage.name == 'bash':
-            return chatMessage(role='assistant', content='查询失败，未继续尝试绕过。')
-        return chatMessage(role='assistant', content='普通对话完成。')
+        return modelCompletion(message=chatMessage(role='assistant', content='done'), requestPayload={}, responsePayload={})
 
 
 def expect(condition: bool, message: str) -> None:
@@ -81,52 +75,69 @@ def printDebug(debugEnabled: bool, message: str) -> None:
         print(f'[manual debug] {message}', flush=True)
 
 
-def runFileToolCheck(debugEnabled: bool) -> None:
-    printDebug(debugEnabled, '开始 file tools 检查')
-    with tempfile.TemporaryDirectory() as tempDir:
-        context = toolContext(workDir=Path(tempDir), debugConsole=debugConsole(debugEnabled))
-        writeResult = executeWrite({'path': 'sample.txt', 'content': 'alpha sample\nbeta sample\n'}, context)
+def byName(definitions, name):
+    return next(definition for definition in definitions if definition.name == name)
+
+
+def runToolConfigCheck(debugEnabled: bool) -> None:
+    printDebug(debugEnabled, '开始 tool config 检查')
+    printer = debugConsole(debugEnabled)
+    definitions = loadToolConfig(debugConsole=printer)
+    expect({definition.name for definition in definitions} == {'read', 'write', 'edit', 'bash'}, '工具名集合不正确')
+    modelTools = buildModelTools(definitions)
+    expect(modelTools[0]['type'] == 'function', '模型工具 schema 包装不正确')
+    expect(all('permissions' not in tool['function'] for tool in modelTools), '模型 schema 泄漏了 permissions')
+    printPass('tool config')
+
+
+def runPermissionCheck(debugEnabled: bool) -> None:
+    printDebug(debugEnabled, '开始 permission policy 检查')
+    printer = debugConsole(debugEnabled)
+    definitions = loadToolConfig(debugConsole=printer)
+    bashDefinition = byName(definitions, 'bash')
+    readDefinition = byName(definitions, 'read')
+    expect(evaluateToolCall(bashDefinition, toolCall('a', 'bash', {'command': 'rm file'}), debugConsole=printer).requiresApproval is True, 'rm 未触发确认')
+    expect(evaluateToolCall(bashDefinition, toolCall('b', 'bash', {'command': 'grep keyword file'}), debugConsole=printer).requiresApproval is False, 'grep 被误判')
+    expect(evaluateToolCall(bashDefinition, toolCall('c', 'bash', {'command': 'find . -delete'}), debugConsole=printer).requiresApproval is True, 'find -delete 未触发确认')
+    expect(evaluateToolCall(readDefinition, toolCall('d', 'read', {'path': 'sample.txt'}), debugConsole=printer).requiresApproval is False, 'read 不应触发确认')
+    printPass('permission policy')
+
+
+def runToolRuntimeCheck(debugEnabled: bool) -> None:
+    printDebug(debugEnabled, '开始 tool runtime 检查')
+    printer = debugConsole(debugEnabled)
+    definitions = loadToolConfig(debugConsole=printer)
+    with TemporaryDirectory() as tempDir:
+        context = toolContext(workDir=Path(tempDir), debugConsole=printer)
+        writeDefinition = byName(definitions, 'write')
+        readDefinition = byName(definitions, 'read')
+        editDefinition = byName(definitions, 'edit')
+        bashDefinition = byName(definitions, 'bash')
+
+        writeResult = executeTool(writeDefinition, {'path': 'sample.txt', 'content': 'alpha\nbeta\n'}, context, 'call_write')
         expect(not writeResult.isError, writeResult.content)
-        readResult = executeRead({'path': 'sample.txt', 'offset': 1, 'limit': 1}, context)
-        expect('alpha sample' in readResult.content, readResult.content)
-        editResult = executeEdit({
-            'path': 'sample.txt',
-            'edits': [{'oldText': 'beta sample', 'newText': 'gamma sample'}],
-        }, context)
+        readResult = executeTool(readDefinition, {'path': 'sample.txt', 'offset': 1, 'limit': 1}, context, 'call_read')
+        expect('alpha' in readResult.content, readResult.content)
+        editResult = executeTool(editDefinition, {'path': 'sample.txt', 'edits': [{'oldText': 'beta', 'newText': 'gamma'}]}, context, 'call_edit')
         expect(not editResult.isError, editResult.content)
-        expect('gamma sample' in (Path(tempDir) / 'sample.txt').read_text(encoding='utf-8'), 'edit 未写入新内容')
-    printPass('file tools')
 
+        for escapePath in ['../outside.txt', '/tmp/outside.txt', '~/secret.txt']:
+            escapeResult = executeTool(readDefinition, {'path': escapePath}, context, 'call_escape')
+            expect(escapeResult.isError, f'路径逃逸没有被阻止：{escapePath}')
 
-def runBashCheck(debugEnabled: bool) -> None:
-    printDebug(debugEnabled, '开始 bash 检查')
-    with tempfile.TemporaryDirectory() as tempDir:
-        context = toolContext(workDir=Path(tempDir), debugConsole=debugConsole(debugEnabled))
-        okResult = executeBash({'command': 'printf hello', 'timeout': 5}, context)
-        expect(not okResult.isError and 'hello' in okResult.content, okResult.content)
-        timeoutResult = executeBash({'command': 'sleep 2', 'timeout': 1}, context)
-        expect(timeoutResult.isError and timeoutResult.details.get('timeoutExpired') is True, timeoutResult.content)
-    printPass('bash')
-
-
-def runGuardCheck() -> None:
-    deleteCommands = [
-        'rm file',
-        'rm -rf folder',
-        'rmdir folder',
-        'unlink file',
-        'find . -delete',
-        'python -c "import os; os.remove(\'file\')"',
-        'python -c "import shutil; shutil.rmtree(\'folder\')"',
-    ]
-    for command in deleteCommands:
-        expect(detectDeletionCommand(command), f'未识别删除命令：{command}')
-    expect(not detectDeletionCommand('grep -R "keyword" .'), 'grep 被误判为删除命令')
-    printPass('deletion guard')
+        bashResult = executeTool(bashDefinition, {'command': 'printf hello', 'timeout': 5}, context, 'call_bash')
+        expect(not bashResult.isError and 'hello' in bashResult.content, bashResult.content)
+        failResult = executeTool(bashDefinition, {'command': 'exit 7', 'timeout': 5}, context, 'call_fail')
+        expect(failResult.isError and failResult.details.get('exitCode') == 7, '非零退出码未被标记为错误')
+        timeoutResult = executeTool(bashDefinition, {'command': 'sleep 2', 'timeout': 1}, context, 'call_timeout')
+        expect(timeoutResult.isError and timeoutResult.details.get('timeoutExpired') is True, '超时未被捕获')
+        clampedResult = executeTool(bashDefinition, {'command': 'printf clamp', 'timeout': 999}, context, 'call_clamp')
+        expect(not clampedResult.isError and clampedResult.details.get('timeout') == 120, 'timeout 未被限制到 120')
+    printPass('tool runtime')
 
 
 def runLoggerCheck() -> None:
-    with tempfile.TemporaryDirectory() as tempDir:
+    with TemporaryDirectory() as tempDir:
         logPath = Path(tempDir) / 'agent.jsonl'
         logger = jsonlLog(logPath)
         logger.logEvent({'type': 'sample', 'token': 'sk-12345678901234567890', 'content': 'x' * 4100})
@@ -137,13 +148,10 @@ def runLoggerCheck() -> None:
 
 
 def runAdapterParseCheck() -> None:
-    adapter = openaiAdapter(modelConfig(
-        provider='openaiCompatible',
-        model='manual-check-model',
-        baseUrl='http://127.0.0.1:9/v1',
-        apiKeyEnv='OPENAI_API_KEY',
-        apiType='openaiCompatible',
-    ))
+    adapter = chatCompletionsAdapter(
+        modelConfig('manual-provider', 'manual-model', 'http://127.0.0.1:9/v1', 'openaiCompatible'),
+        createModelAuth('manual-key'),
+    )
     parsed = adapter.parseAssistantPayload({
         'choices': [{
             'message': {
@@ -159,94 +167,168 @@ def runAdapterParseCheck() -> None:
     })
     expect(parsed.toolCalls[0].toolName == 'read', 'tool_call name 解析失败')
     expect(parsed.toolCalls[0].arguments['path'] == 'sample.txt', 'tool_call arguments 解析失败')
-    printPass('openai adapter parse')
+    for badArguments in ['[]', '"abc"', '{bad json']:
+        try:
+            adapter.parseAssistantPayload({
+                'choices': [{
+                    'message': {
+                        'role': 'assistant',
+                        'content': '',
+                        'tool_calls': [{
+                            'id': 'call_bad',
+                            'type': 'function',
+                            'function': {'name': 'read', 'arguments': badArguments},
+                        }],
+                    },
+                }],
+            })
+            raise RuntimeError('非法 arguments 没有被拒绝')
+        except RuntimeError:
+            pass
+    printPass('adapter parse')
+
+
+def runModelAuthCheck(debugEnabled: bool) -> None:
+    printDebug(debugEnabled, '开始 model config / auth 检查')
+    with TemporaryDirectory() as tempDir:
+        inlinePath = Path(tempDir) / 'inline.yaml'
+        inlinePath.write_text(
+            'providers:\n'
+            '  "abc":\n'
+            '    baseUrl: http://127.0.0.1:9/v1\n'
+            '    api: openai-completions\n'
+            '    apiKey: inline-key\n'
+            '    models:\n'
+            '      - id: model-a\n',
+            encoding='utf-8')
+        before = os.environ.get('FLAMINGO_AGENTS_ABC_API_KEY')
+        resolved = loadModelConfigFromYaml(providerId='abc', configPath=inlinePath, debugConsole=debugConsole(debugEnabled))
+        after = os.environ.get('FLAMINGO_AGENTS_ABC_API_KEY')
+        expect(resolved.apiKey == 'inline-key', 'inline apiKey 解析失败')
+        expect(before == after, '配置加载不应写 os.environ')
+
+        os.environ['TEST_API_KEY'] = 'env-secret'
+        envPath = Path(tempDir) / 'env.yaml'
+        envPath.write_text(
+            'providers:\n'
+            '  "envp":\n'
+            '    baseUrl: http://127.0.0.1:9/v1\n'
+            '    api: openai-completions\n'
+            '    apiKey: ${TEST_API_KEY}\n'
+            '    models:\n'
+            '      - id: model-b\n',
+            encoding='utf-8')
+        envResolved = loadModelConfigFromYaml(providerId='envp', configPath=envPath)
+        expect(envResolved.apiKey == 'env-secret', '${ENV} apiKey 解析失败')
+
+        missingPath = Path(tempDir) / 'missing.yaml'
+        missingPath.write_text(
+            'providers:\n'
+            '  "missp":\n'
+            '    baseUrl: http://127.0.0.1:9/v1\n'
+            '    api: openai-completions\n'
+            '    apiKey: ${MISSING_KEY_NOT_SET}\n'
+            '    models:\n'
+            '      - id: model-c\n',
+            encoding='utf-8')
+        try:
+            loadModelConfigFromYaml(providerId='missp', configPath=missingPath)
+            raise RuntimeError('缺失环境变量没有被拒绝')
+        except RuntimeError:
+            pass
+
+    auth = createModelAuth('abc123')
+    expect(auth.authorizationHeader == 'Bearer abc123', 'Authorization header 生成失败')
+    sourceText = Path('flamingoAgents/models/chatCompletions.py').read_text(encoding='utf-8')
+    expect('os.getenv' not in sourceText, 'adapter 不应包含 os.getenv')
+    expect('jsonlLog' not in sourceText, 'adapter 不应依赖 jsonlLog')
+    printPass('model config auth adapter')
 
 
 def buildFakeAgent(workDir: Path, debugEnabled: bool) -> agent:
     return agent(
         modelAdapter=fakeModel(),
-        registry=createDefaultRegistry(),
+        toolDefinitions=loadToolConfig(debugConsole=debugConsole(debugEnabled)),
         workDir=workDir,
         logDir=workDir / '.agentLogs',
         debugConsole=debugConsole(debugEnabled),
-        confirmDeletion=None,
     )
 
 
-def runAgentCheck(debugEnabled: bool) -> None:
-    printDebug(debugEnabled, '开始 agent 检查')
-    with tempfile.TemporaryDirectory() as tempDir:
+def runAgentStateCheck(debugEnabled: bool) -> None:
+    printDebug(debugEnabled, '开始 agent 状态机检查')
+    with TemporaryDirectory() as tempDir:
         workDir = Path(tempDir)
         (workDir / 'sample.txt').write_text('alpha sample\n', encoding='utf-8')
-        agent = buildFakeAgent(workDir, debugEnabled)
-        readResult = agent.runUserMessage('please read sample', sessionId='manualAgent')
+        testAgent = buildFakeAgent(workDir, debugEnabled)
+
+        readResult = testAgent.runUserMessage('please read sample', sessionId='readSession')
         expect(readResult.status == 'completed', readResult.message)
         expect('alpha sample' in readResult.message, readResult.message)
-        confirmResult = agent.runUserMessage('please delete sample', sessionId='manualAgent')
+
+        confirmResult = testAgent.runUserMessage('please delete sample', sessionId='deleteSession')
         expect(confirmResult.status == 'confirmationRequired', confirmResult.message)
-        rejectResult = agent.continueConfirmation('manualAgent', confirmResult.confirmationId or '', approved=False)
+        expect((workDir / 'sample.txt').exists(), '需要确认时不应执行 rm')
+
+        rejectResult = testAgent.continueConfirmation('deleteSession', confirmResult.confirmationId or '', approved=False)
         expect(rejectResult.status == 'completed', rejectResult.message)
         expect((workDir / 'sample.txt').exists(), '拒绝删除后文件不应消失')
-        curlResult = agent.runUserMessage('please curl fail', sessionId='manualCurl')
-        expect(curlResult.status == 'completed', curlResult.message)
-        expect('查询失败' in curlResult.message, curlResult.message)
-    printPass('agent core')
 
-
-def runHttpCheck(debugEnabled: bool) -> None:
-    printDebug(debugEnabled, '开始 http 检查')
-    with tempfile.TemporaryDirectory() as tempDir:
-        workDir = Path(tempDir)
         (workDir / 'sample.txt').write_text('alpha sample\n', encoding='utf-8')
-        agent = buildFakeAgent(workDir, debugEnabled)
-        server = ThreadingHTTPServer(('127.0.0.1', 0), makeHttpHandler(agent))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            host, port = server.server_address
-            connection = http.client.HTTPConnection(host, port, timeout=5)
-            connection.request('POST', '/chat', body=json.dumps({
-                'sessionId': 'httpManual',
-                'message': 'please delete sample',
-            }), headers={'Content-Type': 'application/json'})
-            response = connection.getresponse()
-            payload = json.loads(response.read().decode('utf-8'))
-            expect(payload['status'] == 'confirmationRequired', json.dumps(payload, ensure_ascii=False))
-            connection.request('POST', '/confirm', body=json.dumps({
-                'sessionId': 'httpManual',
-                'confirmationId': payload['confirmationId'],
-                'approved': False,
-            }), headers={'Content-Type': 'application/json'})
-            confirmResponse = connection.getresponse()
-            confirmPayload = json.loads(confirmResponse.read().decode('utf-8'))
-            expect(confirmPayload['status'] == 'completed', json.dumps(confirmPayload, ensure_ascii=False))
-            expect((workDir / 'sample.txt').exists(), 'HTTP 拒绝删除后文件不应消失')
-        finally:
-            server.shutdown()
-            server.server_close()
-    printPass('http')
+        batchResult = testAgent.runUserMessage('batch', sessionId='batchSession')
+        expect(batchResult.status == 'confirmationRequired', batchResult.message)
+
+        pendingNewMessage = testAgent.runUserMessage('again', sessionId='batchSession')
+        expect(pendingNewMessage.status == 'error', 'pending 期间新消息应被拒绝')
+
+        wrongSession = testAgent.continueConfirmation('wrongSession', batchResult.confirmationId or '', approved=True)
+        expect(wrongSession.status == 'error', '错误 sessionId 不应消费 pending')
+        expect(testAgent.hasPendingConfirmation('batchSession'), '错误 sessionId 不应清掉真实 pending')
+
+        approvedBatch = testAgent.continueConfirmation('batchSession', batchResult.confirmationId or '', approved=True)
+        expect(approvedBatch.status == 'completed', approvedBatch.message)
+    printPass('agent state machine')
+
+
+def runPureLibraryApiCheck(debugEnabled: bool) -> None:
+    printDebug(debugEnabled, '开始纯库 API 检查')
+    from flamingoAgents import createAgent
+
+    builtAgent = createAgent(Path('.'), debug=debugEnabled)
+    expect(type(builtAgent).__name__ == 'agent', 'createAgent 未返回 agent')
+    expect(not Path('flamingoAgents/app').exists(), 'app 目录仍然存在')
+    pyproject = Path('pyproject.toml').read_text(encoding='utf-8')
+    expect('[project.scripts]' not in pyproject, 'pyproject 仍包含命令入口')
+    manualSource = Path('manualChecks.py').read_text(encoding='utf-8')
+    appLayerNeedle = 'flamingoAgents' + '.app'
+    expect(appLayerNeedle not in manualSource, 'manualChecks 仍依赖 app 层')
+    printPass('pure library api')
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='运行无测试框架的手动验证')
-    parser.add_argument('check', choices=['all', 'fileTools', 'bash', 'guard', 'logger', 'adapter', 'agent', 'http'])
+    parser.add_argument('check', choices=[
+        'all', 'toolConfig', 'permission', 'runtime', 'logger', 'adapter', 'modelAuth', 'agent', 'pureLibrary',
+    ])
     parser.add_argument('--debug', action='store_true', help='启用详细调试输出')
     args = parser.parse_args()
 
-    if args.check in {'all', 'fileTools'}:
-        runFileToolCheck(args.debug)
-    if args.check in {'all', 'bash'}:
-        runBashCheck(args.debug)
-    if args.check in {'all', 'guard'}:
-        runGuardCheck()
+    if args.check in {'all', 'toolConfig'}:
+        runToolConfigCheck(args.debug)
+    if args.check in {'all', 'permission'}:
+        runPermissionCheck(args.debug)
+    if args.check in {'all', 'runtime'}:
+        runToolRuntimeCheck(args.debug)
     if args.check in {'all', 'logger'}:
         runLoggerCheck()
     if args.check in {'all', 'adapter'}:
         runAdapterParseCheck()
+    if args.check in {'all', 'modelAuth'}:
+        runModelAuthCheck(args.debug)
     if args.check in {'all', 'agent'}:
-        runAgentCheck(args.debug)
-    if args.check in {'all', 'http'}:
-        runHttpCheck(args.debug)
+        runAgentStateCheck(args.debug)
+    if args.check in {'all', 'pureLibrary'}:
+        runPureLibraryApiCheck(args.debug)
 
 
 if __name__ == '__main__':

@@ -1,139 +1,123 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-07-01
-Description: Coordinates model calls, tool execution, confirmation handling, sessions, and JSONL-backed conversations.
+Version: 1.4
+Date: 2026-07-02
+Description: Coordinates pure Agent sessions; per-session state (lock + pending) lives on the conversation, only the sessionId index is agent-global and guarded by a short critical section.
 '''
 
 from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from threading import RLock
+from typing import Any
 from uuid import uuid4
 
-from flamingoAgents.core.types import (
-    runResult,
-    chatMessage,
-    pendingConfirm,
-    toolCall,
-    toolContext,
-)
 from flamingoAgents.core.conversation import conversation
-from flamingoAgents.tools.guard import checkToolCall, makeBlockedToolResult
-from flamingoAgents.tools.registry import registry
-from flamingoAgents.tools.router import router
+from flamingoAgents.core.ports import modelAdapterPort
+from flamingoAgents.core.types import chatMessage, pendingConfirm, runResult, toolCall, toolContext, toolResult
+from flamingoAgents.tools.toolConfig import toolDefinition
+from flamingoAgents.tools.toolPolicy import evaluateToolCall
+from flamingoAgents.tools.toolRuntime import executeTool
+from flamingoAgents.tools.toolSchema import buildModelTools
 
-confirmationHandler = Callable[[toolCall, str], bool]
-
-systemPrompt = '''你是 Flamingo Agents。你可以正常聊天，也可以调用 read、write、edit、bash 工具。联网查询只能通过 bash 中的 curl 等简单 shell 命令完成。如果 curl 因反爬、登录墙、验证码、403 或空结果失败，你必须诚实说明失败，不尝试绕过。删除相关 bash 命令必须先得到用户确认。'''
+systemPrompt = '''你是 Flamingo Agents。你可以正常聊天，也可以调用配置中声明的工具。联网查询只能通过 shell runtime 中的 curl 等简单 shell 命令完成。如果 curl 因反爬、登录墙、验证码、403 或空结果失败，你必须诚实说明失败，不尝试绕过。需要确认的工具调用必须等待宿主调用 continueConfirmation。'''
 
 
 class agent:
     def __init__(
         self,
-        modelAdapter: Any,
-        registry: registry,
+        modelAdapter: modelAdapterPort,
+        toolDefinitions: list[toolDefinition],
         workDir: Path,
         logDir: Path,
         debugConsole=None,
-        confirmDeletion: confirmationHandler | None = None,
         maxModelSteps: int = 8,
     ):
         self.modelAdapter = modelAdapter
-        self.registry = registry
+        self.toolDefinitions = {definition.name: definition for definition in toolDefinitions}
         self.workDir = workDir
         self.logDir = logDir
         self.debugConsole = debugConsole
-        self.confirmDeletion = confirmDeletion
         self.maxModelSteps = maxModelSteps
         self.conversations: dict[str, conversation] = {}
-        self.pendingConfirms: dict[str, pendingConfirm] = {}
+        self.sessionLocks: dict[str, RLock] = {}
+        self.sessionLocksGuard = RLock()
 
     def runUserMessage(self, message: str, sessionId: str | None = None) -> runResult:
         cleanMessage = message.strip()
-        if not cleanMessage:
-            return runResult(sessionId=sessionId or self.createSessionId(), status='error', message='消息不能为空。')
         realSessionId = sessionId or self.createSessionId()
-        if self.debugConsole:
-            self.debugConsole.debug(f'收到用户消息 sessionId={realSessionId} chars={len(cleanMessage)}')
-        conversation = self.getConversation(realSessionId)
-        conversation.addMessage(chatMessage(role='user', content=cleanMessage))
-        return self.continueModelLoop(realSessionId)
+        if not cleanMessage:
+            return runResult(sessionId=realSessionId, status='error', message='消息不能为空。')
+        with self.getSessionLock(realSessionId):
+            if self.hasPendingConfirmation(realSessionId):
+                return runResult(
+                    sessionId=realSessionId,
+                    status='error',
+                    message='当前会话有待确认工具调用，请先调用 continueConfirmation。',
+                )
+            if self.debugConsole:
+                self.debugConsole.debug(f'收到用户消息 sessionId={realSessionId} chars={len(cleanMessage)}')
+            currentConversation = self.getConversation(realSessionId)
+            currentConversation.addMessage(chatMessage(role='user', content=cleanMessage))
+            return self.continueModelLoop(realSessionId)
 
     def continueConfirmation(self, sessionId: str, confirmationId: str, approved: bool) -> runResult:
-        pending = self.pendingConfirms.pop(confirmationId, None)
-        if pending is None or pending.sessionId != sessionId:
-            return runResult(sessionId=sessionId, status='error', message='确认请求不存在或 sessionId 不匹配。')
-
-        conversation = self.getConversation(sessionId)
-        router = self.createRouter()
-        if approved:
-            result = router.executeTool(pending.toolCall, approvedDeletion=True)
-        else:
-            result = makeBlockedToolResult(pending.toolCall, pending.reason)
-        if self.debugConsole:
-            self.debugConsole.debug(f'工具执行完成 tool={pending.toolCall.toolName} callId={pending.toolCall.id} isError={result.isError}')
-        conversation.addToolResult(result)
-        return self.continueModelLoop(sessionId)
+        with self.getSessionLock(sessionId):
+            currentConversation = self.getConversation(sessionId)
+            pending = currentConversation.takePending()
+            if pending is None or pending.confirmationId != confirmationId:
+                if pending is not None:
+                    currentConversation.setPending(pending)
+                return runResult(sessionId=sessionId, status='error', message='确认请求不存在或 confirmationId 不匹配。')
+            currentCall = pending.toolCalls[pending.currentIndex]
+            if self.debugConsole:
+                self.debugConsole.debug(
+                    f'继续确认 sessionId={sessionId} confirmationId={confirmationId} '
+                    f'approved={approved} tool={currentCall.toolName} callId={currentCall.id}'
+                )
+            if approved:
+                result = self.executeToolCall(currentCall)
+            else:
+                result = self.buildBlockedToolResult(currentCall, pending.reason)
+            currentConversation.addToolResult(result)
+            batchResult = self.processToolBatch(sessionId, pending.toolCalls, pending.currentIndex + 1)
+            if batchResult is not None:
+                return batchResult
+            return self.continueModelLoop(sessionId)
 
     def continueModelLoop(self, sessionId: str) -> runResult:
-        conversation = self.getConversation(sessionId)
-        router = self.createRouter()
+        currentConversation = self.getConversation(sessionId)
         for stepIndex in range(self.maxModelSteps):
+            modelTools = buildModelTools(list(self.toolDefinitions.values()))
             if self.debugConsole:
                 self.debugConsole.debug(
                     f'agent 模型循环 step={stepIndex + 1} sessionId={sessionId} '
-                    f'messages={len(conversation.messages)} tools={len(self.registry.listDefinitions())}'
+                    f'messages={len(currentConversation.messages)} tools={len(modelTools)}'
                 )
             try:
-                assistantMessage = self.modelAdapter.complete(conversation.messages, self.registry.listModelTools())
+                completion = self.modelAdapter.complete(currentConversation.messages, modelTools)
             except Exception as error:
-                conversation.logger.logEvent({
-                    'type': 'modelError',
-                    'errorType': type(error).__name__,
-                    'message': str(error),
-                })
+                self.logModelError(currentConversation, error)
                 return runResult(sessionId=sessionId, status='error', message=f'模型调用失败：{error}')
 
-            conversation.addMessage(assistantMessage)
+            requestPayload = getattr(completion, 'requestPayload', None)
+            responsePayload = getattr(completion, 'responsePayload', None)
+            if isinstance(requestPayload, dict):
+                currentConversation.logger.logEvent({'type': 'modelRequest', 'request': requestPayload})
+            if isinstance(responsePayload, dict):
+                currentConversation.logger.logEvent({'type': 'modelResponse', 'response': responsePayload})
+
+            assistantMessage = completion.message
+            currentConversation.addMessage(assistantMessage)
             if not assistantMessage.toolCalls:
+                if self.debugConsole:
+                    self.debugConsole.debug(f'模型循环完成 sessionId={sessionId} contentChars={len(assistantMessage.content)}')
                 return runResult(sessionId=sessionId, status='completed', message=assistantMessage.content)
 
-            for call in assistantMessage.toolCalls:
-                if self.debugConsole:
-                    self.debugConsole.debug(f'准备执行工具 tool={call.toolName} callId={call.id}')
-                guard = checkToolCall(call)
-                if guard.requiresConfirmation:
-                    if self.confirmDeletion is None:
-                        confirmationId = 'confirm_' + uuid4().hex[:12]
-                        self.pendingConfirms[confirmationId] = pendingConfirm(
-                            sessionId=sessionId,
-                            confirmationId=confirmationId,
-                            reason=guard.reason,
-                            toolCall=call,
-                        )
-                        return runResult(
-                            sessionId=sessionId,
-                            status='confirmationRequired',
-                            confirmationId=confirmationId,
-                            reason=guard.reason,
-                            commandPreview=str(call.arguments.get('command', '')),
-                            toolCall=call,
-                        )
-                    approved = self.confirmDeletion(call, guard.reason)
-                    if not approved:
-                        result = makeBlockedToolResult(call, guard.reason)
-                        if self.debugConsole:
-                            self.debugConsole.debug(f'工具执行完成 tool={call.toolName} callId={call.id} isError={result.isError}')
-                        conversation.addToolResult(result)
-                        continue
-                    result = router.executeTool(call, approvedDeletion=True)
-                else:
-                    result = router.executeTool(call)
-                if self.debugConsole:
-                    self.debugConsole.debug(f'工具执行完成 tool={call.toolName} callId={call.id} isError={result.isError}')
-                conversation.addToolResult(result)
+            batchResult = self.processToolBatch(sessionId, assistantMessage.toolCalls, 0)
+            if batchResult is not None:
+                return batchResult
 
         return runResult(
             sessionId=sessionId,
@@ -141,19 +125,105 @@ class agent:
             message=f'模型循环超过最大步数：{self.maxModelSteps}',
         )
 
-    def getConversation(self, sessionId: str) -> conversation:
-        existing = self.conversations.get(sessionId)
-        if existing is not None:
-            return existing
-        dateText = datetime.now().strftime('%Y%m%d')
-        logPath = self.logDir / f'{dateText}_{sessionId}.jsonl'
-        newConversation = conversation(sessionId=sessionId, logPath=logPath, systemPrompt=systemPrompt)
-        self.conversations[sessionId] = newConversation
-        return newConversation
+    def processToolBatch(self, sessionId: str, toolCalls: list[toolCall], startIndex: int) -> runResult | None:
+        currentConversation = self.getConversation(sessionId)
+        for index in range(startIndex, len(toolCalls)):
+            call = toolCalls[index]
+            definition = self.toolDefinitions.get(call.toolName)
+            if definition is None:
+                currentConversation.addToolResult(self.makeUnknownToolResult(call))
+                continue
+            decision = evaluateToolCall(definition, call, debugConsole=self.debugConsole)
+            if decision.requiresApproval:
+                confirmationId = 'confirm_' + uuid4().hex[:12]
+                currentConversation.setPending(pendingConfirm(
+                    sessionId=sessionId,
+                    confirmationId=confirmationId,
+                    reason=decision.reason,
+                    toolCalls=toolCalls,
+                    currentIndex=index,
+                ))
+                if self.debugConsole:
+                    self.debugConsole.debug(
+                        f'工具需要确认 sessionId={sessionId} confirmationId={confirmationId} '
+                        f'tool={call.toolName} callId={call.id} permissionId={decision.permissionId}'
+                    )
+                return runResult(
+                    sessionId=sessionId,
+                    status='confirmationRequired',
+                    confirmationId=confirmationId,
+                    reason=decision.reason,
+                    commandPreview=str(call.arguments),
+                    toolCall=call,
+                )
+            result = self.executeToolCall(call)
+            currentConversation.addToolResult(result)
+        return None
 
-    def createRouter(self) -> router:
+    def executeToolCall(self, call: toolCall) -> toolResult:
+        definition = self.toolDefinitions.get(call.toolName)
+        if definition is None:
+            return self.makeUnknownToolResult(call)
         context = toolContext(workDir=self.workDir, debugConsole=self.debugConsole)
-        return router(self.registry, context)
+        return executeTool(definition, call.arguments, context, toolCallId=call.id)
+
+    def makeUnknownToolResult(self, call: toolCall) -> toolResult:
+        return toolResult(
+            toolCallId=call.id,
+            toolName=call.toolName,
+            isError=True,
+            content=f'未知工具：{call.toolName}',
+            details={'unknownTool': True},
+        )
+
+    def buildBlockedToolResult(self, call: toolCall, reason: str) -> toolResult:
+        return toolResult(
+            toolCallId=call.id,
+            toolName=call.toolName,
+            isError=True,
+            content=f'命令已被用户拒绝：{reason}。',
+            details={'blocked': True, 'reason': 'userRejectedApproval'},
+        )
+
+    def logModelError(self, currentConversation: conversation, error: Exception) -> None:
+        event: dict[str, Any] = {
+            'type': 'modelError',
+            'errorType': type(error).__name__,
+            'message': str(error),
+        }
+        requestPayload = getattr(error, 'requestPayload', None)
+        if isinstance(requestPayload, dict):
+            event['request'] = requestPayload
+        statusCode = getattr(error, 'statusCode', None)
+        if isinstance(statusCode, int):
+            event['status'] = statusCode
+        currentConversation.logger.logEvent(event)
+
+    def hasPendingConfirmation(self, sessionId: str) -> bool:
+        with self.sessionLocksGuard:
+            conversation = self.conversations.get(sessionId)
+        if conversation is None:
+            return False
+        return conversation.hasPending()
+
+    def getSessionLock(self, sessionId: str) -> RLock:
+        with self.sessionLocksGuard:
+            lock = self.sessionLocks.get(sessionId)
+            if lock is None:
+                lock = RLock()
+                self.sessionLocks[sessionId] = lock
+            return lock
+
+    def getConversation(self, sessionId: str) -> conversation:
+        with self.sessionLocksGuard:
+            existing = self.conversations.get(sessionId)
+            if existing is not None:
+                return existing
+            dateText = datetime.now().strftime('%Y%m%d')
+            logPath = self.logDir / f'{dateText}_{sessionId}.jsonl'
+            newConversation = conversation(sessionId=sessionId, logPath=logPath, systemPrompt=systemPrompt)
+            self.conversations[sessionId] = newConversation
+            return newConversation
 
     def createSessionId(self) -> str:
         return 'session_' + uuid4().hex[:12]

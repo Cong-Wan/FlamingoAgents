@@ -1,0 +1,119 @@
+version: 1
+
+tools:
+  - name: read
+    description: 读取本地文本文件，可通过 offset 和 limit 控制读取的行范围。
+    parameters:
+      type: object
+      properties:
+        path:
+          type: string
+        offset:
+          type: integer
+          minimum: 1
+          default: 1
+        limit:
+          type: integer
+          minimum: 1
+          default: 200
+      required:
+        - path
+      additionalProperties: false
+    runtime:
+      type: file
+      operation: read
+      pathField: path
+      offsetField: offset
+      limitField: limit
+      root: workDir
+    permissions: []
+
+  - name: write
+    description: 创建或完整覆盖本地文本文件。
+    parameters:
+      type: object
+      properties:
+        path:
+          type: string
+        content:
+          type: string
+      required:
+        - path
+        - content
+      additionalProperties: false
+    runtime:
+      type: file
+      operation: write
+      pathField: path
+      contentField: content
+      root: workDir
+    permissions: []
+
+  - name: edit
+    description: 对已有文本文件进行精确文本替换。每个 oldText 必须唯一匹配。
+    parameters:
+      type: object
+      properties:
+        path:
+          type: string
+        edits:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            properties:
+              oldText:
+                type: string
+              newText:
+                type: string
+            required:
+              - oldText
+              - newText
+            additionalProperties: false
+      required:
+        - path
+        - edits
+      additionalProperties: false
+    runtime:
+      type: file
+      operation: edit
+      pathField: path
+      editsField: edits
+      root: workDir
+    permissions: []
+
+  - name: bash
+    description: 在工作目录中执行 bash 命令。curl、python、grep、open 均通过此工具执行。
+    modelPermissionSummary: 删除类命令会请求用户确认。
+    parameters:
+      type: object
+      properties:
+        command:
+          type: string
+        timeout:
+          type: integer
+          minimum: 1
+          default: 30
+      required:
+        - command
+      additionalProperties: false
+    runtime:
+      type: shell
+      commandField: command
+      timeoutField: timeout
+      cwd: workDir
+    permissions:
+      - id: deletionCommand
+        field: command
+        action: requireApproval
+        reason: 删除命令需要用户确认
+        match:
+          type: regex
+          patterns:
+            - '(^|[;&|]\s*)rm\s+(-[A-Za-z]*\s+)*[^\n;&|]+'
+            - '(^|[;&|]\s*)rmdir\s+[^\n;&|]+'
+            - '(^|[;&|]\s*)unlink\s+[^\n;&|]+'
+            - '(^|[;&|]\s*)find\s+[^\n;&|]*\s-delete(\s|$)'
+            - 'os\.(remove|unlink|rmdir)\s*\('
+            - 'shutil\.rmtree\s*\('
+            - 'pathlib\.[A-Za-z0-9_\.]+\.(unlink|rmdir)\s*\('

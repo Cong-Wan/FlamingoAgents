@@ -1,24 +1,19 @@
-providers:
-  "101":
-    baseUrl: http://192.168.0.101:8080/v1
-    api: openai-completions
-    apiKey: llama.cpp
-    compat:
-      supportsDeveloperRole: false
-      supportsReasoningEffort: false
-      supportsUsageInStreaming: false
-      maxTokensField: max_tokens
-      supportsStrictMode: false
-    models:
-      - id: Qwen3.6-27B-MTP-IQ4_KS
-        name: Qwen3.6 27B MTP IQ4_KS - LAN
-        input:
-          - text
-        contextWindow: 98304
-        maxTokens: 65536
-        reasoning: false
-        cost:
-          input: 0
-          output: 0
-          cacheRead: 0
-          cacheWrite: 0
+providers: # 模型提供商列表
+  "101": # 提供商 ID（此处以局域网 IP 简写命名）
+    baseUrl: http://192.168.0.101:8080/v1 # API 端点地址
+    api: openai-completions # API 协议类型（OpenAI Chat Completions，兼容性最广）
+    apiKey: llama.cpp # API 密钥（本地服务会忽略，这里仅作占位）
+    models: # 该提供商下的模型列表
+      - id: Qwen3.6-27B-MTP-IQ4_KS # 模型标识（会原样传给 API）
+        name: Qwen3.6 27B MTP IQ4_KS - LAN # 可读名称，用于模型匹配和详情展示
+        input: # 支持的输入类型
+          - text # 纯文本（可选 image 表示支持图片）
+        contextWindow: 98304 # 上下文窗口大小（单位：token）
+        maxTokens: 65536 # 最大输出 token 数
+        reasoning: true # 是否为支持扩展思考（推理）的模型
+        cost: # 成本配置（按每百万 token 计价，单位：美元）
+          input: 0 # 输入 token 成本
+          output: 0 # 输出 token 成本
+          cacheRead: 0 # 缓存读取成本
+          cacheWrite: 0 # 缓存写入成本
+

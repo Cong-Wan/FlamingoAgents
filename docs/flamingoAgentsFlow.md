@@ -61,7 +61,7 @@ flowchart TD
         build["buildAgent(debugEnabled, workDir)"]
         debug["debugConsole(debugEnabled)"]
         config["loadModelConfig()<br/>优先 config/models.yaml<br/>缺失时 fallback 环境变量"]
-        adapter["openaiAdapter(config, printer)"]
+        adapter["chatCompletionsAdapter(config, printer)"]
         registry["createDefaultRegistry()<br/>read / write / edit / bash"]
         agentInstance["agent(..., modelAdapter, registry,<br/>workDir, logDir, confirmDeletion)"]
     end
@@ -171,9 +171,9 @@ flowchart TD
 | 层级 | 主要职责 | 代码文件 | 关键函数 / 类 |
 | --- | --- | --- | --- |
 | 入口层 | 接收 CLI 输入或 HTTP 请求，打印/返回 Agent 执行结果 | `flamingoAgents/app/cli.py`、`flamingoAgents/app/server.py` | `main()`、`makeHttpHandler()`、`agentHttpHandler.do_POST()`、`handleChat()`、`handleConfirm()` |
-| 启动装配层 | 初始化 debug、模型配置、模型适配器、工具注册表、Agent 实例 | `cli.py`、`server.py`、`models/registry.py`、`models/openai.py`、`tools/registry.py` | `buildAgent()`、`loadModelConfig()`、`openaiAdapter.__init__()`、`createDefaultRegistry()` |
+| 启动装配层 | 初始化 debug、模型配置、模型适配器、工具注册表、Agent 实例 | `cli.py`、`server.py`、`models/registry.py`、`models/chatCompletions.py`、`tools/registry.py` | `buildAgent()`、`loadModelConfig()`、`chatCompletionsAdapter.__init__()`、`createDefaultRegistry()` |
 | 核心编排层 | 管理会话、调用模型、执行工具、处理删除确认、返回 `runResult` | `core/agent.py`、`core/conversation.py`、`core/types.py` | `agent.runUserMessage()`、`agent.continueModelLoop()`、`agent.continueConfirmation()`、`conversation.addMessage()`、`conversation.addToolResult()` |
-| 模型层 | 把内部消息转成 OpenAI 兼容格式，请求 `/chat/completions`，解析 assistant/tool_calls | `models/openai.py` | `openaiAdapter.complete()`、`convertMessage()`、`parseAssistantPayload()` |
+| 模型层 | 把内部消息转成 OpenAI 兼容格式，请求 `/chat/completions`，解析 assistant/tool_calls | `models/chatCompletions.py` | `chatCompletionsAdapter.complete()`、`convertMessage()`、`parseAssistantPayload()` |
 | 工具层 | 注册工具 schema、检查删除风险、路由并执行 `read/write/edit/bash` | `tools/registry.py`、`tools/router.py`、`tools/guard.py`、`tools/file.py`、`tools/bash.py` | `registry.listModelTools()`、`router.executeTool()`、`checkToolCall()`、`executeRead()`、`executeWrite()`、`executeEdit()`、`executeBash()` |
 | 日志辅助层 | Debug 输出、JSONL 审计日志、内容预览、敏感信息脱敏 | `utils/debug.py`、`utils/jsonl.py` | `debugConsole.debug()`、`jsonlLog.logEvent()`、`makePreview()`、`redactText()` |
 | 验证脚本 | 不依赖测试框架的手动检查 | `manualChecks.py` | `runFileToolCheck()`、`runBashCheck()`、`runGuardCheck()`、`runLoggerCheck()`、`runAdapterParseCheck()`、`runAgentCheck()`、`runHttpCheck()` |
@@ -201,7 +201,7 @@ flowchart TD
     addUser["写入用户消息<br/>conversation.addMessage()<br/>chatMessage(role='user')"]
     modelLoop["进入模型-工具循环<br/>agent.continueModelLoop()"]
 
-    modelCall["调用模型<br/>openaiAdapter.complete()<br/>registry.listModelTools()"]
+    modelCall["调用模型<br/>chatCompletionsAdapter.complete()<br/>registry.listModelTools()"]
     modelError{"模型调用异常?"}
     modelErrorResult["记录 modelError 并返回<br/>conversation.logger.logEvent()<br/>runResult(status=error)"]
 
@@ -265,7 +265,7 @@ flowchart TD
 | 用户消息进入 | CLI 字符串或 HTTP JSON `message` | `cleanMessage` | `core/agent.py` | `agent.runUserMessage()` |
 | 会话定位 | `sessionId` 可空 | 真实 `sessionId` 与 `conversation` | `core/agent.py`、`core/conversation.py` | `createSessionId()`、`getConversation()`、`conversation.__init__()` |
 | 消息落会话 | `chatMessage(role='user')` | 内存消息列表 + JSONL 日志 | `core/conversation.py`、`utils/jsonl.py` | `conversation.addMessage()`、`jsonlLog.logEvent()` |
-| 模型请求 | `conversation.messages` + 工具 schema | `chatMessage(role='assistant')` | `models/openai.py`、`tools/registry.py` | `openaiAdapter.complete()`、`registry.listModelTools()` |
+| 模型请求 | `conversation.messages` + 工具 schema | `chatMessage(role='assistant')` | `models/chatCompletions.py`、`tools/registry.py` | `chatCompletionsAdapter.complete()`、`registry.listModelTools()` |
 | 工具调用判断 | `assistantMessage.toolCalls` | 直接完成或执行工具 | `core/agent.py` | `agent.continueModelLoop()` |
 | 删除确认 | `toolCall(toolName='bash')` 且命中删除模式 | CLI 同步确认或 HTTP pending confirmation | `tools/guard.py`、`app/cli.py`、`core/agent.py` | `checkToolCall()`、`askDeletionConfirmation()`、`pendingConfirm` |
 | 工具执行 | `toolCall.arguments` + `toolContext` | `toolResult` | `tools/router.py`、`tools/file.py`、`tools/bash.py` | `router.executeTool()`、`executeRead()`、`executeWrite()`、`executeEdit()`、`executeBash()` |
@@ -288,7 +288,7 @@ flowchart TD
     build["构建 Agent<br/>cli.py::buildAgent(debugEnabled, workDir)"]
     debug["创建 debug 控制台<br/>utils/debug.py::debugConsole"]
     config["读取模型配置<br/>models/registry.py::loadModelConfig()<br/>优先 YAML，缺失时环境变量 fallback"]
-    adapter["创建 OpenAI 兼容适配器<br/>models/openai.py::openaiAdapter(config, printer)"]
+    adapter["创建 OpenAI 兼容适配器<br/>models/chatCompletions.py::chatCompletionsAdapter(config, printer)"]
     registry["创建默认工具表<br/>tools/registry.py::createDefaultRegistry()"]
     agentCtor["实例化 Agent<br/>core/agent.py::agent(...,<br/>confirmDeletion=askDeletionConfirmation)"]
     loop["进入 while True 输入循环<br/>cli.py::main()"]
@@ -322,7 +322,7 @@ flowchart TD
 | 2 | 参数解析 | `flamingoAgents/app/cli.py` | `main()` | 支持 `--debug`、`--session-id`、`--work-dir` |
 | 3 | Agent 装配 | `flamingoAgents/app/cli.py` | `buildAgent()` | 创建 debug、加载模型配置、创建 adapter、创建默认工具表 |
 | 4 | 模型配置 | `flamingoAgents/models/registry.py` | `loadModelConfig()` | 若 `config/models.yaml` 存在则走 `loadModelConfigFromYaml()`；否则走 `loadModelConfigFromEnv()` 校验环境变量 |
-| 5 | 模型适配器 | `flamingoAgents/models/openai.py` | `openaiAdapter.__init__()` | 保存 `modelConfig` 与 debug 控制台 |
+| 5 | 模型适配器 | `flamingoAgents/models/chatCompletions.py` | `chatCompletionsAdapter.__init__()` | 保存 `modelConfig` 与 debug 控制台 |
 | 6 | 工具注册 | `flamingoAgents/tools/registry.py` | `createDefaultRegistry()` | 注册 `read`、`write`、`edit`、`bash` |
 | 7 | 删除确认回调 | `flamingoAgents/app/cli.py` | `askDeletionConfirmation()` | CLI 模式直接用 `input()` 问用户是否允许删除命令 |
 | 8 | 输入循环 | `flamingoAgents/app/cli.py` | `main()` | 处理 `/exit`、`/help`、空输入和普通消息 |
@@ -569,17 +569,17 @@ flowchart TD
     configErr["raise RuntimeError('模型配置缺失...')"]
     configObj["返回 modelConfig<br/>provider / model / baseUrl / apiKeyEnv<br/>apiType='openaiCompatible'<br/>supportsToolCalling=True"]
 
-    adapter["openaiAdapter(config, debugConsole)"]
-    complete["openaiAdapter.complete(messages, tools)"]
+    adapter["chatCompletionsAdapter(config, debugConsole)"]
+    complete["chatCompletionsAdapter.complete(messages, tools)"]
     apiKeyCheck{"os.getenv(config.apiKeyEnv) 为空?"}
     raiseApiKey["raise RuntimeError('环境变量缺失')"]
-    convertMessages["转换 messages<br/>openaiAdapter.convertMessage()"]
+    convertMessages["转换 messages<br/>chatCompletionsAdapter.convertMessage()"]
     payload["构造 requestPayload<br/>model/messages/tools/tool_choice='auto'"]
     request["POST baseUrl + '/chat/completions'<br/>urllib.request.urlopen(timeout=60)"]
     httpErr{"HTTPError / URLError?"}
     raiseHttp["raise RuntimeError('模型请求失败')"]
     jsonParse["json.loads(responseText)"]
-    parse["openaiAdapter.parseAssistantPayload(payload)"]
+    parse["chatCompletionsAdapter.parseAssistantPayload(payload)"]
     choicesCheck{"choices[0].message 合法?"}
     raiseShape["raise RuntimeError('模型响应缺少 choices/message')"]
     rawToolCalls["遍历 rawMessage.tool_calls"]
@@ -638,11 +638,11 @@ flowchart TD
 
 | 转换对象 | 文件 | 函数 / 类 | 规则 |
 | --- | --- | --- | --- |
-| 内部消息 → OpenAI 消息 | `flamingoAgents/models/openai.py` | `openaiAdapter.convertMessage()` | `role='tool'` 转为 `{role, tool_call_id, content}`；assistant 工具调用转为 `tool_calls` 数组 |
+| 内部消息 → OpenAI 消息 | `flamingoAgents/models/chatCompletions.py` | `chatCompletionsAdapter.convertMessage()` | `role='tool'` 转为 `{role, tool_call_id, content}`；assistant 工具调用转为 `tool_calls` 数组 |
 | 工具 schema | `flamingoAgents/tools/registry.py` | `registry.listModelTools()` | 每个 `toolSpec` 转为 OpenAI function tool schema |
-| 请求 payload | `flamingoAgents/models/openai.py` | `openaiAdapter.complete()` | 包含 `model`、`messages`、`tools`、`tool_choice='auto'` |
-| 响应 choices | `flamingoAgents/models/openai.py` | `openaiAdapter.parseAssistantPayload()` | 取 `choices[0].message` |
-| tool_calls | `flamingoAgents/models/openai.py` | `openaiAdapter.parseAssistantPayload()` | 解析 `function.name` 为 `toolName`，`function.arguments` JSON 为 `arguments` |
+| 请求 payload | `flamingoAgents/models/chatCompletions.py` | `chatCompletionsAdapter.complete()` | 包含 `model`、`messages`、`tools`、`tool_choice='auto'` |
+| 响应 choices | `flamingoAgents/models/chatCompletions.py` | `chatCompletionsAdapter.parseAssistantPayload()` | 取 `choices[0].message` |
+| tool_calls | `flamingoAgents/models/chatCompletions.py` | `chatCompletionsAdapter.parseAssistantPayload()` | 解析 `function.name` 为 `toolName`，`function.arguments` JSON 为 `arguments` |
 | assistant 结果 | `flamingoAgents/core/types.py` | `chatMessage` | 返回 `chatMessage(role='assistant', content=..., toolCalls=...)` |
 
 ---
@@ -912,7 +912,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     modelConfig["modelConfig<br/>core/types.py<br/>provider/model/baseUrl/apiKeyEnv/apiType/supportsToolCalling"]
-    adapter["openaiAdapter<br/>models/openai.py"]
+    adapter["chatCompletionsAdapter<br/>models/chatCompletions.py"]
 
     toolSpec["toolSpec<br/>name/description/parameters/execute"]
     registry["registry<br/>tools/registry.py<br/>tools: dict[str, toolSpec]"]
@@ -970,7 +970,7 @@ flowchart LR
 flowchart TD
     args["入口参数 --debug<br/>cli.py::main() / server.py::main()"]
     ctor["debugConsole(debugEnabled)<br/>utils/debug.py"]
-    store["传入 Agent / openaiAdapter / toolContext"]
+    store["传入 Agent / chatCompletionsAdapter / toolContext"]
     callDebug["各层调用 debugConsole.debug(message)"]
     isDebug{"debugConsole.isDebug?"}
     print["打印 [debug HH:MM:SS] message<br/>flush=True"]
@@ -991,7 +991,7 @@ flowchart TD
 | 用户消息 | `flamingoAgents/core/agent.py` | `agent.runUserMessage()` | sessionId 与消息字符数 |
 | 模型循环 | `flamingoAgents/core/agent.py` | `agent.continueModelLoop()` | step、sessionId、消息数、工具数 |
 | 工具执行 | `flamingoAgents/core/agent.py`、`tools/router.py`、`tools/bash.py`、`tools/file.py` | 多处 | 工具名、callId、读写路径、bash 命令等 |
-| 模型请求 | `flamingoAgents/models/openai.py` | `openaiAdapter.complete()` | provider、model、消息数、工具数、URL |
+| 模型请求 | `flamingoAgents/models/chatCompletions.py` | `chatCompletionsAdapter.complete()` | provider、model、消息数、工具数、URL |
 
 ---
 
@@ -1060,7 +1060,7 @@ flowchart TD
 | `runBashCheck()` | `manualChecks.py` | `tools/bash.py` | `printf hello` 成功；`sleep 2` 在 1 秒 timeout 下超时 |
 | `runGuardCheck()` | `manualChecks.py` | `tools/guard.py` | 删除命令命中；`grep` 不应误判 |
 | `runLoggerCheck()` | `manualChecks.py` | `utils/jsonl.py` | `sk-...` 被脱敏，原文不泄露 |
-| `runAdapterParseCheck()` | `manualChecks.py` | `models/openai.py` | `tool_calls` 的 name 与 arguments 能正确解析 |
+| `runAdapterParseCheck()` | `manualChecks.py` | `models/chatCompletions.py` | `tool_calls` 的 name 与 arguments 能正确解析 |
 | `buildFakeAgent()` | `manualChecks.py` | `core/agent.py` | 使用 `fakeModel` 和默认工具注册表构造 Agent |
 | `runAgentCheck()` | `manualChecks.py` | 核心 Agent 链路 | 读文件完成、删除需要确认、拒绝后文件仍存在、curl 失败不绕过 |
 | `runHttpCheck()` | `manualChecks.py` | HTTP 链路 | `/chat` 返回 `confirmationRequired`，`/confirm` 拒绝后完成且文件仍存在 |
@@ -1079,7 +1079,7 @@ pyproject.toml
         ├── buildAgent(debugEnabled, workDir)
         │   ├── utils/debug.py::debugConsole(debugEnabled)
         │   ├── models/registry.py::loadModelConfig()
-        │   ├── models/openai.py::openaiAdapter(config, printer)
+        │   ├── models/chatCompletions.py::chatCompletionsAdapter(config, printer)
         │   ├── tools/registry.py::createDefaultRegistry()
         │   │   └── registry.register(toolSpec(...)) x 4
         │   └── core/agent.py::agent(..., confirmDeletion=askDeletionConfirmation)
@@ -1099,7 +1099,7 @@ pyproject.toml
         ├── buildAgent(debugEnabled, workDir)
         │   ├── utils/debug.py::debugConsole(debugEnabled)
         │   ├── models/registry.py::loadModelConfig()
-        │   ├── models/openai.py::openaiAdapter(config, printer)
+        │   ├── models/chatCompletions.py::chatCompletionsAdapter(config, printer)
         │   ├── tools/registry.py::createDefaultRegistry()
         │   └── core/agent.py::agent(..., confirmDeletion=None)
         ├── makeHttpHandler(agent)
@@ -1130,9 +1130,9 @@ core/agent.py::agent.runUserMessage()
     │   └── tools/router.py::router(registry, toolContext(...))
     ├── registry.listModelTools()
     ├── modelAdapter.complete(messages, tools)
-    │   ├── openaiAdapter.convertMessage(message) x N
+    │   ├── chatCompletionsAdapter.convertMessage(message) x N
     │   ├── urllib.request.urlopen(.../chat/completions)
-    │   └── openaiAdapter.parseAssistantPayload(payload)
+    │   └── chatCompletionsAdapter.parseAssistantPayload(payload)
     ├── conversation.addMessage(assistantMessage)
     ├── 如果没有 toolCalls：return runResult(status='completed')
     └── 如果存在 toolCalls：for call in assistantMessage.toolCalls
@@ -1162,7 +1162,7 @@ core/agent.py::agent.runUserMessage()
 | 函数 | 行号 | 作用 | 被谁调用 / 调谁 |
 | --- | ---: | --- | --- |
 | `askDeletionConfirmation(call, reason)` | 21 | CLI 删除命令确认 | 被 `agent.continueModelLoop()` 通过回调调用；读取 `toolCall.arguments['command']` |
-| `buildAgent(debugEnabled, workDir)` | 30 | CLI Agent 装配 | 调 `debugConsole()`、`loadModelConfig()`、`openaiAdapter()`、`createDefaultRegistry()`、`agent()` |
+| `buildAgent(debugEnabled, workDir)` | 30 | CLI Agent 装配 | 调 `debugConsole()`、`loadModelConfig()`、`chatCompletionsAdapter()`、`createDefaultRegistry()`、`agent()` |
 | `main()` | 45 | CLI 主入口 | 解析参数，循环读取输入，调用 `agent.runUserMessage()` |
 
 ### 5.2 `flamingoAgents/app/server.py`
@@ -1208,11 +1208,11 @@ core/agent.py::agent.runUserMessage()
 | `messageRole` | 14 | 消息角色 Literal | `chatMessage.role` |
 | `agentStatus` | 15 | Agent 返回状态 Literal | `runResult.status` |
 | `toolCall` | 19 | 工具调用数据 | 模型解析、guard、router、pendingConfirm |
-| `chatMessage` | 26 | 统一聊天消息 | conversation、openaiAdapter、manualChecks fakeModel |
+| `chatMessage` | 26 | 统一聊天消息 | conversation、chatCompletionsAdapter、manualChecks fakeModel |
 | `toolResult` | 35 | 工具执行结果 | router、tool implementations、conversation |
 | `toolContext` | 44 | 工具上下文 | router、file/bash tools |
 | `toolSpec` | 50 | 工具定义 | registry |
-| `modelConfig` | 58 | 模型配置 | model registry、openaiAdapter |
+| `modelConfig` | 58 | 模型配置 | model registry、chatCompletionsAdapter |
 | `runResult` | 68 | 入口层统一响应 | CLI/HTTP/agent |
 | `pendingConfirm` | 79 | HTTP 删除确认暂存 | agent.pendingConfirms |
 
@@ -1225,14 +1225,14 @@ core/agent.py::agent.runUserMessage()
 | `loadModelConfigFromEnv()` | 82 | 从环境变量加载模型配置并校验 | 被 `loadModelConfig()` fallback 调用；返回 `modelConfig` |
 | `loadModelConfigFromYaml()` | 108 | 从 YAML provider/model 配置加载模型配置 | 被 `loadModelConfig()` 默认调用；校验 provider、model、api 与 apiKey |
 
-### 5.7 `flamingoAgents/models/openai.py`
+### 5.7 `flamingoAgents/models/chatCompletions.py`
 
 | 函数 / 方法 | 行号 | 作用 | 被谁调用 / 调谁 |
 | --- | ---: | --- | --- |
-| `openaiAdapter.__init__(config, debugConsole)` | 20 | 保存配置和 debug 控制台 | 被 CLI/HTTP `buildAgent()` 调用 |
-| `openaiAdapter.complete(messages, tools)` | 24 | 发起 OpenAI 兼容 chat completions 请求 | 被 `agent.continueModelLoop()` 调用；调 `convertMessage()`、`parseAssistantPayload()` |
-| `openaiAdapter.convertMessage(message)` | 63 | 内部消息转 OpenAI 消息 | 被 `complete()` 调用 |
-| `openaiAdapter.parseAssistantPayload(payload)` | 88 | 解析模型响应为 `chatMessage` | 被 `complete()` 与 `manualChecks.runAdapterParseCheck()` 调用 |
+| `chatCompletionsAdapter.__init__(config, debugConsole)` | 20 | 保存配置和 debug 控制台 | 被 CLI/HTTP `buildAgent()` 调用 |
+| `chatCompletionsAdapter.complete(messages, tools)` | 24 | 发起 OpenAI 兼容 chat completions 请求 | 被 `agent.continueModelLoop()` 调用；调 `convertMessage()`、`parseAssistantPayload()` |
+| `chatCompletionsAdapter.convertMessage(message)` | 63 | 内部消息转 OpenAI 消息 | 被 `complete()` 调用 |
+| `chatCompletionsAdapter.parseAssistantPayload(payload)` | 88 | 解析模型响应为 `chatMessage` | 被 `complete()` 与 `manualChecks.runAdapterParseCheck()` 调用 |
 
 ### 5.8 `flamingoAgents/tools/registry.py`
 
