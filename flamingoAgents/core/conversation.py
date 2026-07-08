@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-07-02
-Description: Maintains per-session conversation state (messages, session lock, pending confirmation) and mirrors key events to JSONL logs using shared preview helpers.
+Version: 1.4
+Date: 2026-07-08
+Description: Maintains per-session conversation state (messages, session lock, pending confirmation). Messages are kept for the next model request; only tool results are mirrored to JSONL logs.
 '''
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from threading import RLock
 
 from flamingoAgents.core.types import chatMessage, pendingConfirm, toolResult
 from flamingoAgents.utils.jsonl import jsonlLog
-from flamingoAgents.utils.preview import makePreview
 
 
 class conversation:
@@ -37,45 +36,15 @@ class conversation:
 
     def addMessage(self, message: chatMessage) -> None:
         self.messages.append(message)
-        if message.role == 'assistant' and message.toolCalls:
-            if message.content:
-                self.logger.logEvent({
-                    'type': 'message',
-                    'role': message.role,
-                    'content': message.content,
-                })
-            for call in message.toolCalls:
-                argumentsPreview, argumentsTruncated = makePreview(call.arguments)
-                self.logger.logEvent({
-                    'type': 'toolCall',
-                    'role': 'assistant',
-                    'toolCallId': call.id,
-                    'toolName': call.toolName,
-                    'argumentsPreview': argumentsPreview,
-                    'argumentsTruncated': argumentsTruncated,
-                })
-            return
-
-        self.logger.logEvent({
-            'type': 'message',
-            'role': message.role,
-            'content': message.content,
-            'toolCallId': message.toolCallId,
-            'name': message.name,
-        })
 
     def addToolResult(self, result: toolResult) -> None:
-        resultPreview, resultTruncated = makePreview(result.content)
-        detailsPreview, detailsTruncated = makePreview(result.details)
         self.logger.logEvent({
             'type': 'toolResult',
             'toolCallId': result.toolCallId,
             'toolName': result.toolName,
             'isError': result.isError,
-            'contentPreview': resultPreview,
-            'contentTruncated': resultTruncated,
-            'detailsPreview': detailsPreview,
-            'detailsTruncated': detailsTruncated,
+            'content': result.content,
+            'details': result.details,
         })
         self.messages.append(chatMessage(
             role='tool',

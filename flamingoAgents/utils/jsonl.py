@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.2
-Date: 2026-07-02
-Description: Writes JSONL audit events using shared redaction and preview helpers.
+Version: 1.3
+Date: 2026-07-08
+Description: Writes JSONL audit events faithfully without redaction or truncation.
 '''
 
 from __future__ import annotations
@@ -12,8 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from flamingoAgents.utils.preview import makePreview, toJsonable
-from flamingoAgents.utils.redaction import redactText
+from flamingoAgents.utils.preview import toJsonable
 
 
 class jsonlLog:
@@ -27,14 +26,5 @@ class jsonlLog:
             **toJsonable(event),
         }
         eventText = json.dumps(eventToWrite, ensure_ascii=False, sort_keys=True)
-        safeText = redactText(eventText)
         with self.logPath.open('a', encoding='utf-8') as fileObj:
-            fileObj.write(safeText + '\n')
-
-    def logPreviewEvent(self, eventType: str, payload: dict[str, Any]) -> None:
-        previewText, truncated = makePreview(payload)
-        self.logEvent({
-            'type': eventType,
-            'payloadPreview': previewText,
-            'truncated': truncated,
-        })
+            fileObj.write(eventText + '\n')

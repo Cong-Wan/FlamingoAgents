@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.4
-Date: 2026-07-02
-Description: Coordinates pure Agent sessions; per-session state (lock + pending) lives on the conversation, only the sessionId index is agent-global and guarded by a short critical section.
+Version: 1.6
+Date: 2026-07-08
+Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state.
 '''
 
 from __future__ import annotations
@@ -16,9 +16,10 @@ from uuid import uuid4
 from flamingoAgents.core.conversation import conversation
 from flamingoAgents.core.ports import modelAdapterPort
 from flamingoAgents.core.types import chatMessage, pendingConfirm, runResult, toolCall, toolContext, toolResult
-from flamingoAgents.tools.toolConfig import toolDefinition
+from flamingoAgents.tools.toolDefinition import toolDefinition
 from flamingoAgents.tools.toolPolicy import evaluateToolCall
-from flamingoAgents.tools.toolRuntime import executeTool
+from flamingoAgents.tools.toolRegistry import toolRegistry
+from flamingoAgents.tools.toolRuntime import executeToolCall as executeCallableToolCall
 from flamingoAgents.tools.toolSchema import buildModelTools
 
 systemPrompt = '''你是 Flamingo Agents。你可以正常聊天，也可以调用配置中声明的工具。联网查询只能通过 shell runtime 中的 curl 等简单 shell 命令完成。如果 curl 因反爬、登录墙、验证码、403 或空结果失败，你必须诚实说明失败，不尝试绕过。需要确认的工具调用必须等待宿主调用 continueConfirmation。'''
@@ -35,7 +36,7 @@ class agent:
         maxModelSteps: int = 8,
     ):
         self.modelAdapter = modelAdapter
-        self.toolDefinitions = {definition.name: definition for definition in toolDefinitions}
+        self.toolRegistry = toolRegistry(toolDefinitions, debugConsole=debugConsole)
         self.workDir = workDir
         self.logDir = logDir
         self.debugConsole = debugConsole
@@ -89,7 +90,7 @@ class agent:
     def continueModelLoop(self, sessionId: str) -> runResult:
         currentConversation = self.getConversation(sessionId)
         for stepIndex in range(self.maxModelSteps):
-            modelTools = buildModelTools(list(self.toolDefinitions.values()))
+            modelTools = buildModelTools(self.toolRegistry.list())
             if self.debugConsole:
                 self.debugConsole.debug(
                     f'agent 模型循环 step={stepIndex + 1} sessionId={sessionId} '
@@ -103,10 +104,12 @@ class agent:
 
             requestPayload = getattr(completion, 'requestPayload', None)
             responsePayload = getattr(completion, 'responsePayload', None)
-            if isinstance(requestPayload, dict):
-                currentConversation.logger.logEvent({'type': 'modelRequest', 'request': requestPayload})
-            if isinstance(responsePayload, dict):
-                currentConversation.logger.logEvent({'type': 'modelResponse', 'response': responsePayload})
+            if isinstance(requestPayload, dict) and isinstance(responsePayload, dict):
+                currentConversation.logger.logEvent({
+                    'type': 'modelTurn',
+                    'request': requestPayload,
+                    'response': responsePayload,
+                })
 
             assistantMessage = completion.message
             currentConversation.addMessage(assistantMessage)
@@ -129,7 +132,7 @@ class agent:
         currentConversation = self.getConversation(sessionId)
         for index in range(startIndex, len(toolCalls)):
             call = toolCalls[index]
-            definition = self.toolDefinitions.get(call.toolName)
+            definition = self.toolRegistry.get(call.toolName)
             if definition is None:
                 currentConversation.addToolResult(self.makeUnknownToolResult(call))
                 continue
@@ -153,7 +156,7 @@ class agent:
                     status='confirmationRequired',
                     confirmationId=confirmationId,
                     reason=decision.reason,
-                    commandPreview=str(call.arguments),
+                    commandPreview=self.buildToolPreview(definition, call),
                     toolCall=call,
                 )
             result = self.executeToolCall(call)
@@ -161,11 +164,25 @@ class agent:
         return None
 
     def executeToolCall(self, call: toolCall) -> toolResult:
-        definition = self.toolDefinitions.get(call.toolName)
+        definition = self.toolRegistry.get(call.toolName)
         if definition is None:
             return self.makeUnknownToolResult(call)
         context = toolContext(workDir=self.workDir, debugConsole=self.debugConsole)
-        return executeTool(definition, call.arguments, context, toolCallId=call.id)
+        return executeCallableToolCall(definition, call, context)
+
+    def buildToolPreview(self, definition: toolDefinition, call: toolCall) -> str:
+        if definition.preview is not None and isinstance(call.arguments, dict):
+            try:
+                preview = definition.preview(call.arguments)
+                if preview:
+                    return preview
+            except Exception as error:
+                if self.debugConsole:
+                    self.debugConsole.debug(
+                        f'工具预览生成失败 tool={definition.name} callId={call.id} '
+                        f'error={type(error).__name__}: {error}'
+                    )
+        return str(call.arguments)
 
     def makeUnknownToolResult(self, call: toolCall) -> toolResult:
         return toolResult(
