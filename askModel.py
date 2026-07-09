@@ -1,29 +1,38 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-07-03
+Version: 1.2
+Date: 2026-07-09
 Description: 导入 Flamingo，向大模型发起一次请求，让它阅读 docs/flamingoAgentsFlow.md 并打印模型的回复。
             v1.1 调大 maxModelSteps，避免大文件分多次读取时超过默认 8 步上限。
+            v1.2 解析 --debug 并传入 createAgent，使诊断输出真正生效。
 '''
 
+import argparse
 from pathlib import Path
 
 from flamingoAgents import createAgent
 
 
+def parseArgs() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='向大模型发起一次请求并打印回复。')
+    parser.add_argument('--debug', action='store_true', default=True, help='开启诊断输出。')
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parseArgs()
     projectDir = Path(__file__).resolve().parent
-    flamingo = createAgent(projectDir)
+    flamingo = createAgent(projectDir, debug=args.debug)
     flamingo.maxModelSteps = 20
 
     prompt = '阅读 /Users/wilbur/project/FlamingoAgents/docs/addCallableToolFunction.md 这个文件'
     result = flamingo.runUserMessage(prompt)
 
-    print('==== 会话状态 ====')
-    print(f'sessionId: {result.sessionId}')
-    print(f'status:    {result.status}')
-    print('==== 模型回复 ====')
-    print(result.message)
+    # print('==== 会话状态 ====')
+    # print(f'sessionId: {result.sessionId}')
+    # print(f'status:    {result.status}')
+    # print('==== 模型回复 ====')
+    # print(result.message)
 
 
 if __name__ == '__main__':

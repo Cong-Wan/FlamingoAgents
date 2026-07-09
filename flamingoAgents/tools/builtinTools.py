@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-07-08
-Description: Defines built-in callable tools for file read/write/edit and bash execution.
+Version: 1.2
+Date: 2026-07-09
+Description: Defines built-in callable tools for file read/write/edit and bash execution. File tools resolve paths directly (~ expanded via expanduser, absolute honored, relative resolved against the working directory) without sandbox validation.
 '''
 
 from __future__ import annotations
@@ -71,7 +71,8 @@ def previewReadTool(arguments: dict[str, Any]) -> str:
 
 
 def readTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:
-    path = resolveSafePath(str(arguments['path']), context.workDir)
+    rawPath = Path(arguments['path']).expanduser()
+    path = rawPath if rawPath.is_absolute() else (context.workDir / rawPath)
     offset = int(arguments.get('offset', 1))
     limit = int(arguments.get('limit', 2000))
     if context.debugConsole:
@@ -128,7 +129,8 @@ def previewWriteTool(arguments: dict[str, Any]) -> str:
 
 
 def writeTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:
-    path = resolveSafePath(str(arguments['path']), context.workDir)
+    rawPath = Path(arguments['path']).expanduser()
+    path = rawPath if rawPath.is_absolute() else (context.workDir / rawPath)
     content = str(arguments['content'])
     if context.debugConsole:
         context.debugConsole.debug(f'写入工具开始 path={path} bytes={len(content.encode("utf-8"))}')
@@ -183,7 +185,8 @@ def previewEditTool(arguments: dict[str, Any]) -> str:
 
 
 def editTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:
-    path = resolveSafePath(str(arguments['path']), context.workDir)
+    rawPath = Path(arguments['path']).expanduser()
+    path = rawPath if rawPath.is_absolute() else (context.workDir / rawPath)
     edits = arguments['edits']
     if context.debugConsole:
         context.debugConsole.debug(f'编辑工具开始 path={path} editCount={len(edits)}')
@@ -324,21 +327,6 @@ def bashTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:
                 'stderrTruncated': stderrTruncated,
             },
         )
-
-
-def resolveSafePath(pathValue: str, workDir: Path) -> Path:
-    if pathValue.strip().startswith('~'):
-        raise ValueError(f'路径不能使用 ~：{pathValue}')
-    rawPath = Path(pathValue)
-    if rawPath.is_absolute():
-        raise ValueError(f'路径必须是工作目录内的相对路径：{pathValue}')
-    root = workDir.resolve()
-    resolved = (root / rawPath).resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError as error:
-        raise ValueError(f'路径超出工作目录：{pathValue}') from error
-    return resolved
 
 
 def decodeProcessText(value: str | bytes | None) -> str:

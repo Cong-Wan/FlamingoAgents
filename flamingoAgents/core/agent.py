@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.6
-Date: 2026-07-08
-Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state.
+Version: 1.7
+Date: 2026-07-09
+Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. Model turns are logged as atomic events (systemMessage/userMessage/assistantMessage/toolResult) instead of full request/response payloads.
 '''
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from flamingoAgents.core.conversation import conversation
 from flamingoAgents.core.ports import modelAdapterPort
-from flamingoAgents.core.types import chatMessage, pendingConfirm, runResult, toolCall, toolContext, toolResult
+from flamingoAgents.core.types import pendingConfirm, runResult, toolCall, toolContext, toolResult
 from flamingoAgents.tools.toolDefinition import toolDefinition
 from flamingoAgents.tools.toolPolicy import evaluateToolCall
 from flamingoAgents.tools.toolRegistry import toolRegistry
@@ -60,7 +60,7 @@ class agent:
             if self.debugConsole:
                 self.debugConsole.debug(f'收到用户消息 sessionId={realSessionId} chars={len(cleanMessage)}')
             currentConversation = self.getConversation(realSessionId)
-            currentConversation.addMessage(chatMessage(role='user', content=cleanMessage))
+            currentConversation.appendUserMessage(cleanMessage)
             return self.continueModelLoop(realSessionId)
 
     def continueConfirmation(self, sessionId: str, confirmationId: str, approved: bool) -> runResult:
@@ -102,17 +102,12 @@ class agent:
                 self.logModelError(currentConversation, error)
                 return runResult(sessionId=sessionId, status='error', message=f'模型调用失败：{error}')
 
-            requestPayload = getattr(completion, 'requestPayload', None)
             responsePayload = getattr(completion, 'responsePayload', None)
-            if isinstance(requestPayload, dict) and isinstance(responsePayload, dict):
-                currentConversation.logger.logEvent({
-                    'type': 'modelTurn',
-                    'request': requestPayload,
-                    'response': responsePayload,
-                })
-
             assistantMessage = completion.message
-            currentConversation.addMessage(assistantMessage)
+            currentConversation.appendAssistantMessage(
+                assistantMessage,
+                responsePayload if isinstance(responsePayload, dict) else {},
+            )
             if not assistantMessage.toolCalls:
                 if self.debugConsole:
                     self.debugConsole.debug(f'模型循环完成 sessionId={sessionId} contentChars={len(assistantMessage.content)}')
@@ -238,7 +233,12 @@ class agent:
                 return existing
             dateText = datetime.now().strftime('%Y%m%d')
             logPath = self.logDir / f'{dateText}_{sessionId}.jsonl'
-            newConversation = conversation(sessionId=sessionId, logPath=logPath, systemPrompt=systemPrompt)
+            newConversation = conversation(
+                sessionId=sessionId,
+                logPath=logPath,
+                systemPrompt=systemPrompt,
+                debugConsole=self.debugConsole,
+            )
             self.conversations[sessionId] = newConversation
             return newConversation
 
