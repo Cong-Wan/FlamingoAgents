@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-07-01
+Version: 1.2
+Date: 2026-07-08
 Description: Provides --debug controlled diagnostic printing for Flamingo Agents.
 '''
 
@@ -21,4 +21,5 @@ class debugConsole:
             print(f'[debug {nowText}] {message}', flush=True)
 
     def visible(self, message: str) -> None:
-        print(message, flush=True)
+        if self.isDebug:
+            print(message, flush=True)

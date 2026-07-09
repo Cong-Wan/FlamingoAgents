@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-07-02
-Description: Enforces config-driven tool permission rules before runtime execution.
+Version: 1.1
+Date: 2026-07-08
+Description: Enforces callable tool permission rules before runtime execution.
 '''
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from flamingoAgents.core.types import toolCall
-from flamingoAgents.tools.toolConfig import toolDefinition
+from flamingoAgents.tools.toolDefinition import toolDefinition
 
 
 @dataclass

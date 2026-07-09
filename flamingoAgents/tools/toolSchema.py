@@ -1,15 +1,15 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-07-02
-Description: Converts internal config-driven tool definitions into model function-call schemas.
+Version: 1.1
+Date: 2026-07-08
+Description: Converts callable tool definitions into model function-call schemas.
 '''
 
 from __future__ import annotations
 
 from typing import Any
 
-from flamingoAgents.tools.toolConfig import toolDefinition
+from flamingoAgents.tools.toolDefinition import toolDefinition
 
 
 def buildModelTool(definition: toolDefinition) -> dict[str, Any]:

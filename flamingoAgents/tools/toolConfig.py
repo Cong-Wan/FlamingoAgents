@@ -1,109 +1,88 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-07-02
-Description: Loads config-driven tool definitions and compiles runtime permission rules.
+Version: 1.1
+Date: 2026-07-08
+Description: Loads callable tool settings and compiles runtime permission rules.
 '''
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Pattern
+from typing import Any, Pattern
 
 import yaml
 
-permissionAction = Literal['requireApproval']
+from flamingoAgents.tools.toolDefinition import permissionRule
 
 
 @dataclass
-class permissionRule:
-    id: str
-    field: str
-    action: permissionAction
-    reason: str
-    patterns: list[Pattern[str]]
-
-
-@dataclass
-class toolDefinition:
-    name: str
-    description: str
-    parameters: dict[str, Any]
-    runtime: dict[str, Any]
-    permissions: list[permissionRule]
+class toolSettings:
+    enabledTools: list[str]
+    permissionsByTool: dict[str, list[permissionRule]] = field(default_factory=dict)
 
 
 defaultToolsConfigPath = Path(__file__).resolve().parents[2] / 'config' / 'tools.yaml'
 
 
-def loadToolConfig(configPath: str | Path | None = None, debugConsole=None) -> list[toolDefinition]:
+def loadToolSettings(configPath: str | Path | None = None, debugConsole=None) -> toolSettings:
     path = Path(configPath) if configPath is not None else defaultToolsConfigPath
     if debugConsole:
-        debugConsole.debug(f'加载工具配置 path={path}')
+        debugConsole.debug(f'加载工具设置 path={path}')
     if not path.exists():
         raise RuntimeError(f'工具配置文件不存在：{path}')
     with path.open('r', encoding='utf-8') as configFile:
         rawConfig = yaml.safe_load(configFile) or {}
-    return parseToolConfig(rawConfig, source=str(path), debugConsole=debugConsole)
+    return parseToolSettings(rawConfig, source=str(path), debugConsole=debugConsole)
 
 
-def parseToolConfig(rawConfig: Any, source: str = '<memory>', debugConsole=None) -> list[toolDefinition]:
+def parseToolSettings(rawConfig: Any, source: str = '<memory>', debugConsole=None) -> toolSettings:
     if not isinstance(rawConfig, dict):
         raise RuntimeError(f'工具配置必须是 YAML 对象：{source}')
     version = rawConfig.get('version')
-    if version != 1:
-        raise RuntimeError(f'工具配置 version 必须是 1，实际为：{version}')
-    rawTools = rawConfig.get('tools')
-    if not isinstance(rawTools, list) or not rawTools:
-        raise RuntimeError('工具配置 tools 必须是非空数组。')
+    if version != 2:
+        raise RuntimeError(f'工具配置 version 必须是 2，实际为：{version}')
 
-    seenNames: set[str] = set()
-    definitions: list[toolDefinition] = []
-    for index, rawTool in enumerate(rawTools):
-        definition = parseTool(index, rawTool)
-        if definition.name in seenNames:
-            raise RuntimeError(f'工具名称重复：{definition.name}')
-        seenNames.add(definition.name)
-        definitions.append(definition)
+    rawEnabledTools = rawConfig.get('enabledTools')
+    if not isinstance(rawEnabledTools, list) or not rawEnabledTools:
+        raise RuntimeError('工具配置 enabledTools 必须是非空数组。')
+
+    enabledTools: list[str] = []
+    seenTools: set[str] = set()
+    for index, rawToolName in enumerate(rawEnabledTools):
+        if not isinstance(rawToolName, str) or not rawToolName.strip():
+            raise RuntimeError(f'enabledTools 第 {index + 1} 项必须是非空字符串。')
+        toolName = rawToolName.strip()
+        if toolName in seenTools:
+            raise RuntimeError(f'启用工具名称重复：{toolName}')
+        seenTools.add(toolName)
+        enabledTools.append(toolName)
+
+    rawPermissionsByTool = rawConfig.get('toolPermissions', {})
+    if rawPermissionsByTool is None:
+        rawPermissionsByTool = {}
+    if not isinstance(rawPermissionsByTool, dict):
+        raise RuntimeError('工具配置 toolPermissions 必须是对象。')
+
+    permissionsByTool: dict[str, list[permissionRule]] = {}
+    for rawToolName, rawPermissions in rawPermissionsByTool.items():
+        if not isinstance(rawToolName, str) or not rawToolName.strip():
+            raise RuntimeError('toolPermissions 的 key 必须是非空工具名。')
+        toolName = rawToolName.strip()
+        if toolName not in seenTools:
+            raise RuntimeError(f'工具权限配置引用了未启用工具：{toolName}')
+        permissionsByTool[toolName] = parsePermissions(toolName, rawPermissions)
+
+    for toolName in enabledTools:
+        permissionsByTool.setdefault(toolName, [])
 
     if debugConsole:
-        debugConsole.debug(f'工具配置加载完成 count={len(definitions)} names={",".join(sorted(seenNames))}')
-    return definitions
-
-
-def parseTool(index: int, rawTool: Any) -> toolDefinition:
-    if not isinstance(rawTool, dict):
-        raise RuntimeError(f'第 {index + 1} 个工具必须是对象。')
-
-    name = readRequiredString(rawTool, 'name', f'第 {index + 1} 个工具')
-    description = readRequiredString(rawTool, 'description', f'工具 {name}')
-    permissionSummary = rawTool.get('modelPermissionSummary')
-    if isinstance(permissionSummary, str) and permissionSummary.strip():
-        description = f'{description}\n\n权限提示：{permissionSummary.strip()}'
-
-    parameters = rawTool.get('parameters')
-    if not isinstance(parameters, dict) or parameters.get('type') != 'object':
-        raise RuntimeError(f'工具 {name} 的 parameters 必须是 type=object 的对象。')
-
-    runtime = rawTool.get('runtime')
-    if not isinstance(runtime, dict):
-        raise RuntimeError(f'工具 {name} 缺少 runtime 对象。')
-    runtimeType = runtime.get('type')
-    if runtimeType not in {'file', 'shell'}:
-        raise RuntimeError(f'工具 {name} 的 runtime.type 不支持：{runtimeType}')
-    if runtimeType == 'file' and runtime.get('operation') not in {'read', 'write', 'edit'}:
-        raise RuntimeError(f'工具 {name} 的 file operation 不支持：{runtime.get("operation")}')
-
-    permissions = parsePermissions(name, rawTool.get('permissions', []))
-    return toolDefinition(
-        name=name,
-        description=description,
-        parameters=parameters,
-        runtime=runtime,
-        permissions=permissions,
-    )
+        debugConsole.debug(
+            f'工具设置加载完成 enabledTools={",".join(enabledTools)} '
+            f'permissionTools={",".join(sorted(permissionsByTool.keys()))}'
+        )
+    return toolSettings(enabledTools=enabledTools, permissionsByTool=permissionsByTool)
 
 
 def parsePermissions(toolName: str, rawPermissions: Any) -> list[permissionRule]:
@@ -116,7 +95,7 @@ def parsePermissions(toolName: str, rawPermissions: Any) -> list[permissionRule]
         if not isinstance(rawRule, dict):
             raise RuntimeError(f'工具 {toolName} 的第 {index + 1} 条 permission 必须是对象。')
         ruleId = readRequiredString(rawRule, 'id', f'工具 {toolName} permission {index + 1}')
-        field = readRequiredString(rawRule, 'field', f'工具 {toolName} permission {ruleId}')
+        fieldName = readRequiredString(rawRule, 'field', f'工具 {toolName} permission {ruleId}')
         action = readRequiredString(rawRule, 'action', f'工具 {toolName} permission {ruleId}')
         if action != 'requireApproval':
             raise RuntimeError(f'工具 {toolName} permission {ruleId} action 不支持：{action}')
@@ -137,7 +116,7 @@ def parsePermissions(toolName: str, rawPermissions: Any) -> list[permissionRule]
                 raise RuntimeError(f'工具 {toolName} permission {ruleId} regex 无法编译：{patternText}') from error
         parsedRules.append(permissionRule(
             id=ruleId,
-            field=field,
+            field=fieldName,
             action='requireApproval',
             reason=reason,
             patterns=patterns,
