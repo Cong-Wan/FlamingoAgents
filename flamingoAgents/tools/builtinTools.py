@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.2
+Version: 1.3
 Date: 2026-07-09
-Description: Defines built-in callable tools for file read/write/edit and bash execution. File tools resolve paths directly (~ expanded via expanduser, absolute honored, relative resolved against the working directory) without sandbox validation.
+Description: Provides executable handlers (execute/preview) for built-in tools and a name-keyed registry mapping them to schema-driven tool definitions. Schemas and permissions come from config/tools.yaml.
 '''
 
 from __future__ import annotations
@@ -10,58 +10,17 @@ from __future__ import annotations
 import difflib
 import subprocess
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from flamingoAgents.core.types import toolContext, toolOutput
-from flamingoAgents.tools.toolDefinition import defineTool, permissionRule, toolDefinition
+from flamingoAgents.tools.toolConfig import toolSchemaSpec
+from flamingoAgents.tools.toolDefinition import defineTool, toolDefinition, toolExecuteFunction, toolPreviewFunction
 
 maxTimeoutSeconds = 120
 defaultTimeoutSeconds = 30
 
 
-def createBuiltinTools(
-    enabledTools: list[str],
-    permissionsByTool: dict[str, list[permissionRule]],
-    debugConsole=None,
-) -> list[toolDefinition]:
-    builtinFactories: dict[str, Callable[[list[permissionRule]], toolDefinition]] = {
-        'read': createReadTool,
-        'write': createWriteTool,
-        'edit': createEditTool,
-        'bash': createBashTool,
-    }
-    definitions: list[toolDefinition] = []
-    for toolName in enabledTools:
-        factory = builtinFactories.get(toolName)
-        if factory is None:
-            raise RuntimeError(f'未知内置工具：{toolName}')
-        permissions = permissionsByTool.get(toolName, [])
-        definition = factory(permissions)
-        definitions.append(definition)
-        if debugConsole:
-            debugConsole.debug(f'创建内置工具 tool={toolName} permissions={len(permissions)}')
-    return definitions
-
-
-def createReadTool(permissions: list[permissionRule] | None = None) -> toolDefinition:
-    return defineTool(
-        name='read',
-        description='读取本地文本文件，可通过 offset 和 limit 控制读取的行范围。',
-        parameters={
-            'type': 'object',
-            'properties': {
-                'path': {'type': 'string'},
-                'offset': {'type': 'integer', 'minimum': 1, 'default': 1},
-                'limit': {'type': 'integer', 'minimum': 1, 'default': 2000},
-            },
-            'required': ['path'],
-            'additionalProperties': False,
-        },
-        execute=readTool,
-        permissions=permissions or [],
-        preview=previewReadTool,
-    )
-
+# --- read ---
 
 def previewReadTool(arguments: dict[str, Any]) -> str:
     path = str(arguments.get('path', ''))
@@ -104,24 +63,7 @@ def readTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:
     )
 
 
-def createWriteTool(permissions: list[permissionRule] | None = None) -> toolDefinition:
-    return defineTool(
-        name='write',
-        description='创建或完整覆盖本地文本文件。',
-        parameters={
-            'type': 'object',
-            'properties': {
-                'path': {'type': 'string'},
-                'content': {'type': 'string'},
-            },
-            'required': ['path', 'content'],
-            'additionalProperties': False,
-        },
-        execute=writeTool,
-        permissions=permissions or [],
-        preview=previewWriteTool,
-    )
-
+# --- write ---
 
 def previewWriteTool(arguments: dict[str, Any]) -> str:
     content = str(arguments.get('content', ''))
@@ -147,36 +89,7 @@ def writeTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:
     )
 
 
-def createEditTool(permissions: list[permissionRule] | None = None) -> toolDefinition:
-    return defineTool(
-        name='edit',
-        description='对已有文本文件进行精确文本替换。每个 oldText 必须唯一匹配。',
-        parameters={
-            'type': 'object',
-            'properties': {
-                'path': {'type': 'string'},
-                'edits': {
-                    'type': 'array',
-                    'minItems': 1,
-                    'items': {
-                        'type': 'object',
-                        'properties': {
-                            'oldText': {'type': 'string'},
-                            'newText': {'type': 'string'},
-                        },
-                        'required': ['oldText', 'newText'],
-                        'additionalProperties': False,
-                    },
-                },
-            },
-            'required': ['path', 'edits'],
-            'additionalProperties': False,
-        },
-        execute=editTool,
-        permissions=permissions or [],
-        preview=previewEditTool,
-    )
-
+# --- edit ---
 
 def previewEditTool(arguments: dict[str, Any]) -> str:
     edits = arguments.get('edits', [])
@@ -232,25 +145,7 @@ def editTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:
     )
 
 
-def createBashTool(permissions: list[permissionRule] | None = None) -> toolDefinition:
-    return defineTool(
-        name='bash',
-        description='在工作目录中执行 bash 命令。curl、python、grep、open 均通过此工具执行。\n\n权限提示：删除类命令会请求用户确认。maxOutput 控制 stdout/stderr 保留字符数，默认 2000，-1 表示不截断。',
-        parameters={
-            'type': 'object',
-            'properties': {
-                'command': {'type': 'string'},
-                'timeout': {'type': 'integer', 'minimum': 1, 'default': 30},
-                'maxOutput': {'type': 'integer', 'minimum': -1, 'default': 2000},
-            },
-            'required': ['command'],
-            'additionalProperties': False,
-        },
-        execute=bashTool,
-        permissions=permissions or [],
-        preview=previewBashTool,
-    )
-
+# --- bash ---
 
 def previewBashTool(arguments: dict[str, Any]) -> str:
     return str(arguments.get('command', ''))
@@ -335,3 +230,39 @@ def decodeProcessText(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode('utf-8', errors='replace')
     return ''
+
+
+# --- schema-driven assembly ---
+
+executableMap: dict[str, tuple[toolExecuteFunction, toolPreviewFunction]] = {
+    'read': (readTool, previewReadTool),
+    'write': (writeTool, previewWriteTool),
+    'edit': (editTool, previewEditTool),
+    'bash': (bashTool, previewBashTool),
+}
+
+
+def createBuiltinTools(toolSchemas: list[toolSchemaSpec], debugConsole=None) -> list[toolDefinition]:
+    definitions: list[toolDefinition] = []
+    for schema in toolSchemas:
+        handlers = executableMap.get(schema.name)
+        if handlers is None:
+            raise RuntimeError(f'未知工具实现：{schema.name}')
+        execute, preview = handlers
+        definition = defineTool(
+            name=schema.name,
+            description=schema.description,
+            parameters=schema.parameters,
+            execute=execute,
+            permissions=schema.permissions,
+            preview=preview,
+        )
+        definitions.append(definition)
+        if debugConsole:
+            debugConsole.debug(
+                f'绑定工具实现 tool={schema.name} '
+                f'permissions={len(schema.permissions)}'
+            )
+    if debugConsole:
+        debugConsole.debug(f'工具定义装配完成 count={len(definitions)}')
+    return definitions

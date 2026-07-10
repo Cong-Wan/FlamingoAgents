@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.7
+Version: 1.8
 Date: 2026-07-09
-Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. Model turns are logged as atomic events (systemMessage/userMessage/assistantMessage/toolResult) instead of full request/response payloads.
+Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. System prompt is injected at construction; model turns are logged as atomic events (systemMessage/userMessage/assistantMessage/toolResult) instead of full request/response payloads.
 '''
 
 from __future__ import annotations
@@ -22,8 +22,6 @@ from flamingoAgents.tools.toolRegistry import toolRegistry
 from flamingoAgents.tools.toolRuntime import executeToolCall as executeCallableToolCall
 from flamingoAgents.tools.toolSchema import buildModelTools
 
-systemPrompt = '''你是 Flamingo Agents。你可以正常聊天，也可以调用配置中声明的工具。联网查询只能通过 shell runtime 中的 curl 等简单 shell 命令完成。如果 curl 因反爬、登录墙、验证码、403 或空结果失败，你必须诚实说明失败，不尝试绕过。需要确认的工具调用必须等待宿主调用 continueConfirmation。'''
-
 
 class agent:
     def __init__(
@@ -32,6 +30,7 @@ class agent:
         toolDefinitions: list[toolDefinition],
         workDir: Path,
         logDir: Path,
+        systemPrompt: str,
         debugConsole=None,
         maxModelSteps: int = 8,
     ):
@@ -39,6 +38,7 @@ class agent:
         self.toolRegistry = toolRegistry(toolDefinitions, debugConsole=debugConsole)
         self.workDir = workDir
         self.logDir = logDir
+        self.systemPrompt = systemPrompt
         self.debugConsole = debugConsole
         self.maxModelSteps = maxModelSteps
         self.conversations: dict[str, conversation] = {}
@@ -236,7 +236,7 @@ class agent:
             newConversation = conversation(
                 sessionId=sessionId,
                 logPath=logPath,
-                systemPrompt=systemPrompt,
+                systemPrompt=self.systemPrompt,
                 debugConsole=self.debugConsole,
             )
             self.conversations[sessionId] = newConversation

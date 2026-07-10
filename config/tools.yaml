@@ -1,24 +1,95 @@
-version: 2
+version: 3
 
-enabledTools:
-  - read
-  - write
-  - edit
-  - bash
+tools:
+  - name: read
+    description: 读取本地文本文件，可通过 offset 和 limit 控制读取的行范围。
+    parameters:
+      type: object
+      properties:
+        path:
+          type: string
+        offset:
+          type: integer
+          minimum: 1
+          default: 1
+        limit:
+          type: integer
+          minimum: 1
+          default: 2000
+      required:
+        - path
+      additionalProperties: false
 
-toolPermissions:
-  bash:
-    - id: deletionCommand
-      field: command
-      action: requireApproval
-      reason: 删除命令需要用户确认
-      match:
-        type: regex
-        patterns:
-          - '(^|[;&|]\s*)rm\s+(-[A-Za-z]*\s+)*[^\n;&|]+'
-          - '(^|[;&|]\s*)rmdir\s+[^\n;&|]+'
-          - '(^|[;&|]\s*)unlink\s+[^\n;&|]+'
-          - '(^|[;&|]\s*)find\s+[^\n;&|]*\s-delete(\s|$)'
-          - 'os\.(remove|unlink|rmdir)\s*\('
-          - 'shutil\.rmtree\s*\('
-          - 'pathlib\.[A-Za-z0-9_\.]+\.(unlink|rmdir)\s*\('
+  - name: write
+    description: 创建或完整覆盖本地文本文件。
+    parameters:
+      type: object
+      properties:
+        path:
+          type: string
+        content:
+          type: string
+      required:
+        - path
+        - content
+      additionalProperties: false
+
+  - name: edit
+    description: 对已有文本文件进行精确文本替换。每个 oldText 必须唯一匹配。
+    parameters:
+      type: object
+      properties:
+        path:
+          type: string
+        edits:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            properties:
+              oldText:
+                type: string
+              newText:
+                type: string
+            required:
+              - oldText
+              - newText
+            additionalProperties: false
+      required:
+        - path
+        - edits
+      additionalProperties: false
+
+  - name: bash
+    description: "在工作目录中执行 bash 命令。curl、python、grep、open 均通过此工具执行。\n\n权限提示：删除类命令会请求用户确认。maxOutput 控制 stdout/stderr 保留字符数，默认 2000，-1 表示不截断。"
+    parameters:
+      type: object
+      properties:
+        command:
+          type: string
+        timeout:
+          type: integer
+          minimum: 1
+          default: 30
+        maxOutput:
+          type: integer
+          minimum: -1
+          default: 2000
+      required:
+        - command
+      additionalProperties: false
+    permissions:
+      - id: deletionCommand
+        field: command
+        action: requireApproval
+        reason: 删除命令需要用户确认
+        match:
+          type: regex
+          patterns:
+            - '(^|[;&|]\s*)rm\s+(-[A-Za-z]*\s+)*[^\n;&|]+'
+            - '(^|[;&|]\s*)rmdir\s+[^\n;&|]+'
+            - '(^|[;&|]\s*)unlink\s+[^\n;&|]+'
+            - '(^|[;&|]\s*)find\s+[^\n;&|]*\s-delete(\s|$)'
+            - 'os\.(remove|unlink|rmdir)\s*\('
+            - 'shutil\.rmtree\s*\('
+            - 'pathlib\.[A-Za-z0-9_\.]+\.(unlink|rmdir)\s*\('
