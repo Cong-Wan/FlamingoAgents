@@ -2,7 +2,7 @@ providers: # 模型提供商列表
   "glm": # 智谱 GLM Coding Plan（OpenAI 协议端点，到 /v4 为止，代码会自动拼 /chat/completions）
     baseUrl: https://open.bigmodel.cn/api/coding/paas/v4
     api: openai-completions # 代码当前仅支持此协议
-    apiKey: 6c094248890d4a7d9d200b2fbc5d3b23.CHcEzPMu3MZr97KU
+    apiKey: your-api-key-here # 替换为你自己的 API 密钥
     models:
       - id: glm-5.2 # 原样传给 API
         name: GLM-5.2 智谱编程套餐
@@ -37,6 +37,3 @@ providers: # 模型提供商列表
           output: 0 # 输出 token 成本
           cacheRead: 0 # 缓存读取成本
           cacheWrite: 0 # 缓存写入成本
-
-
-

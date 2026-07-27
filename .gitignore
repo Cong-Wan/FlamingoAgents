@@ -9,3 +9,6 @@ __pycache__/
 .venv/
 
 .agentLogs/
+
+# 本地模型配置（含密钥），仅提交 models.example.yaml
+config/models.yaml
