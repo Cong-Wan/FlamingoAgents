@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.4
-Date: 2026-07-02
-Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth.
+Version: 1.7
+Date: 2026-07-25
+Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.7 makes the request debug log human-readable: json.dumps now uses ensure_ascii=False so Chinese/emoji are not escaped to \\uXXXX, and the log prints the decoded UTF-8 string instead of the bytes repr.
 '''
 
 from __future__ import annotations
@@ -40,14 +40,19 @@ class chatCompletionsAdapter:
         self.debugConsole = debugConsole
 
     def complete(self, messages: list[chatMessage], tools: list[dict[str, Any]]) -> modelCompletion:
-        requestPayload = {
+        requestPayload: dict[str, Any] = {
             'model': self.config.model,
             'messages': [self.convertMessage(message) for message in messages],
             'tools': tools,
             'tool_choice': 'auto',
         }
+        if self.config.thinking:
+            requestPayload['thinking'] = self.config.thinking
+        if self.config.reasoningEffort:
+            requestPayload['reasoning_effort'] = self.config.reasoningEffort
+
         requestUrl = self.config.baseUrl.rstrip('/') + '/chat/completions'
-        requestBytes = json.dumps(requestPayload).encode('utf-8')
+        requestBytes = json.dumps(requestPayload, ensure_ascii=False).encode('utf-8')
         request = urllib.request.Request(
             requestUrl,
             data=requestBytes,
@@ -58,10 +63,7 @@ class chatCompletionsAdapter:
             },
         )
         if self.debugConsole:
-            self.debugConsole.debug(
-                f'调用模型 provider={self.config.provider} model={self.config.model} '
-                f'messages={len(messages)} tools={len(tools)} url={requestUrl}'
-            )
+            self.debugConsole.debug(f"Source request:\n{requestBytes.decode('utf-8')}\n")
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 responseText = response.read().decode('utf-8')
@@ -83,8 +85,7 @@ class chatCompletionsAdapter:
 
         payload = json.loads(responseText)
         if self.debugConsole:
-            usage = payload.get('usage') if isinstance(payload, dict) else None
-            self.debugConsole.debug(f'模型响应完成 model={self.config.model} usage={usage}')
+            self.debugConsole.debug(f"\nSource response:\n{payload}")
         return modelCompletion(
             message=self.parseAssistantPayload(payload),
             requestPayload=requestPayload,

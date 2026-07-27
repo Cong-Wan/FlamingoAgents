@@ -1,12 +1,13 @@
 '''
 Author: wilbur
-Version: 1.2
-Date: 2026-07-09
-Description: Pure-library assembly factory: resolves paths, loads model config/auth, system prompt, and schema-driven tools, then returns a ready-to-use agent.
+Version: 1.3
+Date: 2026-07-24
+Description: Pure-library assembly factory: resolves paths, loads model config/auth, system prompt, and schema-driven tools, then returns a ready-to-use agent. v1.3 injects the current time into the loaded system prompt.
 '''
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from flamingoAgents.core.agent import agent
@@ -53,6 +54,11 @@ def createAgent(
     if not resolvedSystemPromptPath.exists():
         raise RuntimeError(f'系统提示词文件不存在：{resolvedSystemPromptPath}')
     systemPromptText = resolvedSystemPromptPath.read_text(encoding='utf-8')
+    currentTimeText = datetime.now().astimezone().isoformat(timespec='seconds')
+    systemPromptText = (
+        systemPromptText.rstrip()
+        + f'\n\n## 当前时间\n\n当前日期为：{currentTimeText}。\n'
+    )
     if printer.isDebug:
         printer.debug(f'系统提示词加载完成 chars={len(systemPromptText)}')
     return agent(

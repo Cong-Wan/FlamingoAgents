@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-07-02
+Version: 1.1
+Date: 2026-07-10
 Description: Loads model configuration and resolves API keys without mutating process environment.
 '''
 
@@ -22,6 +22,8 @@ class modelConfig:
     baseUrl: str
     apiType: str
     supportsToolCalling: bool = True
+    thinking: dict[str, Any] | None = None
+    reasoningEffort: str | None = None
 
 
 @dataclass
@@ -114,6 +116,14 @@ def loadModelConfigFromYaml(
     if not isinstance(selectedModelId, str) or not selectedModelId.strip():
         raise RuntimeError(f'provider {providerId} 的模型缺少 id。')
 
+    thinking = selectedModel.get('thinking')
+    if thinking is not None and not isinstance(thinking, dict):
+        raise RuntimeError(f'provider {providerId} 模型 {selectedModelId} 的 thinking 必须是对象。')
+
+    reasoningEffort = selectedModel.get('reasoningEffort')
+    if reasoningEffort is not None and not isinstance(reasoningEffort, str):
+        raise RuntimeError(f'provider {providerId} 模型 {selectedModelId} 的 reasoningEffort 必须是字符串。')
+
     api = selectedModel.get('api') or providerConfig.get('api')
     if api != 'openai-completions':
         raise RuntimeError(f'当前仅支持 openai-completions，实际配置为：{api}')
@@ -124,7 +134,10 @@ def loadModelConfigFromYaml(
     apiKey = resolveApiKey(rawApiKey.strip(), providerId)
 
     if debugConsole:
-        debugConsole.debug(f'从 YAML 加载模型配置 provider={providerId} model={selectedModelId} baseUrl={baseUrl.strip()}')
+        debugConsole.debug(
+            f'从 YAML 加载模型配置 provider={providerId} model={selectedModelId} '
+            f'baseUrl={baseUrl.strip()} thinking={thinking} reasoningEffort={reasoningEffort}'
+        )
     return resolvedModelConfig(
         config=modelConfig(
             provider=providerId,
@@ -132,6 +145,8 @@ def loadModelConfigFromYaml(
             baseUrl=baseUrl.strip(),
             apiType='openaiCompatible',
             supportsToolCalling=True,
+            thinking=thinking,
+            reasoningEffort=reasoningEffort,
         ),
         apiKey=apiKey,
     )

@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-07-08
-Description: Writes JSONL audit events faithfully without redaction or truncation.
+Version: 1.4
+Date: 2026-07-24
+Description: Writes JSONL audit events faithfully without redaction or truncation. v1.4 adds readEvents() to replay logged events for session resume.
 '''
 
 from __future__ import annotations
@@ -28,3 +28,19 @@ class jsonlLog:
         eventText = json.dumps(eventToWrite, ensure_ascii=False, sort_keys=True)
         with self.logPath.open('a', encoding='utf-8') as fileObj:
             fileObj.write(eventText + '\n')
+
+    def readEvents(self) -> list[dict[str, Any]]:
+        if not self.logPath.exists():
+            return []
+        events: list[dict[str, Any]] = []
+        with self.logPath.open('r', encoding='utf-8') as fileObj:
+            for line in fileObj:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    events.append(json.loads(text))
+                except json.JSONDecodeError:
+                    # 进程崩溃可能留下写一半的末行，跳过。
+                    continue
+        return events

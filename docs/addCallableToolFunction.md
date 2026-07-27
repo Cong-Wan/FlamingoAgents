@@ -1,3 +1,5 @@
+> Author: wilbur
+
 > FlamingoAgents 让你新增可被模型 function call 调用的工具函数。照着本文写一个就行。
 
 # 新增 Callable Tool 函数

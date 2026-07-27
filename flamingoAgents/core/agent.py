@@ -1,13 +1,12 @@
 '''
 Author: wilbur
-Version: 1.8
-Date: 2026-07-09
-Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. System prompt is injected at construction; model turns are logged as atomic events (systemMessage/userMessage/assistantMessage/toolResult) instead of full request/response payloads.
+Version: 1.9
+Date: 2026-07-24
+Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. System prompt is injected at construction; model turns are logged as atomic events (systemMessage/userMessage/assistantMessage/toolResult) instead of full request/response payloads. v1.9 wires session resume: dateless per-session log path, dangling tool-call closure on resume, and queued user-message flush after confirmation.
 '''
 
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -60,6 +59,16 @@ class agent:
             if self.debugConsole:
                 self.debugConsole.debug(f'收到用户消息 sessionId={realSessionId} chars={len(cleanMessage)}')
             currentConversation = self.getConversation(realSessionId)
+            dangling = currentConversation.takeDanglingToolCalls()
+            if dangling:
+                currentConversation.setQueuedUserMessage(cleanMessage)
+                batchResult = self.processToolBatch(realSessionId, dangling, 0)
+                if batchResult is not None:
+                    return batchResult
+                queued = currentConversation.takeQueuedUserMessage()
+                if queued:
+                    currentConversation.appendUserMessage(queued)
+                return self.continueModelLoop(realSessionId)
             currentConversation.appendUserMessage(cleanMessage)
             return self.continueModelLoop(realSessionId)
 
@@ -85,6 +94,9 @@ class agent:
             batchResult = self.processToolBatch(sessionId, pending.toolCalls, pending.currentIndex + 1)
             if batchResult is not None:
                 return batchResult
+            queued = currentConversation.takeQueuedUserMessage()
+            if queued:
+                currentConversation.appendUserMessage(queued)
             return self.continueModelLoop(sessionId)
 
     def continueModelLoop(self, sessionId: str) -> runResult:
@@ -231,13 +243,13 @@ class agent:
             existing = self.conversations.get(sessionId)
             if existing is not None:
                 return existing
-            dateText = datetime.now().strftime('%Y%m%d')
-            logPath = self.logDir / f'{dateText}_{sessionId}.jsonl'
+            logPath = self.logDir / f'{sessionId}.jsonl'
             newConversation = conversation(
                 sessionId=sessionId,
                 logPath=logPath,
                 systemPrompt=self.systemPrompt,
                 debugConsole=self.debugConsole,
+                resume=logPath.exists(),
             )
             self.conversations[sessionId] = newConversation
             return newConversation
