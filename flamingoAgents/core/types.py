@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-07-08
-Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs.
+Version: 1.4
+Date: 2026-07-26
+Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.4 adds streaming structures (docs/streamOutputPlan.md §6.2): 3 adapter-layer chunks (textChunk/reasoningChunk/finalChunk) and 7 agent event classes (textDeltaEvent/reasoningDeltaEvent/toolCallStartEvent/toolCallEndEvent/confirmationRequiredEvent/completedEvent/errorEvent) plus the terminalEventTypes tuple.
 '''
 
 from __future__ import annotations
@@ -71,3 +71,69 @@ class pendingConfirm:
     reason: str
     toolCalls: list[toolCall]
     currentIndex: int
+
+
+# ---------- 流式 chunk（适配器层，docs/streamOutputPlan.md §6.2） ----------
+
+
+@dataclass
+class textChunk:
+    text: str
+
+
+@dataclass
+class reasoningChunk:
+    text: str
+
+
+@dataclass
+class finalChunk:
+    # completion 为 models.chatCompletions.modelCompletion，此处用 Any 避免 core → models 的循环导入。
+    completion: Any
+
+
+# ---------- agent 事件流 ----------
+
+
+@dataclass
+class textDeltaEvent:
+    text: str
+
+
+@dataclass
+class reasoningDeltaEvent:
+    text: str
+
+
+@dataclass
+class toolCallStartEvent:
+    toolCall: toolCall
+    preview: str
+
+
+@dataclass
+class toolCallEndEvent:
+    toolResult: toolResult
+
+
+@dataclass
+class confirmationRequiredEvent:
+    confirmationId: str
+    reason: str
+    commandPreview: str
+    toolCall: toolCall
+
+
+@dataclass
+class completedEvent:
+    message: str
+
+
+@dataclass
+class errorEvent:
+    message: str
+    errorType: str
+
+
+# 终态事件：消费者收到时会话锁必然已释放（docs/streamOutputPlan.md §6.4）。
+terminalEventTypes = (completedEvent, confirmationRequiredEvent, errorEvent)

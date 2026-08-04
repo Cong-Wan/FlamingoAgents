@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-07-10
-Description: Loads model configuration and resolves API keys without mutating process environment.
+Version: 1.2
+Date: 2026-07-26
+Description: Loads model configuration and resolves API keys without mutating process environment. v1.2 adds the modelConfig.stream switch (default True; set False to force non-streaming fallback, docs/streamOutputPlan.md §3) and parses it from YAML model/provider entries.
 '''
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ class modelConfig:
     supportsToolCalling: bool = True
     thinking: dict[str, Any] | None = None
     reasoningEffort: str | None = None
+    stream: bool = True
 
 
 @dataclass
@@ -124,6 +125,10 @@ def loadModelConfigFromYaml(
     if reasoningEffort is not None and not isinstance(reasoningEffort, str):
         raise RuntimeError(f'provider {providerId} 模型 {selectedModelId} 的 reasoningEffort 必须是字符串。')
 
+    streamValue = selectedModel.get('stream', providerConfig.get('stream'))
+    if streamValue is not None and not isinstance(streamValue, bool):
+        raise RuntimeError(f'provider {providerId} 模型 {selectedModelId} 的 stream 必须是布尔值。')
+
     api = selectedModel.get('api') or providerConfig.get('api')
     if api != 'openai-completions':
         raise RuntimeError(f'当前仅支持 openai-completions，实际配置为：{api}')
@@ -136,7 +141,7 @@ def loadModelConfigFromYaml(
     if debugConsole:
         debugConsole.debug(
             f'从 YAML 加载模型配置 provider={providerId} model={selectedModelId} '
-            f'baseUrl={baseUrl.strip()} thinking={thinking} reasoningEffort={reasoningEffort}'
+            f'baseUrl={baseUrl.strip()} thinking={thinking} reasoningEffort={reasoningEffort} stream={streamValue}'
         )
     return resolvedModelConfig(
         config=modelConfig(
@@ -147,6 +152,7 @@ def loadModelConfigFromYaml(
             supportsToolCalling=True,
             thinking=thinking,
             reasoningEffort=reasoningEffort,
+            stream=streamValue if streamValue is not None else True,
         ),
         apiKey=apiKey,
     )

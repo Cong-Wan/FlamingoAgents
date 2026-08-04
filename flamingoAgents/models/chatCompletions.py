@@ -1,19 +1,20 @@
 '''
 Author: wilbur
-Version: 1.7
-Date: 2026-07-25
-Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.7 makes the request debug log human-readable: json.dumps now uses ensure_ascii=False so Chinese/emoji are not escaped to \\uXXXX, and the log prints the decoded UTF-8 string instead of the bytes repr.
+Version: 1.8
+Date: 2026-07-26
+Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.8 adds completeStream() (docs/streamOutputPlan.md §6.1/§6.6): SSE streaming with byte-level half-line buffering, comment/heartbeat skipping, three-way incremental accumulation (content / reasoning_content / tool_calls), in-stream error detection, and a synthesized response payload identical in shape to non-streaming so session logging/resume stays intact. When modelConfig.stream is False the iterator degrades to a single finalChunk over the existing non-streaming path.
 '''
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
-from flamingoAgents.core.types import chatMessage, toolCall
+from flamingoAgents.core.types import chatMessage, finalChunk, reasoningChunk, textChunk, toolCall
 from flamingoAgents.models.modelAuth import modelAuth
 from flamingoAgents.models.modelConfig import modelConfig
 
@@ -39,7 +40,7 @@ class chatCompletionsAdapter:
         self.auth = auth
         self.debugConsole = debugConsole
 
-    def complete(self, messages: list[chatMessage], tools: list[dict[str, Any]]) -> modelCompletion:
+    def buildRequestPayload(self, messages: list[chatMessage], tools: list[dict[str, Any]], stream: bool) -> dict[str, Any]:
         requestPayload: dict[str, Any] = {
             'model': self.config.model,
             'messages': [self.convertMessage(message) for message in messages],
@@ -50,7 +51,11 @@ class chatCompletionsAdapter:
             requestPayload['thinking'] = self.config.thinking
         if self.config.reasoningEffort:
             requestPayload['reasoning_effort'] = self.config.reasoningEffort
+        if stream:
+            requestPayload['stream'] = True
+        return requestPayload
 
+    def openRequest(self, requestPayload: dict[str, Any]):
         requestUrl = self.config.baseUrl.rstrip('/') + '/chat/completions'
         requestBytes = json.dumps(requestPayload, ensure_ascii=False).encode('utf-8')
         request = urllib.request.Request(
@@ -65,8 +70,7 @@ class chatCompletionsAdapter:
         if self.debugConsole:
             self.debugConsole.debug(f"Source request:\n{requestBytes.decode('utf-8')}\n")
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                responseText = response.read().decode('utf-8')
+            return urllib.request.urlopen(request, timeout=60)
         except urllib.error.HTTPError as error:
             errorText = error.read().decode('utf-8', errors='replace')
             raise modelRequestError(
@@ -83,6 +87,11 @@ class chatCompletionsAdapter:
                 responseBody=str(error.reason),
             ) from error
 
+    def complete(self, messages: list[chatMessage], tools: list[dict[str, Any]]) -> modelCompletion:
+        requestPayload = self.buildRequestPayload(messages, tools, stream=False)
+        with self.openRequest(requestPayload) as response:
+            responseText = response.read().decode('utf-8')
+
         payload = json.loads(responseText)
         if self.debugConsole:
             self.debugConsole.debug(f"\nSource response:\n{payload}")
@@ -91,6 +100,157 @@ class chatCompletionsAdapter:
             requestPayload=requestPayload,
             responsePayload=payload,
         )
+
+    def completeStream(self, messages: list[chatMessage], tools: list[dict[str, Any]]) -> Iterator:
+        # stream=False 回退：迭代器退化为单发 finalChunk，走现有非流式路径。
+        if not self.config.stream:
+            yield finalChunk(completion=self.complete(messages, tools))
+            return
+        requestPayload = self.buildRequestPayload(messages, tools, stream=True)
+        yield from self.consumeSseStream(requestPayload)
+
+    def consumeSseStream(self, requestPayload: dict[str, Any]) -> Iterator:
+        contentParts: list[str] = []
+        toolCallAccum: dict[int, dict[str, Any]] = {}
+        responseModel: str | None = None
+        usage: dict[str, Any] | None = None
+        chunkCount = 0
+        try:
+            with self.openRequest(requestPayload) as response:
+                for dataPayload in self.iterSseData(response):
+                    if dataPayload == '[DONE]':
+                        break
+                    chunkCount += 1
+                    for event in self.processSseData(dataPayload, requestPayload, contentParts, toolCallAccum):
+                        if isinstance(event, dict):
+                            if event.get('model'):
+                                responseModel = event['model']
+                            if event.get('usage') is not None:
+                                usage = event['usage']
+                        else:
+                            yield event
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+            raise modelRequestError(
+                message=f'模型流式响应中断：{error}',
+                requestPayload=requestPayload,
+                statusCode=None,
+                responseBody=str(error),
+            ) from error
+
+        synthesizedToolCalls = [
+            {
+                'id': accum['id'] or f'call_{index + 1}',
+                'type': 'function',
+                'function': {
+                    'name': accum['name'],
+                    'arguments': ''.join(accum['argumentsParts']),
+                },
+            }
+            for index, accum in sorted(toolCallAccum.items())
+        ]
+        messagePayload: dict[str, Any] = {'role': 'assistant', 'content': ''.join(contentParts)}
+        if synthesizedToolCalls:
+            messagePayload['tool_calls'] = synthesizedToolCalls
+        responsePayload: dict[str, Any] = {
+            'model': responseModel or self.config.model,
+            'choices': [{'index': 0, 'message': messagePayload}],
+        }
+        if usage is not None:
+            responsePayload['usage'] = usage
+        if self.debugConsole:
+            self.debugConsole.debug(f"\nSource response (streamed, chunks={chunkCount}):\n{responsePayload}")
+        yield finalChunk(completion=modelCompletion(
+            message=self.parseAssistantPayload(responsePayload),
+            requestPayload=requestPayload,
+            responsePayload=responsePayload,
+        ))
+
+    def iterSseData(self, response) -> Iterator[str]:
+        # 按字节缓冲半行，凑满一行再 decode（多字节 UTF-8 可能跨 chunk 切断）；\n 是 ASCII，不会出现在 UTF-8 多字节序列内。
+        buffer = b''
+        while True:
+            data = response.read(4096)
+            if not data:
+                break
+            buffer += data
+            while b'\n' in buffer:
+                line, buffer = buffer.split(b'\n', 1)
+                payload = self.parseSseLine(line)
+                if payload is not None:
+                    yield payload
+        tail = self.parseSseLine(buffer)
+        if tail is not None:
+            yield tail
+
+    def parseSseLine(self, line: bytes) -> str | None:
+        line = line.strip()
+        # 跳过空行（事件分隔符）与 : 开头的注释/心跳行。
+        if not line or line.startswith(b':'):
+            return None
+        if not line.startswith(b'data:'):
+            return None
+        return line[5:].strip().decode('utf-8', errors='replace')
+
+    def processSseData(
+        self,
+        dataPayload: str,
+        requestPayload: dict[str, Any],
+        contentParts: list[str],
+        toolCallAccum: dict[int, dict[str, Any]],
+    ) -> Iterator:
+        try:
+            data = json.loads(dataPayload)
+        except json.JSONDecodeError as error:
+            raise modelRequestError(
+                message=f'模型流式响应不是合法 JSON：{dataPayload[:200]}',
+                requestPayload=requestPayload,
+                statusCode=None,
+                responseBody=dataPayload,
+            ) from error
+        if not isinstance(data, dict):
+            return
+        # GLM 等 provider 在 HTTP 200 后以 data 事件内嵌 error 下发，必须识别并转为 modelRequestError。
+        if data.get('error'):
+            raise modelRequestError(
+                message=f'模型流式响应错误：{json.dumps(data["error"], ensure_ascii=False)[:500]}',
+                requestPayload=requestPayload,
+                statusCode=None,
+                responseBody=dataPayload,
+            )
+        meta: dict[str, Any] = {}
+        if data.get('model'):
+            meta['model'] = data['model']
+        if data.get('usage') is not None:
+            meta['usage'] = data['usage']
+        if meta:
+            yield meta
+        choices = data.get('choices') or []
+        if not choices or not isinstance(choices[0], dict):
+            return
+        delta = choices[0].get('delta') or {}
+        if not isinstance(delta, dict):
+            return
+        text = delta.get('content')
+        if text:
+            contentParts.append(text)
+            yield textChunk(text=text)
+        reasoning = delta.get('reasoning_content')
+        if reasoning:
+            yield reasoningChunk(text=reasoning)
+        for rawToolCall in delta.get('tool_calls') or []:
+            if not isinstance(rawToolCall, dict):
+                continue
+            index = rawToolCall.get('index', 0)
+            accum = toolCallAccum.setdefault(index, {'id': '', 'name': '', 'argumentsParts': []})
+            # 首个 chunk 才带 id/name，后续只有 arguments 片段，不得直接覆盖。
+            if rawToolCall.get('id'):
+                accum['id'] = rawToolCall['id']
+            functionValue = rawToolCall.get('function') or {}
+            if isinstance(functionValue, dict):
+                if functionValue.get('name'):
+                    accum['name'] = functionValue['name']
+                if functionValue.get('arguments'):
+                    accum['argumentsParts'].append(functionValue['arguments'])
 
     def convertMessage(self, message: chatMessage) -> dict[str, Any]:
         if message.role == 'tool':
