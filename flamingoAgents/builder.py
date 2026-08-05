@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-07-24
-Description: Pure-library assembly factory: resolves paths, loads model config/auth, system prompt, and schema-driven tools, then returns a ready-to-use agent. v1.3 injects the current time into the loaded system prompt.
+Version: 1.4
+Date: 2026-08-05
+Description: Pure-library assembly factory: resolves paths, loads model config/auth, system prompt, and schema-driven tools, then returns a ready-to-use agent. v1.4 lets callers inject the system prompt as a string (systemPrompt), control the current-time suffix (appendCurrentTime), and whitelist built-in tools by name (toolNames) per docs/initAgentCustomizationPlan.md.
 '''
 
 from __future__ import annotations
@@ -30,6 +30,9 @@ def createAgent(
     modelConfigPath: str | Path | None = None,
     toolsConfigPath: str | Path | None = None,
     systemPromptPath: str | Path | None = None,
+    systemPrompt: str | None = None,
+    appendCurrentTime: bool = True,
+    toolNames: list[str] | None = None,
     providerId: str = '101',
     modelId: str | None = None,
 ) -> agent:
@@ -48,17 +51,34 @@ def createAgent(
     adapter = chatCompletionsAdapter(resolved.config, auth, debugConsole=printer)
     settings = loadToolSettings(configPath=toolsConfigPath, debugConsole=printer)
     definitions = createBuiltinTools(settings.toolSchemas, debugConsole=printer)
-    resolvedSystemPromptPath = Path(systemPromptPath).resolve() if systemPromptPath else defaultSystemPromptPath
-    if printer.isDebug:
-        printer.debug(f'加载系统提示词 path={resolvedSystemPromptPath}')
-    if not resolvedSystemPromptPath.exists():
-        raise RuntimeError(f'系统提示词文件不存在：{resolvedSystemPromptPath}')
-    systemPromptText = resolvedSystemPromptPath.read_text(encoding='utf-8')
-    currentTimeText = datetime.now().astimezone().isoformat(timespec='seconds')
-    systemPromptText = (
-        systemPromptText.rstrip()
-        + f'\n\n## 当前时间\n\n当前日期为：{currentTimeText}。\n'
-    )
+    if toolNames is not None:
+        availableNames = [definition.name for definition in definitions]
+        unknownNames = [name for name in toolNames if name not in availableNames]
+        if unknownNames:
+            raise RuntimeError(
+                f'toolNames 包含未知内置工具：{",".join(unknownNames)}。'
+                f'可用工具：{",".join(availableNames)}'
+            )
+        definitions = [definition for definition in definitions if definition.name in toolNames]
+        if printer.isDebug:
+            printer.debug(f'内置工具白名单生效 tools={",".join(d.name for d in definitions) or "<empty>"}')
+    if systemPrompt is not None and systemPrompt.strip():
+        if systemPromptPath is not None and printer.isDebug:
+            printer.debug('systemPrompt 直传生效，忽略 systemPromptPath。')
+        systemPromptText = systemPrompt
+    else:
+        resolvedSystemPromptPath = Path(systemPromptPath).resolve() if systemPromptPath else defaultSystemPromptPath
+        if printer.isDebug:
+            printer.debug(f'加载系统提示词 path={resolvedSystemPromptPath}')
+        if not resolvedSystemPromptPath.exists():
+            raise RuntimeError(f'系统提示词文件不存在：{resolvedSystemPromptPath}')
+        systemPromptText = resolvedSystemPromptPath.read_text(encoding='utf-8')
+    if appendCurrentTime:
+        currentTimeText = datetime.now().astimezone().isoformat(timespec='seconds')
+        systemPromptText = (
+            systemPromptText.rstrip()
+            + f'\n\n## 当前时间\n\n当前日期为：{currentTimeText}。\n'
+        )
     if printer.isDebug:
         printer.debug(f'系统提示词加载完成 chars={len(systemPromptText)}')
     return agent(
