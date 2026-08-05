@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.8
+Version: 1.9
 Date: 2026-07-26
-Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.8 adds completeStream() (docs/streamOutputPlan.md §6.1/§6.6): SSE streaming with byte-level half-line buffering, comment/heartbeat skipping, three-way incremental accumulation (content / reasoning_content / tool_calls), in-stream error detection, and a synthesized response payload identical in shape to non-streaming so session logging/resume stays intact. When modelConfig.stream is False the iterator degrades to a single finalChunk over the existing non-streaming path.
+Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default).
 '''
 
 from __future__ import annotations
@@ -53,6 +53,8 @@ class chatCompletionsAdapter:
             requestPayload['reasoning_effort'] = self.config.reasoningEffort
         if stream:
             requestPayload['stream'] = True
+            # 流式默认不下发 token 用量，必须显式要求，服务端才会在 [DONE] 前单独发一个携带 usage 的 chunk。
+            requestPayload['stream_options'] = {'include_usage': True}
         return requestPayload
 
     def openRequest(self, requestPayload: dict[str, Any]):
