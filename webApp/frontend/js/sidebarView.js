@@ -1,8 +1,10 @@
 /*
 Author: wilbur
-Version: 1.0
+Version: 1.1
 Date: 2026-08-07
-Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新建会话弹窗、重命名/删除、底部入口高亮
+Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新建会话弹窗、重命名/删除、底部入口高亮。
+             v1.1 迭代一：新建弹窗探建交互（契约 §3.3/§3.4 先探后建 + allowCreate 内联确认）；
+             侧栏完全隐藏/悬浮展开（localStorage sidebarCollapsed）。
 */
 (function () {
   'use strict';
@@ -10,12 +12,36 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
   var listEl = document.getElementById('sessionList');
   var modalEl = document.getElementById('newSessionModal');
   var workDirInput = document.getElementById('newSessionWorkDir');
+  var workDirErrorEl = document.getElementById('workDirError');
+  var confirmAreaEl = document.getElementById('workDirCreateConfirm');
+  var confirmPathEl = document.getElementById('workDirCreatePath');
+  var confirmCreateButton = document.getElementById('workDirCreateAllow');
   var providerSelect = document.getElementById('newSessionProvider');
   var modelSelect = document.getElementById('newSessionModel');
   var errorEl = document.getElementById('newSessionError');
   var createButton = document.getElementById('newSessionCreate');
 
   var cachedModelConfig = null; // 新建弹窗的 provider/model 下拉数据源（GET /api/models）
+  var pendingCreatePath = null; // probe 确认的 resolvedPath（确认创建时提交它，而非用户原始输入）
+
+  /* ---------- 侧栏完全隐藏/悬浮展开（§11.2，状态存 localStorage） ---------- */
+
+  var sidebarEl = document.querySelector('.sidebar');
+  var collapseButton = document.getElementById('sidebarCollapseButton');
+  var expandButton = document.getElementById('sidebarExpandButton');
+
+  function applySidebarCollapsed(collapsed) {
+    sidebarEl.classList.toggle('hidden', collapsed); // display:none 完全隐藏，展开为 flex 推挤式
+    expandButton.classList.toggle('hidden', !collapsed);
+    document.getElementById('app').classList.toggle('sidebar-collapsed', collapsed);
+    try { localStorage.setItem('sidebarCollapsed', collapsed ? '1' : '0'); } catch (ignore) { /* 隐私模式 */ }
+  }
+
+  collapseButton.addEventListener('click', function () { applySidebarCollapsed(true); });
+  expandButton.addEventListener('click', function () { applySidebarCollapsed(false); });
+  applySidebarCollapsed((function () {
+    try { return localStorage.getItem('sidebarCollapsed') === '1'; } catch (ignore) { return false; }
+  })());
 
   function sameDay(a, b) {
     return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
@@ -146,8 +172,20 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
     }
   }
 
+  function hideProbeFeedback() {
+    workDirErrorEl.classList.add('hidden');
+    confirmAreaEl.classList.add('hidden');
+    pendingCreatePath = null;
+  }
+
+  function showWorkDirError(message) {
+    workDirErrorEl.textContent = message;
+    workDirErrorEl.classList.remove('hidden');
+  }
+
   async function openModal() {
     errorEl.classList.add('hidden');
+    hideProbeFeedback();
     workDirInput.value = '';
     createButton.disabled = false;
     try {
@@ -157,27 +195,25 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
       errorEl.textContent = '加载模型配置失败：' + error.message;
       errorEl.classList.remove('hidden');
     }
+    // 预填 defaultWorkDir（契约 §3.4 空 workDir 会 400，以 '/' 占位调 probe 仅取 defaultWorkDir）
+    try {
+      var probe = await window.api.probeWorkDir('/');
+      if (probe.defaultWorkDir) workDirInput.value = probe.defaultWorkDir;
+    } catch (ignore) { /* 预填失败不阻塞弹窗 */ }
     modalEl.classList.remove('hidden');
   }
 
   function closeModal() {
     modalEl.classList.add('hidden');
+    hideProbeFeedback();
   }
 
-  async function onCreate() {
-    var providerId = providerSelect.value;
-    if (!providerId) {
-      errorEl.textContent = '请选择 provider。';
-      errorEl.classList.remove('hidden');
-      return;
-    }
-    var params = { providerId: providerId };
-    var workDir = workDirInput.value.trim();
-    if (workDir) params.workDir = workDir;
+  // 提交 create（契约 §3.3 非幂等 L4：按钮禁用至响应返回）；400 错误在弹窗内展示
+  async function submitCreate(workDir, allowCreate) {
+    var params = { providerId: providerSelect.value, workDir: workDir, allowCreate: allowCreate };
     if (modelSelect.value) params.modelId = modelSelect.value;
-
-    // 契约 §3.3 非幂等（L4）：创建按钮防重，禁用至响应返回
     createButton.disabled = true;
+    confirmCreateButton.disabled = true;
     errorEl.classList.add('hidden');
     try {
       var session = await window.api.createSession(params);
@@ -187,7 +223,44 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
     } catch (error) {
       errorEl.textContent = error.message;
       errorEl.classList.remove('hidden');
+    } finally {
       createButton.disabled = false;
+      confirmCreateButton.disabled = false;
+    }
+  }
+
+  // 点「创建」：先 probe（契约 §3.4，判定只用 creatable/willCreate 两个布尔）
+  async function onCreate() {
+    errorEl.classList.add('hidden');
+    hideProbeFeedback();
+    if (!providerSelect.value) {
+      errorEl.textContent = '请选择 provider。';
+      errorEl.classList.remove('hidden');
+      return;
+    }
+    var workDir = workDirInput.value.trim();
+    if (!workDir) {
+      showWorkDirError('workDir 必填。');
+      return;
+    }
+    createButton.disabled = true;
+    var probe;
+    try {
+      probe = await window.api.probeWorkDir(workDir);
+    } catch (error) {
+      showWorkDirError(error.message);
+      createButton.disabled = false;
+      return;
+    }
+    createButton.disabled = false;
+    if (probe.creatable && !probe.willCreate) {
+      await submitCreate(probe.resolvedPath || workDir, false); // 目录已存在且可写 → 直接建
+    } else if (probe.creatable && probe.willCreate) {
+      pendingCreatePath = probe.resolvedPath || workDir; // 需确认后自动创建
+      confirmPathEl.textContent = pendingCreatePath;
+      confirmAreaEl.classList.remove('hidden');
+    } else {
+      showWorkDirError(probe.message || '该目录不可用。'); // 不可建 → 红字拦截
     }
   }
 
@@ -231,6 +304,10 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
   document.getElementById('newSessionButton').addEventListener('click', openModal);
   document.getElementById('newSessionCancel').addEventListener('click', closeModal);
   createButton.addEventListener('click', onCreate);
+  confirmCreateButton.addEventListener('click', function () {
+    if (pendingCreatePath) submitCreate(pendingCreatePath, true); // 确认创建 → allowCreate:true
+  });
+  workDirInput.addEventListener('input', hideProbeFeedback); // 改动路径后收起确认区/红字
   providerSelect.addEventListener('change', fillModelOptions);
   modalEl.addEventListener('click', function (event) {
     if (event.target === modalEl) closeModal();

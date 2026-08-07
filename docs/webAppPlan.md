@@ -1,12 +1,15 @@
 # FlamingoAgents Web 程序 —— 方案与计划
 
 > Author: wilbur
-> Version: 1.3
+> Version: 1.4.2
 > Date: 2026-08-05
 > 目的：为 FlamingoAgents 纯库增加一个单用户、局域网可访问的 Web 对话程序（界面参照 Kimi 官网），支持流式对话、历史保留、用量统计、工具调用确认框、模型配置，前后端 API 对接 + Token 认证。
 > v1.1：按 pi 审核报告修订——H1 停止机制改为「泵线程+队列+停止标志」（跨线程 generator.close() 会抛 ValueError，原设计不可行）；M1 sessionId 格式校验；M2 models.yaml 改合并式更新；M3 XSS 防线收敛为二选一；M4 清缓存与挂起确认的边界；M5 统一异常映射；L1-L6 如实修订语义/补 TODO。
 > v1.2：用户拍板渲染方案——vendor marked + DOMPurify（§4.6）；接口契约已独立落档 docs/webApiSpec.md v1.1。
 > v1.3：用户拍板包结构调整——`flamingoWeb/` 改名 `webApp/`，内部拆分 `backend/`（FastAPI）与 `frontend/`（原生静态文件，原 static/），前端仍由后端启动时托管；启动命令变为 `uv run python -m webApp`。
+> v1.4：迭代一（§11）——workDir 探建分离 + 侧栏浅色可隐藏 + 模型配置整页表单化 + 用量图表（SQLite 统计库 + Chart.js）。
+> v1.4.1：按 pi 审核报告（docs/codeReview/260807_iter1DocsReview.md）修订——probe 响应加 creatable/defaultWorkDir 字段与第 6 行情形；时区写死服务器本地；byModel key 改 providerId/modelId；双口径声明；mkdir TOCTOU 与校验顺序；泵流粒度/回填 providerId/连接线程安全；侧栏硬编码深色清理；前端文件头契约引用修正入 TODO。
+> v1.4.2：用户拍板——Completion Tokens 即 output tokens，不新增 token 卡片，卡片区保持三张；新增接口已在 webApiSpec v1.2.1 补齐。
 
 ---
 
@@ -352,3 +355,124 @@ def sseGen(pump):
 
 - Q1 编排落地时：sessions 索引加 `profileId` 字段、agentManager 缓存 key 扩展、新建会话弹窗加 profile 下拉——索引结构已按 dict 存储，加字段不破坏兼容；
 - 多 agent 协作、插件工具市场、WebSocket 替代 SSE：出现时再评估。
+
+---
+
+## 11. 迭代一（v1.4，用户已拍板）
+
+### 11.0 决策记录
+
+| 需求 | 拍板 |
+|---|---|
+| workDir 创建方式 | **只建最后一级**（父目录必须已存在且可写，否则报错）；**前端先探后建**（探到不存在 → 用户确认「将自动创建」后才真正创建） |
+| 侧栏 | **浅色化**（浅灰底深字，与主区同色系）+ **完全隐藏式收缩**（悬浮按钮展开，状态存 localStorage） |
+| 模型配置 | **整页表单化**：整个页面全部是纵向排布的字段（label 上、输入控件下、全宽），废弃横向拥挤表格 |
+| 用量统计 | 三张卡片保留不动；**时/天/月粒度图表**（柱状+折线、每模型不同颜色）；**价格统计**（模型配了 cost 就算费用，出「总费用」卡）；**Chart.js vendor 引入**；**SQLite 统计库**（用户预判「涉及数据库设计」，确认见 §11.4） |
+
+**两处解释性声明（实施按此执行，用户可纠正）**：
+
+1. **「新增 output tokens」（用户 v1.4.2 已拍板取消）**：OpenAI 口径下 `completion_tokens` 就是 output tokens（现有第三张卡）——**不新增任何 token 卡片**，卡片区保持现状三张；
+2. **费用口径**：`usageTotal`/日志只有 cachedTokens（读缓存），没有 cacheWrite 分开计数——费用公式里 cacheWrite 项恒为 0，不单独统计。
+
+### 11.1 workDir 探建分离（需求 1）
+
+**后端**：
+
+- 新增 `POST /api/sessions/probeWorkDir`：`{workDir}` → `{resolvedPath, exists, writable, willCreate, parentPath, message}`。规则：
+  - 路径存在且是目录 → 校验 `R_OK|W_OK|X_OK`，`exists=true, willCreate=false`；
+  - 不存在 → `willCreate=true`，取**上一级父目录**：父目录不存在 → `message='父目录不存在：…'`；父目录不可写（`os.access(parent, W_OK|X_OK)`）→ `message='无权限在 … 下创建目录'`；两者都过 → 可创建；
+- `POST /api/sessions` 变更：`workDir` 从「可缺省」改为**必填**；新增 `allowCreate: bool`（缺省 `false`）。**处理顺序（审核中 6）**：先 providerId/modelId 预检（失败 400 不留孤儿目录）→ 再处理目录。目录不存在时：`allowCreate=false` → 400「workDir 不存在：…」；`allowCreate=true` → 重查父目录 → `mkdir`（**不带 parents**）；**TOCTOU 兜底**：`FileExistsError` 视为成功（被抢建）、其它 `OSError` → 400 透传中文消息，不裸 500；
+- **已存在目录的权限校验是行为变更（审核中 9）**：现状仅 `is_dir()` 检查，本期增加 `R_OK|W_OK|X_OK` 校验（`os.access` 对 root/只读挂载可能失真，接受，局域网单用户够用）；
+- 前端新建弹窗：workDir 输入框必填（预填项目根路径占位），提交前先调 probe：
+  - `willCreate=false` 且可写 → 直接提交创建；
+  - `willCreate=true` 且可创建 → 弹内联确认「目录不存在，将自动创建：`/path/aaaa`」，用户点「创建并开启」→ 带 `allowCreate=true` 提交；
+  - 不可写/父目录不存在 → 输入框下方红字提示，禁止提交。
+
+**验证**：存在的可写目录直接建成；**存在但不可写 → 400**；不存在单级目录经确认后被创建并绑定；父目录不存在/不可写均 400 中文报错；`allowCreate=false` 时不存在目录 400 且**不产生**目录；providerId 非法时 400 且不产生目录。
+
+### 11.2 侧栏浅色 + 完全隐藏（需求 2）
+
+- CSS 变量改浅色系：`--sidebar-bg` 由 `#1c1c1e` 改为浅灰（如 `#f5f5f7`），文字/悬停/分组标题色同步反转；**同时清理硬编码深色（审核低 11）**：`.btn-new-session`、`.session-action-btn:hover`、`.sidebar-bottom` 等不随变量走的深色值逐一手动改浅；
+- 收缩交互：侧栏 `display:none` 完全隐藏，主区左上角出现悬浮圆形按钮（☰）点击展开；展开态为 flex 推挤式（不覆盖主区）；状态写 `localStorage`（`sidebarCollapsed`），刷新保持；
+- 新建会话/设置等按钮在隐藏态不可用——依赖悬浮按钮先展开，不做第二个入口。
+
+**验证**：点收缩侧栏完全消失、悬浮按钮出现；点悬浮按钮恢复；刷新后状态保持；浅色系无残留深色样式。
+
+### 11.3 模型配置整页表单化（需求 3）
+
+现状痛点：provider 卡片纵向堆叠 + 卡片内嵌横向表格，字段挤在一行。改为**整页表单**：
+
+- 页面骨架：顶部 provider 切换条（tab 式，一个 provider 一个 tab + 「+ 新增 provider」）；其下**整页纵向表单**；底部固定保存/重置栏；
+- **编辑态管理（审核低 14）**：页面加载时拉一次 GET 存为内存工作副本，tab 切换**不重拉**（保留未保存修改，切换时若有脏数据提示）；「重置」= 放弃修改重新拉取 GET；「保存」= 工作副本全量 PUT；
+- provider 字段区（全宽行，label 上控件下）：providerId（新建时可编辑，已有则只读展示）、baseUrl、api（只读 `openai-completions`）、apiKey（password 型输入 + 明文切换眼睛图标，`__KEEP__` 逻辑不变、`$` 开头新输入 confirm 提示逻辑不变）、「删除此 provider」危险按钮；
+- 模型列表区：每个模型一张**全宽卡片**，卡片头 = 模型 id + 折叠箭头 + 删除按钮；卡片体 = 字段纵向排布（每行一个字段：id/name/input 多选/contextWindow/maxTokens/reasoning 开关/thinking.type 下拉/reasoningEffort 下拉/cost 四字段两列网格），默认折叠只展开第一个；「+ 新增模型」按钮在列表尾；
+- 交互与校验逻辑（PUT 全量、合并式更新、备份）全部不变，只改展示层。
+
+**验证**：每个字段独占一行全宽可编辑；新增/删除 provider 与模型可用；保存后 GET 回显一致；`stream` 等 schema 外字段保留（回归 §4.7 指标）。
+
+### 11.4 用量图表 + SQLite 统计库 + 费用（需求 4）
+
+**数据库选型（对齐用户「涉及数据库」预判）**：SQLite（Python stdlib `sqlite3`，零新依赖），库文件 `webData/usage.db`。不引入 ORM。
+
+**表结构**（`usageTurns`，一轮对话一条，粒度足够时/天/月聚合）：
+
+```sql
+CREATE TABLE IF NOT EXISTS usageTurns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sessionId TEXT NOT NULL,
+  providerId TEXT NOT NULL,
+  modelId TEXT NOT NULL,
+  timestamp TEXT NOT NULL,          -- ISO 8601 UTC，泵线程终态时刻
+  promptTokens INTEGER NOT NULL,
+  cachedTokens INTEGER NOT NULL,
+  completionTokens INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idxUsageTurnsTs ON usageTurns(timestamp);
+```
+
+**写入时机（审核中 7/8、低 12 修订）**：泵线程终态时，从**已缓存的 conversation**（`conversations.get()` 读法，不用 `getConversation()` 避免为未发消息会话落 jsonl 的副作用）取 `usageTotal`，与**流开始时同法快照**相减得 delta——**每条泵流一条记录**（confirm 续流是独立泵流、独立一条，表述如此而非「一轮对话一条」）；**先写 usageTurns、后回写 sessions 索引**（索引回写失败不丢账）；modelId/providerId 从会话索引取。sqlite 连接用 `check_same_thread=False` + 写锁（泵线程是工作线程）。**崩溃取舍**：泵线程中途崩溃丢一条记录，可接受。
+
+**历史回填（审核中 8）**：服务**启动完成前**执行：若表为空且 `webData/sessionLogs/` 已有 jsonl → 逐文件扫描 `assistantMessage` 事件，按事件自带 `timestamp`/`model`/`usage` 插入；jsonl 事件**无 providerId**，从 sessions 索引按 sessionId 补，索引中也不存在（会话已删）→ providerId 记 `unknown`（cost 按 0 计，图表仍按 modelId 维度可见）。只在空表时执行一次，之后纯增量。
+
+**双口径声明（审核中 1）**：卡片区数据来自 sessions 索引（删会话即扣减），图表来自 usageTurns（保留已删会话的账）——同页总数可能不一致，图表区 UI 标注「含已删除会话的历史用量」；**「总费用」卡 = month 粒度全量求和**（hour/day 有范围限制，不能作总费用口径）。
+
+**删除会话**：`usageTurns` 记录**保留**（用量是账单性质，删会话不删账）。
+
+**新接口** `GET /api/usage/series?granularity=hour|day|month`（缺省 `day`）：
+
+```json
+{
+  "granularity": "day",
+  "models": ["deepseek-v4-flash"],
+  "buckets": [
+    {
+      "label": "2026-08-07",
+      "promptTokens": 4795, "cachedTokens": 2048, "completionTokens": 203,
+      "cost": 0.0,
+      "byModel": { "deepseek-v4-flash": { "promptTokens": 4795, "cachedTokens": 2048, "completionTokens": 203, "cost": 0.0 } }
+    }
+  ]
+}
+```
+
+- 默认范围：hour=近 72 小时、day=近 90 天、month=全部；空桶补齐（连续时间轴）；
+- `cost` **查询时**按 `config/models.yaml` 当前 cost 计算（每百万 token 美元）：`prompt×input/1M + completion×output/1M + cached×cacheRead/1M`；查询时计算的好处：后补价格也能让历史记录出费用（对齐「配置的时候加了价格，也要把价格统计出来」）；全部模型 cost 为 0 时字段恒 0，前端隐藏费用展示。
+
+**前端用量页**：
+
+- 卡片区：Prompt / Cached / Completion 三张**原样不动**（用户拍板不新增 token 卡）；任一模型 cost 非零时再出一张「总费用」卡（month 粒度全量求和口径）；
+- **vendor `chart.umd.min.js`**（Chart.js 4.x 单文件）进 `frontend/vendor/`，与 marked/DOMPurify 先例一致；
+- 图表区：粒度切换（时/天/月）+ 组合图——**每模型一种固定颜色**（按 modelId 哈希到调色板）的堆叠柱状（token 量）+ 总量折线叠加；tooltip 显示该桶各模型明细与费用；
+- 底部保留原会话用量表格（点行跳会话，可选，若超期则砍）。
+
+**验证**：发几轮对话（含一次 confirm 续流）后 usageTurns 的 **token 总量**与 sessions 索引对账一致（不对账行数——回填是 message 粒度、增量是泵流粒度，行数无可比性）；三粒度接口返回桶正确（空桶补齐、本地时区切桶）；回填后历史会话出现在图表（含 providerId=unknown 的已删会话）；models.yaml 配非零 cost 后费用卡与桶 cost 正确、yaml 删模型后 cost 按 0；图表每模型不同颜色、折线=总量、图表区有「含已删除会话」标注。
+
+### 11.5 迭代一 TODO（P7）
+
+- [ ] T7.1 后端 probeWorkDir + create 改造（必填 workDir + allowCreate + 已存在目录权限校验 + TOCTOU 兜底）→ 验证见 §11.1；
+- [ ] T7.2 前端新建弹窗探建交互 → 验证：三条路径（已存在/确认创建/不可建红字）；
+- [ ] T7.3 侧栏浅色 + 隐藏/悬浮展开 + localStorage → 验证见 §11.2；
+- [ ] T7.4 模型配置整页表单重构（settingsView.js + styles.css）→ 验证见 §11.3；
+- [ ] T7.5 `usageStore.py`（SQLite 写入/回填/聚合查询）+ `/api/usage/series` → 验证见 §11.4 后端部分；
+- [ ] T7.6 前端用量页（Chart.js 组合图 + 粒度切换 + 费用卡/费用展示，token 卡不动）→ 验证见 §11.4 前端部分；
+- [ ] T7.7 契约文档 webApiSpec 同步（v1.2 已同步：probe/series 端点、create 变更、编号顺延）+ **前端文件头注释中的契约章节号引用修正（chatView.js §3.7→§3.8、usageView.js §3.8→§3.9、settingsView.js §3.9/§3.10→§3.11/§3.12）** + 回归 v1 全链路。

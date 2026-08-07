@@ -1,11 +1,13 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.1
+> Version: 1.2.1
 > Date: 2026-08-05
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 7 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
+> v1.2：迭代一（webAppPlan §11）——新增 probeWorkDir 端点（§3.4）与 usage/series 端点（§3.10）；POST /api/sessions 的 workDir 改必填 + 新增 allowCreate；原 §3.4–3.8、§3.9–3.11 顺延为 §3.5–3.9、§3.11–3.13。
+> v1.2.1：按 pi 审核修订——§3.4 probe 响应加 `creatable`/`defaultWorkDir` 字段 + 补「存在但不是目录」情形；§3.10 时区写死服务器本地、byModel key 改 `providerId/modelId`、补双口径声明与 month 空范围语义。
 
 ---
 
@@ -104,7 +106,7 @@
 - **`assistant.usage` 归一化映射表（审核 M1，嵌套取值，前后端必须一致）**：`promptTokens ← usage.prompt_tokens`；`cachedTokens ← usage.prompt_tokens_details.cached_tokens`（**嵌套字段**，缺省 0）；`completionTokens ← usage.completion_tokens`；usage 缺失/非对象 → 整个字段为 `null`；
 - **`tool.details` 原样透传**（审核 H2，与 SSE `toolCallEnd.toolResult.details` 同口径）。渲染规则：`details.reason == "userRejectedApproval"`（即 `blocked: true`）→ 呈现「**被拒绝**」；其余 `isError=true` → 呈现「失败」。不得靠匹配 content 文案判别；
 - **jsonl 事件过滤口径（审核 M2）**：`systemMessage`、`modelError` 不下发；`assistantMessage.timings` 不下发；
-- 前端配对规则：`assistant.toolCalls[].id` ↔ 后续 `tool.toolCallId`；**末尾未配对的 toolCalls = dangling（中断未完成），渲染置灰卡片**——但需先经 §3.7 pending 接口识别：**pending 中的 toolCall 不按 dangling 渲染，而是重弹确认框**（审核 H1）。
+- 前端配对规则：`assistant.toolCalls[].id` ↔ 后续 `tool.toolCallId`；**末尾未配对的 toolCalls = dangling（中断未完成），渲染置灰卡片**——但需先经 §3.8 pending 接口识别：**pending 中的 toolCall 不按 dangling 渲染，而是重弹确认框**（审核 H1）。
 
 ### 2.3 usage（用量汇总，`GET /api/usage` 响应）
 
@@ -196,31 +198,65 @@
 请求：
 
 ```json
-{ "workDir": "/abs/path 可缺省", "providerId": "volcano", "modelId": "可缺省" }
+{ "workDir": "/abs/path", "providerId": "volcano", "modelId": "可缺省", "allowCreate": false }
 ```
 
-- `workDir` 缺省 = 项目根目录；必须已存在且为目录，否则 400（`workDir 不存在或不是目录：...`）；
+- `workDir` **必填**（v1.2 变更，原为可缺省）：必须是非空字符串；
+- 目录已存在：必须是目录且当前进程可读写进入（`R_OK|W_OK|X_OK`），否则 400；
+- 目录不存在：`allowCreate=false`（缺省）→ 400 `workDir 不存在：…`；`allowCreate=true` → 校验**上一级父目录**存在且可写（`W_OK|X_OK`）后 `mkdir` **只建最后一级**（不带 parents），父目录不存在 → 400 `父目录不存在：…`，父目录不可写 → 400 `无权限在 … 下创建目录`；
 - `providerId` 必填，必须在 models.yaml 中存在，否则 400；`modelId` 可缺省（= provider 首个模型）；指定但不存在 → 400；
 - **校验实现路径（审核 M4）**：Web 层调库 `loadModelConfigFromYaml(providerId, modelId)` 做预检（仅解析 yaml，无网络开销，不建 agent），`RuntimeError` 消息透传为 400。**不得依赖库的默认回退**：yaml 缺失时库会静默回退环境变量配置（providerId 被忽略），故 yaml 缺失时本接口一律 400 `config/models.yaml 不存在。`（审核 M3）；
 - 200：创建好的 session 对象（§2.1）。此时**不创建 agent 实例、不写 jsonl**（惰性：首发消息时才建）；
 - **非幂等（审核 L4）**：契约不提供幂等键，前端创建按钮需防重（点击后禁用至响应返回）。
 
-### 3.4 PATCH /api/sessions/{sessionId} —— 重命名
+### 3.4 POST /api/sessions/probeWorkDir —— 探测 workDir（v1.2 新增，前端「先探后建」）
+
+请求：`{ "workDir": "/abs/path" }`（必填非空，否则 400）
+
+- 200：
+
+```json
+{
+  "resolvedPath": "/home/xx/project/aaaa",
+  "exists": false,
+  "writable": true,
+  "creatable": true,
+  "willCreate": true,
+  "parentPath": "/home/xx/project",
+  "defaultWorkDir": "/Users/wilbur/project/FlamingoAgents",
+  "message": "目录不存在，可创建。"
+}
+```
+
+**字段语义（审核修订，前端判定只用 `creatable`/`willCreate` 两个布尔）**：`exists`=路径已存在且是目录；`writable`=（exists 时）目录本身可读写进入 /（不存在时）父目录可写；`creatable`=**可以建会话**（exists&&writable，或 !exists&&willCreate&&父目录可写）；`willCreate`=建会话时是否需要新建目录；`defaultWorkDir`=项目根路径（新建弹窗预填用，审核高 2）。
+
+| 情形 | exists | writable | creatable | willCreate | message |
+|---|---|---|---|---|---|
+| 存在且可读写进入 | true | true | true | false | `目录可用。` |
+| 存在但权限不足 | true | false | false | false | `目录不可读写：…` |
+| 存在但不是目录 | false | false | false | false | `路径已存在且不是目录：…` |
+| 不存在，父目录可写 | false | true | true | true | `目录不存在，可创建。` |
+| 不存在，父目录不存在 | false | false | false | true | `父目录不存在：…` |
+| 不存在，父目录不可写 | false | false | false | true | `无权限在 … 下创建目录` |
+
+- 本接口**无副作用**（不创建目录、不写索引）；仅探测。前端据此决定直接提交 / 弹创建确认 / 红字拦截。
+
+### 3.5 PATCH /api/sessions/{sessionId} —— 重命名
 
 请求：`{ "title": "新标题" }`（trim 后 1–60 字，否则 400）
 
 - 200：更新后的 session 对象；404：会话不存在。
 
-### 3.5 DELETE /api/sessions/{sessionId} —— 删除会话
+### 3.6 DELETE /api/sessions/{sessionId} —— 删除会话
 
 - 200：`{ "ok": true }`；404：不存在；**409：该会话有活跃流，拒绝删除**；
 - 副作用：删索引条目 + 删 `webData/sessionLogs/{sessionId}.jsonl` + 清 agent 缓存实例。
 
-### 3.6 GET /api/sessions/{sessionId}/messages —— 历史消息
+### 3.7 GET /api/sessions/{sessionId}/messages —— 历史消息
 
 - 200：`{ "messages": [ message, ... ] }`（§2.2）；会话存在但无 jsonl（从未发消息）→ 空数组；404：会话不存在。
 
-### 3.7 GET /api/sessions/{sessionId}/pending —— 查询挂起的工具确认（审核 H1，防待确认死锁）
+### 3.8 GET /api/sessions/{sessionId}/pending —— 查询挂起的工具确认（审核 H1，防待确认死锁）
 
 **存在理由**：`pendingConfirm` 只在 agent 内存。挂起确认时 assistantMessage（含 toolCalls）已落 jsonl 而 toolResult 未落盘——刷新页面后历史回放只看到「未配对 toolCall」，前端无从知道服务端挂着 pending；此时发新消息只会收到 `error(pendingConfirmationExists)`，且 error 帧不含 confirmationId（库零改动约束，不能加字段），会话将永久卡死。本端点提供契约内恢复途径。
 
@@ -229,17 +265,48 @@
 - 数据源：agent 缓存实例的 `conversation.pending`（取 `toolCalls[currentIndex]` 为当前待确认调用）；
 - **前端调用时机**：① 进入/刷新会话页时（与 GET messages 并行）；② 任何流收到 `errorType == "pendingConfirmationExists"` 时。
 
-### 3.8 GET /api/usage —— 用量汇总
+### 3.9 GET /api/usage —— 用量汇总
 
 - 200：§2.3 结构。无副作用。
 
-### 3.9 GET /api/models —— 读模型配置
+### 3.10 GET /api/usage/series —— 时/天/月粒度用量序列（v1.2 新增，图表数据源）
+
+请求：`GET /api/usage/series?granularity=hour|day|month`（缺省 `day`；非法值 400）
+
+- 200：
+
+```json
+{
+  "granularity": "day",
+  "models": ["volcano/deepseek-v4-flash"],
+  "buckets": [
+    {
+      "label": "2026-08-07",
+      "promptTokens": 4795,
+      "cachedTokens": 2048,
+      "completionTokens": 203,
+      "cost": 0.0,
+      "byModel": {
+        "volcano/deepseek-v4-flash": { "promptTokens": 4795, "cachedTokens": 2048, "completionTokens": 203, "cost": 0.0 }
+      }
+    }
+  ]
+}
+```
+
+- 数据源：`webData/usage.db`（SQLite `usageTurns` 表，泵线程终态写入增量 + 空表时从 jsonl 回填一次，webAppPlan §11.4）；
+- 粒度与默认范围：`hour` = 近 72 小时（label `2026-08-07 13`）、`day` = 近 90 天（label `2026-08-07`）、`month` = 最早记录所在月 → 当前月，无记录返回空 `buckets`（label `2026-08`）；**空桶补齐**保证时间轴连续；**桶切分按服务器本地时区**（jsonl 时间戳为 UTC，聚合时先转本地时区再切桶，审核高 3）；
+- `cost` 查询时按 `config/models.yaml` 当前 cost 计算：`promptTokens×input/1M + completionTokens×output/1M + cachedTokens×cacheRead/1M`（美元；cacheWrite 无分开计数，恒不计）；**byModel/models 的 key 为 `providerId/modelId` 二元组**（不同 provider 下同 id 模型不撞桶、价格各自查，审核高 4）；yaml 中已删除的模型 cost 按 0 计；全部模型 cost 为 0 时所有 cost 字段恒 0，前端据此隐藏费用展示；
+- `models` 为出现过的全部 `providerId/modelId` 列表（前端配色/图例用）；
+- **口径声明（审核中 1）**：本接口基于 usageTurns（账单性质，删会话不删账）；§3.9 汇总卡基于 sessions 索引（删会话即扣减）——同页两个总数可能不一致，属预期行为，UI 需在图表区标注「含已删除会话的历史用量」。
+
+### 3.11 GET /api/models —— 读模型配置
 
 - 200：§2.4 结构（apiKey 已脱敏）；
 - **实现口径（审核 M3）**：原始 yaml 读取 + §2.4 宽松结构校验（apiKey 允许为空），**不使用** `loadModelConfigFromYaml`——库解析器必须指定单个 providerId、apiKey 缺失直接 raise、yaml 缺失时回退环境变量而非报错，三者都与本端点语义冲突；
 - 400：`config/models.yaml 不存在。`（缺失时）；yaml 语法错误 → 400 透传 yaml 解析消息。
 
-### 3.10 PUT /api/models —— 写模型配置
+### 3.12 PUT /api/models —— 写模型配置
 
 请求体：§2.4 结构（apiKey 按脱敏规则回传）。
 
@@ -248,7 +315,7 @@
 - 副作用：备份 `models.yaml.bak` → 合并式写回 → 原子替换 → agent 缓存标记失效（下次 getAgent 惰性重建）；
 - **yaml 缺失时（审核 L5）**：以空文档为基底创建（等价于全新配置）。
 
-### 3.11 GET /api/health —— 探活
+### 3.13 GET /api/health —— 探活
 
 - 200：`{ "ok": true, "version": "0.1.0" }`（需认证）。
 

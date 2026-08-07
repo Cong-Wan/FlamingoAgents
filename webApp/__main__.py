@@ -1,9 +1,10 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-08-05
+Version: 1.2
+Date: 2026-08-07
 Description: 启动入口：校验 FLAMINGO_WEB_TOKEN（未设置则报错退出），读 FLAMINGO_WEB_HOST/PORT，单 worker 起 uvicorn。
             v1.1 随包改名 flamingoWeb → webApp 调整为从 webApp.backend.server 导入 app。
+            v1.2 迭代一（方案 §11.4）：uvicorn 启动前调用 usageStore.initUsageDb()（建表 + 空表时从 jsonl 一次性回填历史用量）。
 '''
 
 import os
@@ -20,6 +21,8 @@ def main() -> None:
     host = os.environ.get('FLAMINGO_WEB_HOST', '0.0.0.0')
     port = int(os.environ.get('FLAMINGO_WEB_PORT', '8787'))
     from webApp.backend.server import app
+    from webApp.backend.usageStore import initUsageDb
+    initUsageDb()
     # agent 缓存、活跃流登记、索引文件锁全是进程内内存态，多 worker 会各自持有一份导致状态错乱，写死单 worker。
     uvicorn.run(app, host=host, port=port, workers=1)
 

@@ -1,9 +1,10 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-08-05
+Version: 1.2
+Date: 2026-08-07
 Description: sessionId → agent 实例缓存（懒建、模型配置变更后置失效标记惰性重建）、活跃流登记（同会话并发 409）、停止标志与泵线程结构。
             v1.1 随包改名调整 import（webApp.backend.*）。
+            v1.2 迭代一（方案 §11.4）：泵线程流开始快照 usageTotal、终态算 delta 先写 usageStore.usageTurns（后回写 sessions 索引，原有回写不变）。
 '''
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import threading
 from flamingoAgents import createAgent
 from flamingoAgents.core.types import errorEvent, terminalEventTypes
 
-from webApp.backend import sessionStore
+from webApp.backend import sessionStore, usageStore
 from webApp.backend.sessionStore import sessionLogsDir
 
 managerLock = threading.RLock()
@@ -109,6 +110,7 @@ class streamPump:
         self.stopFlag.set()
 
     def _pump(self) -> None:
+        startUsage = self._currentUsage()
         try:
             for event in self.stream:
                 if self.stopFlag.is_set():
@@ -120,14 +122,29 @@ class streamPump:
             self.eventQueue.put(errorEvent(message=str(error), errorType=type(error).__name__))
         finally:
             self.stream.close()
-            self._writebackUsage()
+            self._recordUsage(startUsage)
             unregisterStream(self.sessionId)
             self.eventQueue.put(None)  # 哨兵：通知 SSE 生成器结束
 
-    def _writebackUsage(self) -> None:
-        # 回写时机在泵线程结束（审核 L4）：客户端早断时泵仍跑到终态，回写值才完整。
-        # 会话可能尚未建 conversation（如 pendingConfirmationExists 直通错误），无则跳过。
+    def _currentUsage(self) -> dict:
+        # 从已缓存 conversation 读 usageTotal（禁止 getConversation()，避免为未发消息会话落 jsonl 的副作用）。
         with self.agent.sessionLocksGuard:
             currentConversation = self.agent.conversations.get(self.sessionId)
-        if currentConversation is not None:
-            sessionStore.updateUsage(self.sessionId, currentConversation.usageTotal)
+        if currentConversation is None:
+            return {'promptTokens': 0, 'cachedTokens': 0, 'completionTokens': 0}
+        usage = currentConversation.usageTotal
+        return {key: int(usage.get(key, 0) or 0) for key in ('promptTokens', 'cachedTokens', 'completionTokens')}
+
+    def _recordUsage(self, startUsage: dict) -> None:
+        # 回写时机在泵线程结束（审核 L4）：客户端早断时泵仍跑到终态，回写值才完整。
+        # 会话可能尚未建 conversation（如 pendingConfirmationExists 直通错误），无则跳过。
+        # 顺序（方案 §11.4）：先写 usageTurns（账单，delta 任一项 >0 才写），后回写 sessions 索引（回写失败不丢账）。
+        with self.agent.sessionLocksGuard:
+            currentConversation = self.agent.conversations.get(self.sessionId)
+        if currentConversation is None:
+            return
+        finalUsage = {key: int(currentConversation.usageTotal.get(key, 0) or 0) for key in startUsage}
+        delta = {key: finalUsage[key] - startUsage[key] for key in finalUsage}
+        meta = sessionStore.getSession(self.sessionId) or {}
+        usageStore.writeUsageTurn(self.sessionId, meta.get('providerId', 'unknown'), meta.get('modelId', ''), delta)
+        sessionStore.updateUsage(self.sessionId, finalUsage)

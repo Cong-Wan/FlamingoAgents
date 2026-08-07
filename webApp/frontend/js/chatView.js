@@ -1,9 +1,9 @@
 /*
 Author: wilbur
-Version: 1.0
+Version: 1.1
 Date: 2026-08-07
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
-             确认框、停止；完整落实契约 §5 前端状态机。
+             确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
 */
 (function () {
   'use strict';
@@ -334,7 +334,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         card.resultSection.classList.remove('hidden');
         setCollapsibleText(card.resultPre, result.content || '', card.resultSection);
       } else if (pending && pending.toolCall && pending.toolCall.id === toolCall.id) {
-        // pending 中的 toolCall 不按 dangling 渲染，而是「待确认」卡片（契约 §3.7/§5）
+        // pending 中的 toolCall 不按 dangling 渲染，而是「待确认」卡片（契约 §3.8/§5）
         card = buildToolCard(toolCall, 'pending', pending.commandPreview || '');
       } else {
         // 末尾未配对 toolCalls = dangling（中断未完成），渲染置灰卡片

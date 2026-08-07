@@ -1,8 +1,9 @@
 /*
 Author: wilbur
-Version: 1.0
+Version: 1.1
 Date: 2026-08-07
-Description: fetch 封装：自动带 Bearer token；任意请求 401 → 清 token → 登录门（契约 §1.1/§3.1/§5）
+Description: fetch 封装：自动带 Bearer token；任意请求 401 → 清 token → 登录门（契约 §1.1/§3.1/§5）。
+             v1.1 迭代一：新增 probeWorkDir（§3.4）与 getUsageSeries（§3.10）。
 */
 (function () {
   'use strict';
@@ -68,6 +69,9 @@ Description: fetch 封装：自动带 Bearer token；任意请求 401 → 清 to
     },
 
     getSessions: function () { return request('/api/sessions'); },
+    probeWorkDir: function (workDir) {
+      return request('/api/sessions/probeWorkDir', { method: 'POST', body: { workDir: workDir } });
+    },
     createSession: function (params) { return request('/api/sessions', { method: 'POST', body: params }); },
     renameSession: function (sessionId, title) {
       return request('/api/sessions/' + encodeURIComponent(sessionId), { method: 'PATCH', body: { title: title } });
@@ -85,6 +89,9 @@ Description: fetch 封装：自动带 Bearer token；任意请求 401 → 清 to
       return request('/api/chat/stop', { method: 'POST', body: { sessionId: sessionId } });
     },
     getUsage: function () { return request('/api/usage'); },
+    getUsageSeries: function (granularity) {
+      return request('/api/usage/series?granularity=' + encodeURIComponent(granularity || 'day'));
+    },
     getModels: function () { return request('/api/models'); },
     putModels: function (config) { return request('/api/models', { method: 'PUT', body: config }); }
   };

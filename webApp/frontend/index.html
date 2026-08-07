@@ -1,8 +1,9 @@
 <!--
 Author: wilbur
-Version: 1.0
+Version: 1.1
 Date: 2026-08-07
-Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局骨架：侧栏 + 主区 + 弹层 + 登录门）
+Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局骨架：侧栏 + 主区 + 弹层 + 登录门）。
+             v1.1 迭代一：新建弹窗加探建内联确认区；侧栏浅色化 + 收缩/悬浮展开按钮；设置页改 tab + 整页表单 + 固定保存栏；用量页加费用卡与 Chart.js 图表区。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -26,10 +27,11 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
   </div>
 
   <div id="app" class="app hidden">
-    <!-- 左侧深色侧栏 -->
+    <!-- 左侧浅色侧栏 -->
     <aside class="sidebar">
       <div class="sidebar-top">
         <button id="newSessionButton" class="btn-new-session">＋ 新建会话</button>
+        <button id="sidebarCollapseButton" class="sidebar-collapse-btn" title="收起侧栏">‹</button>
       </div>
       <nav id="sessionList" class="session-list"></nav>
       <div class="sidebar-bottom">
@@ -40,6 +42,8 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
 
     <!-- 主区域 -->
     <main class="main">
+      <!-- 侧栏隐藏态的悬浮展开按钮 -->
+      <button id="sidebarExpandButton" class="sidebar-expand-btn hidden" title="展开侧栏">☰</button>
       <!-- 聊天页 -->
       <section id="chatPage" class="page page-chat">
         <header class="topbar">
@@ -62,15 +66,17 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
       <!-- 模型配置页 -->
       <section id="settingsPage" class="page hidden">
         <header class="topbar"><span class="topbar-title">模型配置</span></header>
-        <div class="page-body">
+        <div class="page-body settings-body">
           <div class="settings-notice">与 CLI 共用 <code>config/models.yaml</code>，保存后立即生效（已建会话下次发消息时按新配置重建）。</div>
-          <div class="settings-actions">
-            <button id="addProviderButton" class="btn">＋ 新增 Provider</button>
-            <button id="saveModelsButton" class="btn btn-primary">保存</button>
-          </div>
-          <div id="settingsError" class="error-bar hidden"></div>
-          <div id="providerList" class="provider-list"></div>
+          <div id="settingsError" class="error-bar settings-error hidden"></div>
+          <div id="providerTabs" class="provider-tabs"></div>
+          <div id="providerForm" class="provider-form"></div>
         </div>
+        <footer class="settings-savebar">
+          <span id="settingsDirtyHint" class="settings-dirty-hint hidden">有未保存修改</span>
+          <button id="resetModelsButton" class="btn">重置</button>
+          <button id="saveModelsButton" class="btn btn-primary">保存</button>
+        </footer>
       </section>
 
       <!-- 用量统计页 -->
@@ -81,6 +87,22 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
             <div class="usage-card"><div class="usage-card-label">Prompt Tokens</div><div id="usagePrompt" class="usage-card-value">-</div></div>
             <div class="usage-card"><div class="usage-card-label">Cached Tokens</div><div id="usageCached" class="usage-card-value">-</div></div>
             <div class="usage-card"><div class="usage-card-label">Completion Tokens</div><div id="usageCompletion" class="usage-card-value">-</div></div>
+            <div id="usageCostCard" class="usage-card hidden"><div class="usage-card-label">总费用</div><div id="usageCost" class="usage-card-value">-</div></div>
+          </div>
+          <div class="usage-chart-area">
+            <div class="usage-chart-head">
+              <span class="usage-chart-title">用量趋势</span>
+              <div id="granularitySwitch" class="granularity-switch">
+                <button data-granularity="hour" class="granularity-btn">时</button>
+                <button data-granularity="day" class="granularity-btn active">天</button>
+                <button data-granularity="month" class="granularity-btn">月</button>
+              </div>
+            </div>
+            <div class="usage-chart-wrap">
+              <canvas id="usageChart"></canvas>
+              <div id="usageChartEmpty" class="usage-chart-empty hidden">暂无用量数据</div>
+            </div>
+            <div class="usage-chart-note">图表含已删除会话的历史用量；上方卡片仅统计现存会话。</div>
           </div>
           <table class="usage-table">
             <thead>
@@ -97,8 +119,13 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
   <div id="newSessionModal" class="modal-mask hidden">
     <div class="modal">
       <h2 class="modal-title">新建会话</h2>
-      <label class="form-label">工作目录（workDir）</label>
-      <input id="newSessionWorkDir" class="form-input" type="text" placeholder="留空使用项目根目录">
+      <label class="form-label">工作目录（workDir，必填）</label>
+      <input id="newSessionWorkDir" class="form-input" type="text" placeholder="工作目录绝对路径">
+      <div id="workDirError" class="field-error hidden"></div>
+      <div id="workDirCreateConfirm" class="workdir-create-confirm hidden">
+        <span>目录不存在，将自动创建：<code id="workDirCreatePath"></code></span>
+        <button id="workDirCreateAllow" class="btn btn-primary">确认创建</button>
+      </div>
       <label class="form-label">Provider</label>
       <select id="newSessionProvider" class="form-input"></select>
       <label class="form-label">模型</label>
@@ -128,6 +155,7 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
 
   <script src="/static/vendor/marked.min.js"></script>
   <script src="/static/vendor/dompurify.min.js"></script>
+  <script src="/static/vendor/chart.umd.min.js"></script>
   <script src="/static/js/store.js"></script>
   <script src="/static/js/api.js"></script>
   <script src="/static/js/sse.js"></script>

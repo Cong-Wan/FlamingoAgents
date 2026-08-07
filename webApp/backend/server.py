@@ -1,13 +1,16 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-08-05
+Version: 1.2
+Date: 2026-08-07
 Description: FastAPI 应用与全部路由：认证依赖、统一异常映射（库 RuntimeError → 400 透传中文消息）、sessionId 入口校验、SSE 对话流、静态文件容忍空目录挂载。
             v1.1 随包改名调整 import（webApp.backend.*）；静态目录由 static/ 改为 webApp/frontend/，projectRoot 随目录加深改为 parents[2]。
+            v1.2 迭代一（契约 v1.2 §3.3/§3.4/§3.10）：新增 probeWorkDir 与 usage/series 端点；create 会话 workDir 改必填 + allowCreate，
+            校验顺序调整为先 providerId/modelId 预检再处理目录，已存在目录增加 R_OK|W_OK|X_OK 校验，mkdir TOCTOU 兜底。
 '''
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -19,7 +22,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from flamingoAgents.models.modelConfig import loadModelConfigFromYaml
 
-from webApp.backend import agentManager, historyView, modelConfigStore, sessionStore
+from webApp.backend import agentManager, historyView, modelConfigStore, sessionStore, usageStore
 from webApp.backend.auth import authDependency, checkToken
 from webApp.backend.sseCodec import sseGen
 
@@ -105,6 +108,42 @@ def listSessions():
     return {'sessions': sessionStore.listSessions()}
 
 
+@authedApi.post('/sessions/probeWorkDir')
+def probeWorkDir(body: dict = Body(...)):
+    # 无副作用探测（契约 §3.4）：前端「先探后建」，判定只用 creatable/willCreate 两个布尔。
+    workDirRaw = body.get('workDir') if isinstance(body, dict) else None
+    if not isinstance(workDirRaw, str) or not workDirRaw.strip():
+        raise HTTPException(status_code=400, detail='workDir 必须是非空字符串。')
+    workPath = Path(workDirRaw).expanduser().resolve()
+    parentPath = workPath.parent
+    result = {
+        'resolvedPath': str(workPath),
+        'parentPath': str(parentPath),
+        'defaultWorkDir': str(projectRoot),
+    }
+    if workPath.is_dir():
+        writable = os.access(workPath, os.R_OK | os.W_OK | os.X_OK)
+        result.update(
+            exists=True,
+            writable=writable,
+            creatable=writable,
+            willCreate=False,
+            message='目录可用。' if writable else f'目录不可读写：{workPath}',
+        )
+    elif workPath.exists():
+        result.update(exists=False, writable=False, creatable=False, willCreate=False,
+                      message=f'路径已存在且不是目录：{workPath}')
+    elif not parentPath.is_dir():
+        result.update(exists=False, writable=False, creatable=False, willCreate=True,
+                      message=f'父目录不存在：{parentPath}')
+    elif not os.access(parentPath, os.W_OK | os.X_OK):
+        result.update(exists=False, writable=False, creatable=False, willCreate=True,
+                      message=f'无权限在 {parentPath} 下创建目录')
+    else:
+        result.update(exists=False, writable=True, creatable=True, willCreate=True, message='目录不存在，可创建。')
+    return result
+
+
 @authedApi.post('/sessions')
 def createSession(body: dict = Body(...)):
     providerId = body.get('providerId') if isinstance(body, dict) else None
@@ -115,18 +154,37 @@ def createSession(body: dict = Body(...)):
     if modelId is not None and not isinstance(modelId, str):
         raise HTTPException(status_code=400, detail='modelId 必须是字符串。')
     workDirRaw = body.get('workDir')
-    if workDirRaw is None:
-        workPath = projectRoot
-    elif isinstance(workDirRaw, str) and workDirRaw.strip():
-        workPath = Path(workDirRaw).expanduser()
-    else:
+    if not isinstance(workDirRaw, str) or not workDirRaw.strip():
         raise HTTPException(status_code=400, detail='workDir 必须是非空字符串。')
-    if not workPath.is_dir():
-        raise HTTPException(status_code=400, detail=f'workDir 不存在或不是目录：{workPath}')
+    allowCreate = body.get('allowCreate', False)
+    if not isinstance(allowCreate, bool):
+        raise HTTPException(status_code=400, detail='allowCreate 必须是布尔值。')
+    workPath = Path(workDirRaw).expanduser()
+    # 处理顺序（审核中 6）：先 providerId/modelId 预检（失败 400 不留孤儿目录），再处理目录。
     # 预检（审核 M3/M4）：yaml 缺失时库会静默回退环境变量配置，必须 Web 层先行拦截。
     if not modelConfigStore.modelsYamlPath.exists():
         raise HTTPException(status_code=400, detail='config/models.yaml 不存在。')
     resolved = loadModelConfigFromYaml(providerId=providerId, modelId=modelId or None)
+    if workPath.is_dir():
+        # 行为变更（审核中 9）：已存在目录除 is_dir 外增加可读写进入校验。
+        if not os.access(workPath, os.R_OK | os.W_OK | os.X_OK):
+            raise HTTPException(status_code=400, detail=f'目录不可读写：{workPath}')
+    elif workPath.exists():
+        raise HTTPException(status_code=400, detail=f'路径已存在且不是目录：{workPath}')
+    else:
+        if not allowCreate:
+            raise HTTPException(status_code=400, detail=f'workDir 不存在：{workPath}')
+        parentPath = workPath.parent
+        if not parentPath.is_dir():
+            raise HTTPException(status_code=400, detail=f'父目录不存在：{parentPath}')
+        if not os.access(parentPath, os.W_OK | os.X_OK):
+            raise HTTPException(status_code=400, detail=f'无权限在 {parentPath} 下创建目录')
+        try:
+            workPath.mkdir()  # 只建最后一级（不带 parents，方案 §11.0）
+        except FileExistsError:
+            pass  # TOCTOU 兜底：被抢建视为成功
+        except OSError as error:
+            raise HTTPException(status_code=400, detail=f'创建目录失败：{error}')
     return sessionStore.createSession(str(workPath.resolve()), providerId, resolved.config.model)
 
 
@@ -213,6 +271,14 @@ def getUsage():
             'updatedAt': session.get('updatedAt', ''),
         })
     return {'total': total, 'sessions': entries}
+
+
+@authedApi.get('/usage/series')
+def getUsageSeries(granularity: str = 'day'):
+    # 时/天/月粒度用量序列（契约 §3.10）：数据源 usageTurns（账单口径，删会话不删账）。
+    if granularity not in ('hour', 'day', 'month'):
+        raise HTTPException(status_code=400, detail=f'granularity 非法：{granularity}（仅允许 hour/day/month）。')
+    return usageStore.querySeries(granularity)
 
 
 @authedApi.get('/models')
