@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Local Flamingo Agents as a pure library"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.141.1",
     "pyyaml>=6.0.3",
+    "uvicorn>=0.52.1",
 ]
 
 [build-system]

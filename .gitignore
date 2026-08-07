@@ -12,3 +12,6 @@ __pycache__/
 
 # 本地模型配置（含密钥），仅提交 models.example.yaml
 config/models.yaml
+
+# Web 程序运行数据（会话索引 + 集中日志）
+webData/

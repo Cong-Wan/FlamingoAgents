@@ -1,0 +1,140 @@
+<!--
+Author: wilbur
+Version: 1.0
+Date: 2026-08-07
+Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局骨架：侧栏 + 主区 + 弹层 + 登录门）
+-->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FlamingoAgents</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <!-- 登录门：无 token 或任意请求 401 时全屏遮罩 -->
+  <div id="loginGate" class="login-gate hidden">
+    <div class="login-box">
+      <div class="login-logo">🦩</div>
+      <h1 class="login-title">FlamingoAgents</h1>
+      <p class="login-hint">请输入访问 Token（服务端环境变量 FLAMINGO_WEB_TOKEN）</p>
+      <input id="loginTokenInput" class="login-input" type="password" placeholder="Token" autocomplete="off">
+      <div id="loginError" class="login-error hidden"></div>
+      <button id="loginButton" class="btn btn-primary login-button">进入</button>
+    </div>
+  </div>
+
+  <div id="app" class="app hidden">
+    <!-- 左侧深色侧栏 -->
+    <aside class="sidebar">
+      <div class="sidebar-top">
+        <button id="newSessionButton" class="btn-new-session">＋ 新建会话</button>
+      </div>
+      <nav id="sessionList" class="session-list"></nav>
+      <div class="sidebar-bottom">
+        <a class="sidebar-entry" href="#/settings/models"><span class="entry-icon">⚙</span>模型配置</a>
+        <a class="sidebar-entry" href="#/usage"><span class="entry-icon">📊</span>用量统计</a>
+      </div>
+    </aside>
+
+    <!-- 主区域 -->
+    <main class="main">
+      <!-- 聊天页 -->
+      <section id="chatPage" class="page page-chat">
+        <header class="topbar">
+          <span id="topbarTitle" class="topbar-title">FlamingoAgents</span>
+          <span id="topbarModel" class="topbar-model"></span>
+        </header>
+        <div id="errorBar" class="error-bar hidden"></div>
+        <div id="messageList" class="message-list"></div>
+        <div id="chatEmpty" class="chat-empty">
+          <div class="chat-empty-logo">🦩</div>
+          <p>从左侧选择会话，或点击「＋ 新建会话」开始</p>
+        </div>
+        <footer class="composer">
+          <textarea id="composerInput" class="composer-input" rows="1"
+                    placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+          <button id="sendButton" class="btn btn-primary send-button" disabled>发送</button>
+        </footer>
+      </section>
+
+      <!-- 模型配置页 -->
+      <section id="settingsPage" class="page hidden">
+        <header class="topbar"><span class="topbar-title">模型配置</span></header>
+        <div class="page-body">
+          <div class="settings-notice">与 CLI 共用 <code>config/models.yaml</code>，保存后立即生效（已建会话下次发消息时按新配置重建）。</div>
+          <div class="settings-actions">
+            <button id="addProviderButton" class="btn">＋ 新增 Provider</button>
+            <button id="saveModelsButton" class="btn btn-primary">保存</button>
+          </div>
+          <div id="settingsError" class="error-bar hidden"></div>
+          <div id="providerList" class="provider-list"></div>
+        </div>
+      </section>
+
+      <!-- 用量统计页 -->
+      <section id="usagePage" class="page hidden">
+        <header class="topbar"><span class="topbar-title">用量统计</span></header>
+        <div class="page-body">
+          <div class="usage-cards">
+            <div class="usage-card"><div class="usage-card-label">Prompt Tokens</div><div id="usagePrompt" class="usage-card-value">-</div></div>
+            <div class="usage-card"><div class="usage-card-label">Cached Tokens</div><div id="usageCached" class="usage-card-value">-</div></div>
+            <div class="usage-card"><div class="usage-card-label">Completion Tokens</div><div id="usageCompletion" class="usage-card-value">-</div></div>
+          </div>
+          <table class="usage-table">
+            <thead>
+              <tr><th>会话</th><th>模型</th><th>Prompt</th><th>Cached</th><th>Completion</th><th>更新时间</th></tr>
+            </thead>
+            <tbody id="usageTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 新建会话弹窗 -->
+  <div id="newSessionModal" class="modal-mask hidden">
+    <div class="modal">
+      <h2 class="modal-title">新建会话</h2>
+      <label class="form-label">工作目录（workDir）</label>
+      <input id="newSessionWorkDir" class="form-input" type="text" placeholder="留空使用项目根目录">
+      <label class="form-label">Provider</label>
+      <select id="newSessionProvider" class="form-input"></select>
+      <label class="form-label">模型</label>
+      <select id="newSessionModel" class="form-input"></select>
+      <div id="newSessionError" class="login-error hidden"></div>
+      <div class="modal-actions">
+        <button id="newSessionCancel" class="btn">取消</button>
+        <button id="newSessionCreate" class="btn btn-primary">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 工具确认框 -->
+  <div id="confirmModal" class="modal-mask hidden">
+    <div class="modal">
+      <h2 class="modal-title">工具调用确认</h2>
+      <div class="confirm-row"><span class="confirm-label">工具</span><span id="confirmToolName" class="confirm-value"></span></div>
+      <div class="confirm-row"><span class="confirm-label">原因</span><span id="confirmReason" class="confirm-value"></span></div>
+      <div class="confirm-row" id="confirmPreviewRow"><span class="confirm-label">命令预览</span><pre id="confirmPreview" class="confirm-preview"></pre></div>
+      <div class="confirm-row"><span class="confirm-label">入参</span><pre id="confirmArgs" class="confirm-preview"></pre></div>
+      <div class="modal-actions">
+        <button id="confirmReject" class="btn btn-danger">拒绝</button>
+        <button id="confirmApprove" class="btn btn-primary">批准</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/vendor/marked.min.js"></script>
+  <script src="/static/vendor/dompurify.min.js"></script>
+  <script src="/static/js/store.js"></script>
+  <script src="/static/js/api.js"></script>
+  <script src="/static/js/sse.js"></script>
+  <script src="/static/js/sidebarView.js"></script>
+  <script src="/static/js/chatView.js"></script>
+  <script src="/static/js/settingsView.js"></script>
+  <script src="/static/js/usageView.js"></script>
+  <script src="/static/js/main.js"></script>
+</body>
+</html>
