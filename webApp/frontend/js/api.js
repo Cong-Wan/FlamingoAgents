@@ -1,9 +1,10 @@
 /*
 Author: wilbur
-Version: 1.1
+Version: 1.2
 Date: 2026-08-07
 Description: fetch 封装：自动带 Bearer token；任意请求 401 → 清 token → 登录门（契约 §1.1/§3.1/§5）。
              v1.1 迭代一：新增 probeWorkDir（§3.4）与 getUsageSeries（§3.10）。
+             v1.2 迭代二（方案 §4.9）：新增 getSessionStatus / updateSessionModel / listFiles / getFileContent。
 */
 (function () {
   'use strict';
@@ -93,6 +94,22 @@ Description: fetch 封装：自动带 Bearer token；任意请求 401 → 清 to
       return request('/api/usage/series?granularity=' + encodeURIComponent(granularity || 'day'));
     },
     getModels: function () { return request('/api/models'); },
-    putModels: function (config) { return request('/api/models', { method: 'PUT', body: config }); }
+    putModels: function (config) { return request('/api/models', { method: 'PUT', body: config }); },
+
+    // 迭代二：状态栏 / /model 指令 / 文件浏览器与@附件
+    getSessionStatus: function (sessionId) {
+      return request('/api/sessions/' + encodeURIComponent(sessionId) + '/status');
+    },
+    updateSessionModel: function (sessionId, providerId, modelId) {
+      return request('/api/sessions/' + encodeURIComponent(sessionId) + '/model', {
+        method: 'PATCH', body: { providerId: providerId, modelId: modelId }
+      });
+    },
+    listFiles: function (sessionId, path) {
+      return request('/api/sessions/' + encodeURIComponent(sessionId) + '/files?path=' + encodeURIComponent(path || ''));
+    },
+    getFileContent: function (sessionId, path) {
+      return request('/api/sessions/' + encodeURIComponent(sessionId) + '/fileContent?path=' + encodeURIComponent(path));
+    }
   };
 })();

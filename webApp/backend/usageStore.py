@@ -1,10 +1,11 @@
 '''
 Author: wilbur
-Version: 1.0
+Version: 1.1
 Date: 2026-08-07
 Description: webData/usage.db SQLite 用量统计库（契约 §3.10 / webAppPlan §11.4）：usageTurns 表 DDL 与增量写入（泵线程终态 delta，任一项 >0 才写）；
             空表时从 sessionLogs jsonl 一次性回填 assistantMessage 事件（providerId 从 sessions 索引补、缺省 unknown）；
             hour/day/month 聚合查询（UTC 转服务器本地时区切桶、空桶补齐、byModel key 为 providerId/modelId、cost 查询时按 models.yaml 当前价格计算）。
+            v1.1 迭代二（方案 §3.2）：新增 querySessionCost（status 端点费用口径，按 sessionId 聚合逐 turn 计价）。
 '''
 
 from __future__ import annotations
@@ -116,6 +117,25 @@ def writeUsageTurn(sessionId: str, providerId: str, modelId: str, delta: dict) -
             ),
         )
         connection.commit()
+
+
+def querySessionCost(sessionId: str) -> float:
+    # status 端点费用（迭代二 §3.2 / D1-A）：按 sessionId 聚合 usageTurns，逐行套 costMap 当前价求和；
+    # 模型已从 yaml 删除 → 该行按 0 计；泵流进行中落后一轮（D7 不轮询，可接受）。
+    connection = getConnection()
+    with dbLock:
+        rows = connection.execute(
+            'SELECT providerId, modelId, promptTokens, cachedTokens, completionTokens FROM usageTurns WHERE sessionId = ?',
+            (sessionId,),
+        ).fetchall()
+    costMap = loadCostMap()
+    total = 0.0
+    for providerId, modelId, promptTokens, cachedTokens, completionTokens in rows:
+        cost = costMap.get(f'{providerId}/{modelId}')
+        if cost:
+            total += (promptTokens * cost['input'] + completionTokens * cost['output']
+                      + cachedTokens * cost['cacheRead']) / 1_000_000
+    return total
 
 
 def loadCostMap() -> dict:

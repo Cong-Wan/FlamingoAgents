@@ -1,17 +1,20 @@
 '''
 Author: wilbur
-Version: 1.2
+Version: 1.3
 Date: 2026-08-07
 Description: FastAPI 应用与全部路由：认证依赖、统一异常映射（库 RuntimeError → 400 透传中文消息）、sessionId 入口校验、SSE 对话流、静态文件容忍空目录挂载。
             v1.1 随包改名调整 import（webApp.backend.*）；静态目录由 static/ 改为 webApp/frontend/，projectRoot 随目录加深改为 parents[2]。
             v1.2 迭代一（契约 v1.2 §3.3/§3.4/§3.10）：新增 probeWorkDir 与 usage/series 端点；create 会话 workDir 改必填 + allowCreate，
             校验顺序调整为先 providerId/modelId 预检再处理目录，已存在目录增加 R_OK|W_OK|X_OK 校验，mkdir TOCTOU 兜底。
+            v1.3 迭代二（方案 webAppIteration2Plan §3）：新增 status（状态栏聚合）、PATCH model（/model）、files/fileContent（文件浏览器与@附件）端点；
+            chat/stream 支持 attachments（后端拼接附件块）且 message 校验放宽为「与 attachments 不同时为空」。
 '''
 
 from __future__ import annotations
 
 import os
 import re
+import subprocess
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
@@ -22,7 +25,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from flamingoAgents.models.modelConfig import loadModelConfigFromYaml
 
-from webApp.backend import agentManager, historyView, modelConfigStore, sessionStore, usageStore
+from webApp.backend import agentManager, fileBrowser, historyView, modelConfigStore, sessionStore, usageStore
 from webApp.backend.auth import authDependency, checkToken
 from webApp.backend.sseCodec import sseGen
 
@@ -188,6 +191,93 @@ def createSession(body: dict = Body(...)):
     return sessionStore.createSession(str(workPath.resolve()), providerId, resolved.config.model)
 
 
+@authedApi.get('/sessions/{sessionId}/status')
+def getSessionStatus(sessionId: str):
+    # 状态栏聚合（迭代二 §3.2）：usage/contextTokens 单一数据源为 sessions 索引；yaml 异常时 cost=0、contextWindow=null 降级（评审 M1）。
+    checkSessionId(sessionId)
+    session = requireSession(sessionId)
+    workDir = session.get('workDir', '')
+    gitBranch = None
+    try:
+        result = subprocess.run(
+            ['git', '-C', workDir, 'rev-parse', '--abbrev-ref', 'HEAD'],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            gitBranch = result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        gitBranch = None
+    providerId = session.get('providerId', '')
+    modelId = session.get('modelId', '')
+    contextWindow = None
+    try:
+        raw = modelConfigStore.readRawYaml()
+        providers = raw.get('providers') if isinstance(raw, dict) else None
+        provider = providers.get(providerId) if isinstance(providers, dict) else None
+        models = provider.get('models') if isinstance(provider, dict) else None
+        for model in models or []:
+            if isinstance(model, dict) and model.get('id') == modelId and isinstance(model.get('contextWindow'), int):
+                contextWindow = model['contextWindow']
+                break
+    except RuntimeError:
+        contextWindow = None
+    contextTokens = int(session.get('contextTokens', 0) or 0)
+    remainingPercent = None
+    if contextWindow:
+        remainingPercent = round(max(0.0, min(100.0, (1 - contextTokens / contextWindow) * 100)), 1)
+    return {
+        'workDir': workDir,
+        'gitBranch': gitBranch,
+        'providerId': providerId,
+        'modelId': modelId,
+        'usage': session.get('usage') or dict(sessionStore.emptyUsage),
+        'cost': usageStore.querySessionCost(sessionId),
+        'contextWindow': contextWindow,
+        'contextTokens': contextTokens,
+        'contextRemainingPercent': remainingPercent,
+    }
+
+
+@authedApi.patch('/sessions/{sessionId}/model')
+def updateSessionModel(sessionId: str, body: dict = Body(...)):
+    # /model 指令（迭代二 §3.3）：先 yaml 预检再落索引，最后单锁丢弃 agent（活跃流 → 409，索引已生效、下轮起新模型）。
+    checkSessionId(sessionId)
+    requireSession(sessionId)
+    providerId = body.get('providerId') if isinstance(body, dict) else None
+    modelId = body.get('modelId') if isinstance(body, dict) else None
+    if not isinstance(providerId, str) or not providerId.strip():
+        raise HTTPException(status_code=400, detail='providerId 必填。')
+    if not isinstance(modelId, str) or not modelId.strip():
+        raise HTTPException(status_code=400, detail='modelId 必填。')
+    providerId = providerId.strip()
+    modelId = modelId.strip()
+    if not modelConfigStore.modelsYamlPath.exists():
+        raise HTTPException(status_code=400, detail='config/models.yaml 不存在。')
+    loadModelConfigFromYaml(providerId=providerId, modelId=modelId)  # 预检，失败 RuntimeError → 400
+    session = sessionStore.updateSessionModel(sessionId, providerId, modelId)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f'会话不存在：{sessionId}')
+    if not agentManager.dropAgentIfIdle(sessionId):
+        raise HTTPException(status_code=409, detail='该会话有活跃流，本轮仍跑旧模型，下轮起新模型生效。')
+    return session
+
+
+@authedApi.get('/sessions/{sessionId}/files')
+def listFiles(sessionId: str, path: str = ''):
+    checkSessionId(sessionId)
+    session = requireSession(sessionId)
+    return fileBrowser.listDir(session['workDir'], path or None)
+
+
+@authedApi.get('/sessions/{sessionId}/fileContent')
+def getFileContent(sessionId: str, path: str = ''):
+    checkSessionId(sessionId)
+    session = requireSession(sessionId)
+    if not path:
+        raise HTTPException(status_code=400, detail='path 不能为空。')
+    return fileBrowser.readTextFile(session['workDir'], path)
+
+
 @authedApi.patch('/sessions/{sessionId}')
 def renameSession(sessionId: str, body: dict = Body(...)):
     checkSessionId(sessionId)
@@ -298,16 +388,30 @@ def chatStream(body: dict = Body(...)):
     sessionId = checkSessionId(body.get('sessionId') if isinstance(body, dict) else None)
     requireSession(sessionId)
     message = body.get('message')
-    if not isinstance(message, str) or not message.strip():
-        raise HTTPException(status_code=400, detail='message 不能为空。')
+    if not isinstance(message, str):
+        raise HTTPException(status_code=400, detail='message 必须是字符串。')
+    attachments = body.get('attachments') or []
+    if not isinstance(attachments, list):
+        raise HTTPException(status_code=400, detail='attachments 必须是数组。')
     cleanMessage = message.strip()
+    if not cleanMessage and not attachments:
+        raise HTTPException(status_code=400, detail='message 与 attachments 不能同时为空。')
+    session = requireSession(sessionId)
+    if attachments:
+        # 后端拼接附件块（迭代二 §3.7）：落 jsonl 与发模型的都是拼接后文本，resume 上下文一致。
+        cleanMessage = fileBrowser.buildAttachmentMessage(cleanMessage, session['workDir'], attachments)
     agentInstance = agentManager.getAgent(sessionId)
     stream = agentInstance.runUserMessageStream(cleanMessage, sessionId)
     pump = agentManager.startStream(sessionId, agentInstance, stream)
     if pump is None:
         raise HTTPException(status_code=409, detail='该会话已有活跃流，请稍后再试。')
     # 首条用户消息发出后标题自动改为前 20 字；发消息刷新 updatedAt（契约 §2.1）。
-    sessionStore.setDefaultTitle(sessionId, cleanMessage[:20])
+    # 纯附件发送（D8）时标题取第一个附件名，同样截断前 20 字（评审 L3）。
+    titleSource = message.strip()
+    if not titleSource and attachments:
+        firstPath = attachments[0].get('path') if isinstance(attachments[0], dict) else ''
+        titleSource = f'📄 {firstPath}'
+    sessionStore.setDefaultTitle(sessionId, titleSource[:20])
     sessionStore.touchSession(sessionId)
     return sseResponse(pump)
 

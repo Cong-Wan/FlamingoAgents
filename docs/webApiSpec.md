@@ -1,13 +1,14 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.2.1
-> Date: 2026-08-05
+> Version: 1.3
+> Date: 2026-08-08
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 7 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
 > v1.2：迭代一（webAppPlan §11）——新增 probeWorkDir 端点（§3.4）与 usage/series 端点（§3.10）；POST /api/sessions 的 workDir 改必填 + 新增 allowCreate；原 §3.4–3.8、§3.9–3.11 顺延为 §3.5–3.9、§3.11–3.13。
 > v1.2.1：按 pi 审核修订——§3.4 probe 响应加 `creatable`/`defaultWorkDir` 字段 + 补「存在但不是目录」情形；§3.10 时区写死服务器本地、byModel key 改 `providerId/modelId`、补双口径声明与 month 空范围语义。
+> v1.3：迭代二（docs/webAppIteration2Plan.md）——新增 status（§3.14）/ PATCH model（§3.15）/ files（§3.16）/ fileContent（§3.17）端点；chat/stream 请求体新增 `attachments` 且 message 校验放宽（§4.1）；session 对象新增 `contextTokens`（§2.1）；user message content 可能含附件块标记（§2.2）。
 
 ---
 
@@ -69,7 +70,8 @@
 - `title`：默认「新会话」；**首条用户消息发出后后端自动改为消息前 20 字**；可经 PATCH 改名；
 - `modelId`：建会话时未指定则为该 provider 首个模型（与库 `selectModel` 行为一致），此处记录的是**实际生效值**；
 - `usage`：会话累计 token（来源 `conversation.usageTotal`，泵线程每轮结束后回写）；初始值 `{ "promptTokens": 0, "cachedTokens": 0, "completionTokens": 0 }`（审核 L6）；
-- `updatedAt`：建会话、发消息、改名、用量回写时刷新。
+- `contextTokens`（v1.3 新增，可选字段）：最近一次模型调用的 prompt+completion tokens（来源 `conversation.lastTurnTokens`，泵线程终态随 usage 一并回写），用于状态栏「会话窗口剩余百分比」（§3.14）；老索引无此字段按 0 处理；
+- `updatedAt`：建会话、发消息、改名、切模型、用量回写时刷新。
 
 ### 2.2 message（历史消息 DTO，`GET /api/sessions/{id}/messages` 元素）
 
@@ -78,6 +80,8 @@
 ```json
 { "kind": "user", "content": "阅读 @/xx 文件并总结", "timestamp": "..." }
 ```
+
+- **user content 可能含附件块标记（v1.3）**：`@文件` 发送的消息由后端拼接为 `<attachment path="相对路径">\n<文件全文>\n</attachment>` 块附在原文之后（§4.1）；前端回放时应将该块渲染为折叠 chip，path 需做字符集校验（仅 `[A-Za-z0-9_\-./]`）防手输伪造；
 
 ```json
 {
@@ -139,6 +143,7 @@
       "baseUrl": "https://ark.cn-beijing.volces.com/api/coding/v3",
       "api": "openai-completions",
       "apiKey": "__KEEP__",
+      "headers": { "User-Agent": "curl/8.7.1" },
       "models": [
         {
           "id": "deepseek-v4-flash",
@@ -149,7 +154,8 @@
           "reasoning": true,
           "thinking": { "type": "enabled" },
           "reasoningEffort": "max",
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "headers": {}
         }
       ]
     }
@@ -169,6 +175,8 @@
 **`$` 前缀约定（审核 L3）**：任何以 `$` 开头的 apiKey 值一律视为环境变量引用（GET 原样返回不脱敏、PUT 按引用写回）；因此**明文 key 不得以 `$` 开头**，UI 输入校验需拦截并提示。
 
 **PUT 合并语义（webAppPlan §4.7）**：仅覆盖本文档 schema 内字段；yaml 中 schema 外字段（如 `stream`）原样保留；写前备份 `models.yaml.bak`。
+
+**`headers` 自定义请求头（v1.3 新增）**：provider 级与 model 级均为可选 `dict[str, str]`（键值必须都是字符串，否则 400）；无配置时 GET 返回 `{}`；**PUT 传空对象 = 删除该字段**（与 apiKey 空串删除语义对齐）；生效合并规则：`provider.headers` 为底、`model.headers` 覆盖同名字段（与 `stream` 的 provider→model 回退一致）；`Authorization`/`Content-Type` 始终由适配器设置，自定义头不可覆盖。
 
 **PUT 校验规则**（失败 400，消息中文）：
 
@@ -319,6 +327,70 @@
 
 - 200：`{ "ok": true, "version": "0.1.0" }`（需认证）。
 
+### 3.14 GET /api/sessions/{sessionId}/status —— 会话状态栏聚合（v1.3 新增）
+
+- 200：
+
+```json
+{
+  "workDir": "/Users/wilbur/project/FlamingoAgents",
+  "gitBranch": "dev",
+  "providerId": "volcano",
+  "modelId": "deepseek-v4-flash",
+  "usage": { "promptTokens": 1571, "cachedTokens": 0, "completionTokens": 236 },
+  "cost": 0.000286,
+  "contextWindow": 1048576,
+  "contextTokens": 1793,
+  "contextRemainingPercent": 99.8
+}
+```
+
+- `gitBranch`：`git -C <workDir> rev-parse --abbrev-ref HEAD`（参数数组无 shell、timeout=2s）每次现查不缓存；非 git 仓库 / workDir 已删 / 超时 → `null`，不报错；
+- `usage` / `contextTokens`：**单一数据源为 sessions 索引**（泵线程先回写索引后放流结束哨兵，前端在 SSE 连接关闭后刷新必然拿到新值）；
+- `cost`：usageTurns 按 sessionId 聚合、逐 turn 按其记录的 `providerId/modelId` 套 models.yaml 当前价求和（公式同 §3.10）；泵流进行中落后一轮属预期；
+- `contextWindow`：当前会话模型在 models.yaml 的 `contextWindow`；**yaml 缺失/损坏/模型无该字段 → `null` 且 cost 按 0 计，不影响其余字段**；
+- `contextRemainingPercent`：`clamp((1 − contextTokens/contextWindow) × 100, 0, 100)` 保留 1 位小数；`contextWindow` 为 `null` 时该字段为 `null`；
+- 404：会话不存在。
+
+### 3.15 PATCH /api/sessions/{sessionId}/model —— 切换当前会话模型（v1.3 新增，/model 指令）
+
+请求：`{ "providerId": "volcano", "modelId": "deepseek-v4-flash" }`（均必填非空字符串，否则 400）
+
+- 处理顺序（与 §3.3「先预检后落库」一致）：会话存在性（404）→ models.yaml 存在性 + `loadModelConfigFromYaml` 预检（400 透传）→ 原子写索引 → 单锁尝试丢弃 agent 缓存；
+- 200：更新后的 session 对象；
+- **409：该会话有活跃流——索引已改为新模型（本轮跑完旧模型、下轮起新模型生效），前端透传提示即可，不回滚**；
+- **已知行为声明**：待确认（waitingConfirm）不是活跃流，PATCH 会放行且内存 pending 随旧 agent 一并丢弃；前端再点「批准」会收到 `confirmationMismatch` 走既有自愈刷新（§4.2）；
+- 副作用边界：不动 models.yaml、不影响其它会话。
+
+### 3.16 GET /api/sessions/{sessionId}/files —— 列目录（v1.3 新增，@面板与文件树共用）
+
+请求：`GET .../files?path=<相对 workDir 路径>`（缺省/空 = 根；前端必须 `encodeURIComponent`）
+
+- 200：
+
+```json
+{
+  "path": "src",
+  "entries": [
+    { "name": "subdir", "type": "dir" },
+    { "name": "a.py", "type": "file", "size": 1234, "attachable": true }
+  ],
+  "truncated": false
+}
+```
+
+- 排序：目录在前、文件在后，各自按名称（小写）排序；`attachable = size ≤ 512KB`（@面板置灰依据）；目录无 size/attachable 字段；
+- **不屏蔽任何文件**：dotfiles（含 `.env`）与 `.git/` 全部照常返回（用户明示，凭证暴露风险由使用者自负）；
+- 单层超过 500 条截断并 `truncated: true`；单条目 stat 失败（坏符号链接/竞态删除）跳过该条目；
+- 400：路径越出 workDir（resolve + `Path.is_relative_to` 拘禁）、path 不是目录、目录不存在/不可读（OSError 统一转中文 400，不落 500）；404：会话不存在。
+
+### 3.17 GET /api/sessions/{sessionId}/fileContent —— 读文件内容（v1.3 新增，预览与@附件共用）
+
+请求：`GET .../fileContent?path=<相对路径>`（空 path → 400）
+
+- 200：`{ "path": "src/a.py", "size": 1234, "content": "<utf-8 文本>" }`（`errors='replace'` 解码）；
+- 400：路径越拘禁 / 不是文件 / 超过 512KB / 含 NUL 字节（二进制）/ 不存在或不可读；404：会话不存在。
+
 ## 4. SSE 流式接口
 
 ### 4.1 POST /api/chat/stream —— 发起对话
@@ -326,10 +398,18 @@
 请求：
 
 ```json
-{ "sessionId": "session_0bcd11873ded", "message": "用户消息" }
+{
+  "sessionId": "session_0bcd11873ded",
+  "message": "用户消息",
+  "attachments": [{ "path": "src/main.py" }]
+}
 ```
 
-预检（失败走 REST 错误，不开流）：sessionId 非法 → 400；会话不存在 → 404；`message` trim 后为空 → 400；该会话有活跃流 → 409。
+- `attachments`（v1.3 新增，可选）：`@文件` 引用数组，≤ 8 个、合计 ≤ 1MB；每个 path 走与 §3.17 相同的拘禁/大小/文本校验，文件内容含 `</attachment>` 字面量 → 400 指明文件名；任一失败整请求 400；
+- **附件拼接（后端完成，落 jsonl 与发模型的是同一最终文本，resume 上下文一致）**：`<原文>\n\n<attachment path="...">\n<文件全文>\n</attachment>`（多块顺序追加）；
+- 标题口径：原文前 20 字；**纯附件发送（原文为空）时取第一个附件名前 20 字（含 `📄 ` 前缀）**。
+
+预检（失败走 REST 错误，不开流）：sessionId 非法 → 400；会话不存在 → 404；**`message` trim 后为空且 `attachments` 为空 → 400**（v1.3 放宽：纯附件可发）；该会话有活跃流 → 409。
 
 通过后返回 `text/event-stream`，事件序列见 §4.3。
 

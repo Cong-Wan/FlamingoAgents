@@ -1,9 +1,11 @@
 <!--
 Author: wilbur
-Version: 1.1
+Version: 1.2
 Date: 2026-08-07
 Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局骨架：侧栏 + 主区 + 弹层 + 登录门）。
              v1.1 迭代一：新建弹窗加探建内联确认区；侧栏浅色化 + 收缩/悬浮展开按钮；设置页改 tab + 整页表单 + 固定保存栏；用量页加费用卡与 Chart.js 图表区。
+             v1.2 迭代二（方案 webAppIteration2Plan §4）：favicon 与 flamingo2 头像；聊天页改双栏（chat-center + 右侧文件树 filePanel）；
+             composer 加附件 chip 区、/@面板容器、两行状态栏；新增文件预览弹层；引入 highlight.js 与 4 个新 JS 模块。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -11,6 +13,8 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>FlamingoAgents</title>
+  <link rel="icon" type="image/png" href="/static/flamingo.png">
+  <link rel="stylesheet" href="/static/vendor/highlight-theme.min.css">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -46,21 +50,44 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
       <button id="sidebarExpandButton" class="sidebar-expand-btn hidden" title="展开侧栏">☰</button>
       <!-- 聊天页 -->
       <section id="chatPage" class="page page-chat">
-        <header class="topbar">
-          <span id="topbarTitle" class="topbar-title">FlamingoAgents</span>
-          <span id="topbarModel" class="topbar-model"></span>
-        </header>
-        <div id="errorBar" class="error-bar hidden"></div>
-        <div id="messageList" class="message-list"></div>
-        <div id="chatEmpty" class="chat-empty">
-          <div class="chat-empty-logo">🦩</div>
-          <p>从左侧选择会话，或点击「＋ 新建会话」开始</p>
+        <div class="chat-center">
+          <header class="topbar">
+            <span id="topbarTitle" class="topbar-title">FlamingoAgents</span>
+            <span id="topbarModel" class="topbar-model"></span>
+            <span class="topbar-spacer"></span>
+            <button id="filePanelToggle" class="file-panel-toggle hidden" title="文件浏览器">🗂</button>
+          </header>
+          <div id="errorBar" class="error-bar hidden"></div>
+          <div id="messageList" class="message-list"></div>
+          <div id="chatEmpty" class="chat-empty">
+            <img class="chat-empty-logo" src="/static/flamingo2.png" alt="FlamingoAgents">
+            <p>从左侧选择会话，或点击「＋ 新建会话」开始</p>
+          </div>
+          <footer class="composer">
+            <div id="attachmentChips" class="attachment-chips hidden"></div>
+            <div class="composer-row">
+              <div class="composer-input-wrap">
+                <textarea id="composerInput" class="composer-input" rows="1"
+                          placeholder="输入消息，Enter 发送，Shift+Enter 换行；/ 指令，@ 引用文件" disabled></textarea>
+                <div id="slashPanel" class="command-panel hidden"></div>
+                <div id="mentionPanel" class="command-panel hidden"></div>
+              </div>
+              <button id="sendButton" class="btn btn-primary send-button" disabled>发送</button>
+            </div>
+            <div id="composerStatus" class="composer-status hidden">
+              <div id="statusLocation" class="status-line"></div>
+              <div id="statusUsage" class="status-line"></div>
+            </div>
+          </footer>
         </div>
-        <footer class="composer">
-          <textarea id="composerInput" class="composer-input" rows="1"
-                    placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
-          <button id="sendButton" class="btn btn-primary send-button" disabled>发送</button>
-        </footer>
+        <!-- 右侧文件浏览器（迭代二 §4.7） -->
+        <aside id="filePanel" class="file-panel hidden">
+          <div class="file-panel-head">
+            <span class="file-panel-title">工作区文件</span>
+            <button id="filePanelRefresh" class="file-panel-btn" title="刷新">⟳</button>
+          </div>
+          <div id="fileTree" class="file-tree"></div>
+        </aside>
       </section>
 
       <!-- 模型配置页 -->
@@ -153,13 +180,30 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
     </div>
   </div>
 
+  <!-- 文件预览弹层（迭代二 §4.7） -->
+  <div id="filePreviewModal" class="modal-mask hidden">
+    <div class="modal file-preview-modal">
+      <div class="file-preview-head">
+        <h2 id="filePreviewTitle" class="modal-title file-preview-title"></h2>
+        <button id="filePreviewModeToggle" class="btn file-preview-mode hidden">源码</button>
+        <button id="filePreviewClose" class="btn">✕</button>
+      </div>
+      <div id="filePreviewBody" class="file-preview-body"></div>
+    </div>
+  </div>
+
   <script src="/static/vendor/marked.min.js"></script>
   <script src="/static/vendor/dompurify.min.js"></script>
+  <script src="/static/vendor/highlight.min.js"></script>
   <script src="/static/vendor/chart.umd.min.js"></script>
   <script src="/static/js/store.js"></script>
   <script src="/static/js/api.js"></script>
   <script src="/static/js/sse.js"></script>
   <script src="/static/js/sidebarView.js"></script>
+  <script src="/static/js/statusBar.js"></script>
+  <script src="/static/js/slashCommand.js"></script>
+  <script src="/static/js/fileMention.js"></script>
+  <script src="/static/js/fileExplorer.js"></script>
   <script src="/static/js/chatView.js"></script>
   <script src="/static/js/settingsView.js"></script>
   <script src="/static/js/usageView.js"></script>

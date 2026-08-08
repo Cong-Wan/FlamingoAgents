@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.9
+Version: 1.10
 Date: 2026-07-26
-Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default).
+Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden).
 '''
 
 from __future__ import annotations
@@ -60,14 +60,15 @@ class chatCompletionsAdapter:
     def openRequest(self, requestPayload: dict[str, Any]):
         requestUrl = self.config.baseUrl.rstrip('/') + '/chat/completions'
         requestBytes = json.dumps(requestPayload, ensure_ascii=False).encode('utf-8')
+        # 自定义头（如 User-Agent 伪装绕过中转 CF 拦截）在底，系统头始终覆盖，防误配破坏鉴权。
+        requestHeaders = dict(self.config.headers or {})
+        requestHeaders['Authorization'] = self.auth.authorizationHeader
+        requestHeaders['Content-Type'] = 'application/json'
         request = urllib.request.Request(
             requestUrl,
             data=requestBytes,
             method='POST',
-            headers={
-                'Authorization': self.auth.authorizationHeader,
-                'Content-Type': 'application/json',
-            },
+            headers=requestHeaders,
         )
         if self.debugConsole:
             self.debugConsole.debug(f"Source request:\n{requestBytes.decode('utf-8')}\n")

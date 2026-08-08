@@ -1,9 +1,10 @@
 '''
 Author: wilbur
-Version: 1.1
+Version: 1.2
 Date: 2026-08-05
 Description: webData/sessions.json 会话索引 CRUD：进程内锁 + 临时文件 rename 原子写；updatedAt/usage/标题的刷新时机对齐契约 §2.1。
             v1.1 随包改名调整：webDataDir 因目录加深一级改为 parents[2]。
+            v1.2 迭代二（方案 §3.3/§3.6）：updateUsage 增加可选 contextTokens 字段回写；新增 updateSessionModel（/model 指令）。
 '''
 
 from __future__ import annotations
@@ -114,8 +115,8 @@ def touchSession(sessionId: str) -> None:
         saveIndex(sessions)
 
 
-def updateUsage(sessionId: str, usage: dict) -> None:
-    # 泵线程结束时回写累计用量并刷新 updatedAt（契约 §2.1）。
+def updateUsage(sessionId: str, usage: dict, contextTokens: int | None = None) -> None:
+    # 泵线程结束时回写累计用量并刷新 updatedAt（契约 §2.1）；contextTokens 为最近一轮 prompt+completion（迭代二 §3.6）。
     with indexLock:
         sessions = loadIndex()
         session = sessions.get(sessionId)
@@ -126,8 +127,24 @@ def updateUsage(sessionId: str, usage: dict) -> None:
             'cachedTokens': int(usage.get('cachedTokens', 0) or 0),
             'completionTokens': int(usage.get('completionTokens', 0) or 0),
         }
+        if contextTokens is not None:
+            session['contextTokens'] = int(contextTokens)
         session['updatedAt'] = nowIso()
         saveIndex(sessions)
+
+
+def updateSessionModel(sessionId: str, providerId: str, modelId: str) -> dict | None:
+    # /model 指令（迭代二 §3.3）：改写索引的 providerId/modelId。
+    with indexLock:
+        sessions = loadIndex()
+        session = sessions.get(sessionId)
+        if session is None:
+            return None
+        session['providerId'] = providerId
+        session['modelId'] = modelId
+        session['updatedAt'] = nowIso()
+        saveIndex(sessions)
+        return session
 
 
 def deleteSession(sessionId: str) -> bool:

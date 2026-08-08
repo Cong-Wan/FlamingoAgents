@@ -1,14 +1,32 @@
 /*
 Author: wilbur
-Version: 1.1
-Date: 2026-08-07
+Version: 1.2
+Date: 2026-08-08
 Description: 模型配置编辑页：整页表单化（§11.3）——顶部 provider tab 条 + 全宽纵向字段 + 模型折叠卡片 +
              底部固定保存/重置栏。内存工作副本：open 时 GET 一次，tab 切换不重拉（脏数据 confirm 提示），
              重置 = 放弃修改重拉，保存 = 工作副本全量 PUT（契约 §2.4/§3.11/§3.12）。
              apiKey 遵循 __KEEP__ / $ 引用 / 空串删除规则。
+             v1.2：provider 级新增 headers 自定义请求头编辑（每行 Key: Value；空=删除该字段；可用于伪装 UA 绕过中转 CF 拦截）。
 */
 (function () {
   'use strict';
+
+  // headers 对象 ↔ 文本域（每行 Key: Value）互转
+  function headersToText(headers) {
+    if (!headers) return '';
+    return Object.keys(headers).map(function (key) { return key + ': ' + headers[key]; }).join('\n');
+  }
+
+  function textToHeaders(text) {
+    var headers = {};
+    (text || '').split('\n').forEach(function (line) {
+      var index = line.indexOf(':');
+      if (index <= 0) return;
+      var key = line.slice(0, index).trim();
+      if (key) headers[key] = line.slice(index + 1).trim();
+    });
+    return headers;
+  }
 
   var tabsEl = document.getElementById('providerTabs');
   var formEl = document.getElementById('providerForm');
@@ -162,6 +180,15 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
     apiKeyRow.appendChild(apiKeyInput);
     apiKeyRow.appendChild(eyeButton);
     formEl.appendChild(makeField('apiKey', apiKeyRow, '__KEEP__ 表示保留原值；留空表示删除该字段；$ 开头视为环境变量引用'));
+
+    // headers：自定义请求头（可选），随每次模型请求发送；Authorization/Content-Type 由系统设置不可覆盖
+    var headersInput = document.createElement('textarea');
+    headersInput.className = 'form-input headers-input';
+    headersInput.rows = 3;
+    headersInput.placeholder = 'User-Agent: curl/8.7.1';
+    headersInput.value = headersToText(provider.headers);
+    headersInput.addEventListener('input', function () { provider.headers = textToHeaders(headersInput.value); markDirty(); });
+    formEl.appendChild(makeField('headers（自定义请求头，可选）', headersInput, '每行一个 Key: Value；留空 = 不携带自定义头；适用于中转站按客户端指纹拦截的场景（如伪装 curl）'));
 
     // 删除此 provider（危险按钮，confirm）
     var dangerZone = document.createElement('div');

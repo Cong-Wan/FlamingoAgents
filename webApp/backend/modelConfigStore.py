@@ -1,9 +1,10 @@
 '''
 Author: wilbur
-Version: 1.1
+Version: 1.2
 Date: 2026-08-05
 Description: config/models.yaml 读写：GET 原始 yaml 宽松读取 + apiKey 脱敏（__KEEP__/$ 引用规则，契约 §2.4）；PUT 合并式更新（保留 stream 等 schema 外字段）+ .bak 备份 + 原子写。
             v1.1 随包改名调整：modelsYamlPath 因目录加深一级改为 parents[2]。
+            v1.2：headers 自定义请求头纳入 schema（provider/model 两级，dict[str,str]；PUT 传空对象=删除该字段）。
 '''
 
 from __future__ import annotations
@@ -43,6 +44,13 @@ def maskApiKey(rawValue) -> str:
     return keepPlaceholder
 
 
+def normalizeHeadersForRead(headers) -> dict:
+    # 宽松读取：仅保留 字符串→字符串 的键值对；无配置返回空对象（UI 以空文本域呈现）。
+    if not isinstance(headers, dict):
+        return {}
+    return {str(key): value for key, value in headers.items() if isinstance(value, str)}
+
+
 def normalizeModelForRead(model) -> dict:
     modelDict = model if isinstance(model, dict) else {}
     result = {
@@ -53,6 +61,7 @@ def normalizeModelForRead(model) -> dict:
         'maxTokens': modelDict.get('maxTokens') if isinstance(modelDict.get('maxTokens'), int) else 0,
         'reasoning': bool(modelDict.get('reasoning')),
         'cost': normalizeCostForRead(modelDict.get('cost')),
+        'headers': normalizeHeadersForRead(modelDict.get('headers')),
     }
     if isinstance(modelDict.get('thinking'), dict):
         result['thinking'] = modelDict['thinking']
@@ -82,6 +91,7 @@ def readModelsConfig() -> dict:
                 'baseUrl': providerDict.get('baseUrl') if isinstance(providerDict.get('baseUrl'), str) else '',
                 'api': providerDict.get('api') if isinstance(providerDict.get('api'), str) else '',
                 'apiKey': maskApiKey(providerDict.get('apiKey')),
+                'headers': normalizeHeadersForRead(providerDict.get('headers')),
                 'models': [normalizeModelForRead(item) for item in rawModels] if isinstance(rawModels, list) else [],
             }
     return {'providers': providers}
@@ -98,6 +108,14 @@ def isPositiveInt(value) -> bool:
 
 def isNonNegativeNumber(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+
+
+def validateHeaders(headers, location: str) -> None:
+    if headers is None:
+        return
+    require(isinstance(headers, dict), f'{location} 的 headers 必须是对象。')
+    for key, value in headers.items():
+        require(isinstance(key, str) and isinstance(value, str), f'{location} 的 headers 键值必须都是字符串。')
 
 
 def validateModel(model, location: str) -> None:
@@ -124,6 +142,7 @@ def validateModel(model, location: str) -> None:
     require(isinstance(cost, dict), f'{location} 的 cost 必须是对象。')
     for key in ('input', 'output', 'cacheRead', 'cacheWrite'):
         require(isNonNegativeNumber(cost.get(key)), f'{location} 的 cost.{key} 必须是不小于 0 的数值。')
+    validateHeaders(model.get('headers'), location)
 
 
 def validateProvider(providerId: str, provider) -> None:
@@ -136,6 +155,7 @@ def validateProvider(providerId: str, provider) -> None:
         require(isinstance(apiKey, str), f'provider {providerId} 的 apiKey 必须是字符串。')
     models = provider.get('models')
     require(isinstance(models, list) and bool(models), f'provider {providerId} 的 models 必须是非空数组。')
+    validateHeaders(provider.get('headers'), f'provider {providerId}')
     for index, model in enumerate(models):
         validateModel(model, f'provider {providerId} 的 models[{index}]')
 
@@ -171,6 +191,11 @@ def mergeModel(requestModel: dict, existingModels: list) -> dict:
     else:
         merged.pop('reasoningEffort', None)
     merged['cost'] = {key: requestModel['cost'][key] for key in ('input', 'output', 'cacheRead', 'cacheWrite')}
+    if 'headers' in requestModel:
+        if requestModel['headers']:
+            merged['headers'] = dict(requestModel['headers'])
+        else:
+            merged.pop('headers', None)  # 空对象 = 删除该字段
     return merged
 
 
@@ -187,6 +212,11 @@ def mergeProvider(requestProvider: dict, existingProvider) -> dict:
         existing.pop('apiKey', None)
     else:
         existing['apiKey'] = apiKey
+    if 'headers' in requestProvider:
+        if requestProvider['headers']:
+            existing['headers'] = dict(requestProvider['headers'])
+        else:
+            existing.pop('headers', None)  # 空对象 = 删除该字段
     existingModels = existing.get('models')
     existingModels = existingModels if isinstance(existingModels, list) else []
     existing['models'] = [mergeModel(model, existingModels) for model in requestProvider['models']]

@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.8
+Version: 1.9
 Date: 2026-07-24
-Description: Maintains per-session conversation state (messages, session lock, pending confirmation). Messages are appended as atomic log events (systemMessage/userMessage/assistantMessage/toolResult); in-memory list is kept for the next model request. v1.6 adds session resume: replay the JSONL log into messages, track dangling/queued tool-call state, and accumulate a session usage total. v1.7 accumulates live-turn usage in appendAssistantMessage so usageTotal covers post-resume turns too. v1.8 restores the logged systemMessage on resume (instead of re-injecting the current one) so the resumed prefix matches the original and provider prompt cache stays hit.
+Description: Maintains per-session conversation state (messages, session lock, pending confirmation). Messages are appended as atomic log events (systemMessage/userMessage/assistantMessage/toolResult); in-memory list is kept for the next model request. v1.6 adds session resume: replay the JSONL log into messages, track dangling/queued tool-call state, and accumulate a session usage total. v1.7 accumulates live-turn usage in appendAssistantMessage so usageTotal covers post-resume turns too. v1.8 restores the logged systemMessage on resume (instead of re-injecting the current one) so the resumed prefix matches the original and provider prompt cache stays hit. v1.9 tracks lastTurnTokens (last call's prompt+completion tokens, rebuilt on resume) for the web status bar's context-window estimate (docs/webAppIteration2Plan.md §3.6).
 '''
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ class conversation:
         self.pending: pendingConfirm | None = None
         self.debugConsole = debugConsole
         self.usageTotal: dict[str, int] = {'promptTokens': 0, 'cachedTokens': 0, 'completionTokens': 0}
+        self.lastTurnTokens: int = 0  # 最近一次调用的 prompt+completion（下一请求上下文规模估计）
         self.danglingToolCalls: list[toolCall] = []
         self.queuedUserMessage: str | None = None
         if resume:
@@ -99,10 +100,13 @@ class conversation:
     def _accumulateUsage(self, usage: dict | None) -> None:
         if not isinstance(usage, dict):
             return
-        self.usageTotal['promptTokens'] += int(usage.get('prompt_tokens', 0) or 0)
+        promptTokens = int(usage.get('prompt_tokens', 0) or 0)
+        completionTokens = int(usage.get('completion_tokens', 0) or 0)
+        self.usageTotal['promptTokens'] += promptTokens
         details = usage.get('prompt_tokens_details') or {}
         self.usageTotal['cachedTokens'] += int(details.get('cached_tokens', 0) or 0)
-        self.usageTotal['completionTokens'] += int(usage.get('completion_tokens', 0) or 0)
+        self.usageTotal['completionTokens'] += completionTokens
+        self.lastTurnTokens = promptTokens + completionTokens
 
     def _closeOrphanToolCalls(self, openCallIds: list[str]) -> None:
         # 崩溃兜底：assistant 发出 tool_calls 后没等到 toolResult 就来了下一条 user/assistant，补占位 toolResult 让序列合法。

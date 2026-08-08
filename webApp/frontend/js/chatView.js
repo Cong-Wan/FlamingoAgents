@@ -1,9 +1,12 @@
 /*
 Author: wilbur
-Version: 1.1
+Version: 1.2
 Date: 2026-08-07
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
+             v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
+             历史 user 消息的 attachment 块渲染为折叠 chip；流终态刷新状态栏；open/showEmpty 挂载 statusBar/fileExplorer/fileMention；
+             新增 discardPendingConfirm（/model 切换放弃待确认）。
 */
 (function () {
   'use strict';
@@ -219,12 +222,60 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
   /* ---------- 消息块 ---------- */
 
-  function appendUserMessage(content) {
+  // 附件块标记（与后端 fileBrowser.buildAttachmentMessage 约定一致；path 字符集校验防手输伪造，评审 M5）
+  var ATTACHMENT_RE = /<attachment path="([A-Za-z0-9_\-\.\/]+)">\n([\s\S]*?)\n<\/attachment>/g;
+
+  function appendTextSegment(bubble, text) {
+    if (!text) return;
+    var span = document.createElement('span');
+    span.textContent = text;
+    bubble.appendChild(span);
+  }
+
+  function buildAttachmentBlock(path, content) {
+    // 历史回放：附件块折叠为 chip（details），内容纯 textContent
+    var details = document.createElement('details');
+    details.className = 'attachment-block';
+    var summary = document.createElement('summary');
+    summary.textContent = '📄 ' + path;
+    summary.title = path;
+    var pre = document.createElement('pre');
+    pre.className = 'attachment-block-content';
+    pre.textContent = content;
+    details.appendChild(summary);
+    details.appendChild(pre);
+    return details;
+  }
+
+  // sentAttachments：本次发送的 chip 列表（仅显示路径）；为空则按历史消息解析 attachment 块
+  function appendUserMessage(content, sentAttachments) {
     var row = document.createElement('div');
     row.className = 'msg msg-user';
     var bubble = document.createElement('div');
     bubble.className = 'msg-bubble';
-    bubble.textContent = content;
+    if (sentAttachments && sentAttachments.length > 0) {
+      appendTextSegment(bubble, content);
+      var chipRow = document.createElement('div');
+      chipRow.className = 'attachment-chip-row';
+      sentAttachments.forEach(function (attachment) {
+        var chip = document.createElement('span');
+        chip.className = 'attachment-chip static';
+        chip.textContent = '📄 ' + attachment.path;
+        chip.title = attachment.path;
+        chipRow.appendChild(chip);
+      });
+      bubble.appendChild(chipRow);
+    } else {
+      ATTACHMENT_RE.lastIndex = 0;
+      var last = 0;
+      var match;
+      while ((match = ATTACHMENT_RE.exec(content)) !== null) {
+        appendTextSegment(bubble, content.slice(last, match.index).trim());
+        bubble.appendChild(buildAttachmentBlock(match[1], match[2]));
+        last = match.index + match[0].length;
+      }
+      appendTextSegment(bubble, last > 0 ? content.slice(last).trim() : content);
+    }
     row.appendChild(bubble);
     messageListEl.appendChild(row);
     scrollToBottom();
@@ -233,9 +284,10 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
   function buildAssistantShell() {
     var row = document.createElement('div');
     row.className = 'msg msg-assistant';
-    var avatar = document.createElement('div');
+    var avatar = document.createElement('img');
     avatar.className = 'msg-avatar';
-    avatar.textContent = '🦩';
+    avatar.src = '/static/flamingo2.png';
+    avatar.alt = '🦩';
     var body = document.createElement('div');
     body.className = 'msg-body';
     row.appendChild(avatar);
@@ -462,7 +514,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         scrollToBottom();
         break;
 
-      case 'completed': // 终态：刷新侧栏（title/usage/updatedAt 已变）
+      case 'completed': // 终态：刷新侧栏（title/usage/updatedAt 已变）；状态栏在 onStreamClosed 统一刷新（泵线程回写时序）
         stream.terminalSeen = true;
         goIdle();
         window.sidebarView.refresh().then(function () { window.chatView.syncTopbar(); });
@@ -550,6 +602,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
   function onStreamClosed() {
     var stream = window.appStore.stream;
+    // 连接关闭 = 泵线程已回写用量（先回写后哨兵，D7）；completed 已 goIdle 置空 stream 也需刷新，statusBar 内部防会话竞态
+    window.statusBar.refresh();
     if (!stream) return; // 已复位（离开页面/completed 已处理）
     if (stream.phase === 'waitingConfirm') return; // 等用户确认，保持该态
     if (stream.phase === 'stopping') {
@@ -582,11 +636,13 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var stream = window.appStore.stream;
     if (!sessionId || stream) return;
     var text = composerInput.value.trim();
-    if (!text) return;
+    var attachments = window.fileMention.getAttachments();
+    if (!text && attachments.length === 0) return; // D8：纯附件可发
 
     composerInput.value = '';
     autoResize();
-    appendUserMessage(text);
+    appendUserMessage(text, attachments);
+    window.fileMention.clearChips();
 
     window.appStore.stream = {
       phase: 'streaming',
@@ -599,11 +655,9 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     };
     updateComposer();
 
-    var handle = window.sse.streamPost(
-      '/api/chat/stream',
-      { sessionId: sessionId, message: text },
-      onStreamEvent
-    );
+    var body = { sessionId: sessionId, message: text };
+    if (attachments.length > 0) body.attachments = attachments;
+    var handle = window.sse.streamPost('/api/chat/stream', body, onStreamEvent);
     window.appStore.stream.abort = handle.abort;
     handle.done.then(onStreamClosed).catch(onStreamFailed);
   }
@@ -674,9 +728,12 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       errorBarEl.classList.add('hidden');
       window.chatView.syncTopbar();
       updateComposer();
+      window.fileMention.resetForSession();
+      window.fileExplorer.open();
       try {
         await reloadSession(sessionId);
         if (!window.appStore.stream) updateComposer();
+        window.statusBar.refresh();
       } catch (error) {
         if (error.status === 404) {
           showError('会话不存在。');
@@ -695,6 +752,9 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       messageListEl.classList.add('hidden');
       chatEmptyEl.classList.remove('hidden');
       errorBarEl.classList.add('hidden');
+      window.statusBar.hide();
+      window.fileExplorer.hide();
+      window.fileMention.resetForSession();
       updateComposer();
     },
 
@@ -704,6 +764,13 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       if (stream && stream.abort) stream.abort();
       window.appStore.stream = null;
       hideConfirmModal();
+    },
+
+    // /model 切换放弃待确认（§3.3）：关确认框、回空闲态
+    discardPendingConfirm: function () {
+      hideConfirmModal();
+      window.appStore.stream = null;
+      updateComposer();
     },
 
     syncTopbar: function () {

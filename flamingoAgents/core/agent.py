@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.10
+Version: 1.11
 Date: 2026-07-26
-Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. v1.10 adds the event-stream API (docs/streamOutputPlan.md §6, v2.3 定稿): runUserMessageStream/continueConfirmationStream generators yield 7 event types with real-time text/reasoning deltas; terminal events (completed/confirmationRequired/error) are yielded only after the session lock is released; legacy sync APIs runUserMessage/continueConfirmation are kept as thin wrappers that drain the stream, map terminal events back to runResult, and accept optional onDelta/onReasoning callbacks.
+Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. v1.10 adds the event-stream API (docs/streamOutputPlan.md §6, v2.3 定稿): runUserMessageStream/continueConfirmationStream generators yield 7 event types with real-time text/reasoning deltas; terminal events (completed/confirmationRequired/error) are yielded only after the session lock is released; legacy sync APIs runUserMessage/continueConfirmation are kept as thin wrappers that drain the stream, map terminal events back to runResult, and accept optional onDelta/onReasoning callbacks. v1.11 调整 maxModelSteps 默认值 8 -> 32。
 '''
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ class agent:
         logDir: Path,
         systemPrompt: str,
         debugConsole=None,
-        maxModelSteps: int = 8,
+        maxModelSteps: int = 32,
     ):
         self.modelAdapter = modelAdapter
         self.toolRegistry = toolRegistry(toolDefinitions, debugConsole=debugConsole)

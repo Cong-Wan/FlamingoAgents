@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.2
+Version: 1.3
 Date: 2026-07-26
-Description: Loads model configuration and resolves API keys without mutating process environment. v1.2 adds the modelConfig.stream switch (default True; set False to force non-streaming fallback, docs/streamOutputPlan.md §3) and parses it from YAML model/provider entries.
+Description: Loads model configuration and resolves API keys without mutating process environment. v1.2 adds the modelConfig.stream switch (default True; set False to force non-streaming fallback, docs/streamOutputPlan.md §3) and parses it from YAML model/provider entries. v1.3 adds optional custom HTTP headers (provider-level base merged with model-level override, keys/values must be strings) so relays behind Cloudflare-style bot filters can be reached with e.g. a curl User-Agent.
 '''
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ class modelConfig:
     thinking: dict[str, Any] | None = None
     reasoningEffort: str | None = None
     stream: bool = True
+    headers: dict[str, str] | None = None  # 自定义请求头（Authorization/Content-Type 由系统设置，不可覆盖）
 
 
 @dataclass
@@ -129,6 +130,8 @@ def loadModelConfigFromYaml(
     if streamValue is not None and not isinstance(streamValue, bool):
         raise RuntimeError(f'provider {providerId} 模型 {selectedModelId} 的 stream 必须是布尔值。')
 
+    headers = parseHeaders(providerConfig.get('headers'), selectedModel.get('headers'), providerId, selectedModelId)
+
     api = selectedModel.get('api') or providerConfig.get('api')
     if api != 'openai-completions':
         raise RuntimeError(f'当前仅支持 openai-completions，实际配置为：{api}')
@@ -153,9 +156,25 @@ def loadModelConfigFromYaml(
             thinking=thinking,
             reasoningEffort=reasoningEffort,
             stream=streamValue if streamValue is not None else True,
+            headers=headers,
         ),
         apiKey=apiKey,
     )
+
+
+def parseHeaders(providerHeaders, modelHeaders, providerId: str, modelId: str) -> dict[str, str] | None:
+    # 合并规则同 stream：provider 级为底、model 级覆盖同名字段；键值必须都是字符串。
+    merged: dict[str, str] = {}
+    for source, location in ((providerHeaders, f'provider {providerId}'), (modelHeaders, f'provider {providerId} 模型 {modelId}')):
+        if source is None:
+            continue
+        if not isinstance(source, dict):
+            raise RuntimeError(f'{location} 的 headers 必须是对象（键值均为字符串）。')
+        for key, value in source.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise RuntimeError(f'{location} 的 headers 键值必须都是字符串。')
+            merged[key] = value
+    return merged or None
 
 
 def selectModel(models: list[Any], modelId: str | None, providerId: str) -> dict[str, Any]:
