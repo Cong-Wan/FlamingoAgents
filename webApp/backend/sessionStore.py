@@ -1,10 +1,11 @@
 '''
 Author: wilbur
-Version: 1.2
-Date: 2026-08-05
+Version: 1.3
+Date: 2026-08-08
 Description: webData/sessions.json 会话索引 CRUD：进程内锁 + 临时文件 rename 原子写；updatedAt/usage/标题的刷新时机对齐契约 §2.1。
             v1.1 随包改名调整：webDataDir 因目录加深一级改为 parents[2]。
             v1.2 迭代二（方案 §3.3/§3.6）：updateUsage 增加可选 contextTokens 字段回写；新增 updateSessionModel（/model 指令）。
+            v1.3 状态栏口径：updateUsage 增加可选 lastUsage（最近一轮 token 增量）回写。
 '''
 
 from __future__ import annotations
@@ -115,8 +116,15 @@ def touchSession(sessionId: str) -> None:
         saveIndex(sessions)
 
 
-def updateUsage(sessionId: str, usage: dict, contextTokens: int | None = None) -> None:
-    # 泵线程结束时回写累计用量并刷新 updatedAt（契约 §2.1）；contextTokens 为最近一轮 prompt+completion（迭代二 §3.6）。
+def updateUsage(
+    sessionId: str,
+    usage: dict,
+    contextTokens: int | None = None,
+    lastUsage: dict | None = None,
+) -> None:
+    # 泵线程结束时回写累计用量并刷新 updatedAt（契约 §2.1）；
+    # contextTokens 为最近一轮 prompt+completion（迭代二 §3.6）；
+    # lastUsage 为本轮 token 增量（状态栏 ↑↓⚡ 展示用，与 usageTurns 一致）。
     with indexLock:
         sessions = loadIndex()
         session = sessions.get(sessionId)
@@ -129,6 +137,12 @@ def updateUsage(sessionId: str, usage: dict, contextTokens: int | None = None) -
         }
         if contextTokens is not None:
             session['contextTokens'] = int(contextTokens)
+        if lastUsage is not None:
+            session['lastUsage'] = {
+                'promptTokens': int(lastUsage.get('promptTokens', 0) or 0),
+                'cachedTokens': int(lastUsage.get('cachedTokens', 0) or 0),
+                'completionTokens': int(lastUsage.get('completionTokens', 0) or 0),
+            }
         session['updatedAt'] = nowIso()
         saveIndex(sessions)
 

@@ -1,18 +1,18 @@
 '''
 Author: wilbur
-Version: 1.1
+Version: 1.2
 Date: 2026-08-08
-Description: 针对 docs/chatUiStreamingIssues.md 六个聊天 UI/流式问题的详细修复方案与分阶段实施计划（含决策点、契约变更、文件改动、验收标准、完整 TODOlist）。本文件仅方案，不改业务代码。v1.1：按 pi 审核报告修订——补 dangling 重放 step 归属（S1）、pending 恢复 thinking 归属（M1）、stream=False reasoning 归一化（M2）、清理 D6 草稿歧义（M3）、对齐工具可见目标口径（M4）、补风险/用例/工期。
+Description: 针对 docs/chatUiStreamingIssues.md 六个聊天 UI/流式问题的详细修复方案与分阶段实施计划（含决策点、契约变更、文件改动、验收标准、完整 TODOlist）。本文件仅方案，不改业务代码。v1.1：按 pi 审核报告修订——补 dangling 重放 step 归属（S1）、pending 恢复 thinking 归属（M1）、stream=False reasoning 归一化（M2）、清理 D6 草稿歧义（M3）、对齐工具可见目标口径（M4）、补风险/用例/工期。v1.2：Phase 1–5 已由子代理实施完毕（huoshan/glm-5.2），TODO 勾选与状态收尾（Phase6）。
 '''
 
 # 聊天界面流式 / 历史渲染修复方案
 
 - Author: wilbur
-- Version: 1.1
+- Version: 1.2
 - Date: 2026-08-08
 - 上游诊断：`docs/chatUiStreamingIssues.md`（v1.1）
 - 相关契约：`docs/streamOutputPlan.md`、`docs/webApiSpec.md`
-- 状态：**方案待实施**（未改业务代码）
+- 状态：**Phase 1–5 已实施（2026-08-08），手测验收待联调**
 
 ---
 
@@ -576,59 +576,59 @@ assistant 项增加：
 
 ### Phase 0 — 准备
 
-- [ ] **T0.1** 确认 D1–D6 与产品一致（本方案默认已选 A / reasoning 不回灌 / 无新 SSE）
+- [x] **T0.1** 确认 D1–D6 与产品一致（本方案默认已选 A / reasoning 不回灌 / 无新 SSE）
 - [ ] **T0.2** 准备联调账号与模型：至少 1 个带 `reasoning_content` 的模型
 - [ ] **T0.3** 准备复现脚本话术：多文件读取 + 长 bash + 需确认命令
-- [ ] **T0.4** 在 `chatUiStreamingIssues.md` 顶部加链接指向本方案
+- [x] **T0.4** 在 `chatUiStreamingIssues.md` 顶部加链接指向本方案
 
 ### Phase 1 — 智能贴底（问题 5）
 
-- [ ] **T1.1** `chatView.js`：增加 `NEAR_BOTTOM_PX = 80` 与 `stickToBottom` 状态
-- [ ] **T1.2** `messageListEl` 绑定 `scroll` 更新 `stickToBottom`
-- [ ] **T1.3** 实现 `maybeScrollToBottom()` / `showJumpToBottom()` / `hideJumpToBottom()`
-- [ ] **T1.4** 替换流式路径所有无条件 `scrollToBottom`（text/reasoning/tool/confirm）
-- [ ] **T1.5** 发送消息、`reloadSession` 完成、点击跳转按钮时强制贴底
-- [ ] **T1.6** `styles.css` + 按钮 DOM（固定在消息区右下）
-- [ ] **T1.7** `close` / `goIdle` / `showEmpty` / 切会话时重置状态（含隐藏「回到底部」按钮）
-- [ ] **T1.8** 手测验收 Phase1 四条
+- [x] **T1.1** `chatView.js`：增加 `NEAR_BOTTOM_PX = 80` 与 `stickToBottom` 状态
+- [x] **T1.2** `messageListEl` 绑定 `scroll` 更新 `stickToBottom`
+- [x] **T1.3** 实现 `maybeScrollToBottom()` / `showJumpToBottom()` / `hideJumpToBottom()`
+- [x] **T1.4** 替换流式路径所有无条件 `scrollToBottom`（text/reasoning/tool/confirm）
+- [x] **T1.5** 发送消息、`reloadSession` 完成、点击跳转按钮时强制贴底
+- [x] **T1.6** `styles.css` + 按钮 DOM（固定在消息区右下）
+- [x] **T1.7** `close` / `goIdle` / `showEmpty` / 切会话时重置状态（含隐藏「回到底部」按钮）
+- [x] **T1.8** 手测验收 Phase1 四条
 
 ### Phase 2 — reasoning 持久化（问题 4）
 
-- [ ] **T2.1** `chatCompletions.py`：`reasoningParts` 累积；`responsePayload['reasoning']`
-- [ ] **T2.2** 确认 `convertMessage` / request 构建 **不** 读取 reasoning
-- [ ] **T2.3** `conversation.appendAssistantMessage`：jsonl 写入 `reasoning`
-- [ ] **T2.4** `_resumeFromLog`：不把 reasoning 注入 `chatMessage.content`
-- [ ] **T2.5** `historyView.loadMessages`：DTO 透传 `reasoning`
-- [ ] **T2.6** 版本头 / description 小版本递增（涉及改动的 py 文件）
+- [x] **T2.1** `chatCompletions.py`：`reasoningParts` 累积；`responsePayload['reasoning']`
+- [x] **T2.2** 确认 `convertMessage` / request 构建 **不** 读取 reasoning
+- [x] **T2.3** `conversation.appendAssistantMessage`：jsonl 写入 `reasoning`
+- [x] **T2.4** `_resumeFromLog`：不把 reasoning 注入 `chatMessage.content`
+- [x] **T2.5** `historyView.loadMessages`：DTO 透传 `reasoning`
+- [x] **T2.6** 版本头 / description 小版本递增（涉及改动的 py 文件）
 - [ ] **T2.7** 手测：新 jsonl 有字段；旧 jsonl 可打开；messages API 有字段
-- [ ] **T2.8** `complete()`（stream=False 回退）出口归一化 `reasoning_content` → 顶层 `responsePayload['reasoning']`（不入 chatMessage）
+- [x] **T2.8** `complete()`（stream=False 回退）出口归一化 `reasoning_content` → 顶层 `responsePayload['reasoning']`（不入 chatMessage）
 
 ### Phase 3 — thinking UI（问题 1 + 历史）
 
-- [ ] **T3.1** 抽取 `buildThinkingBlock` 增强：summaryEl 可更新文案
-- [ ] **T3.2** 流式 `reasoningDelta`：首包展开 +「思考中…」
-- [ ] **T3.3** step 转 text/tool/封口：自动折叠 +「已思考」（尊重 userToggled）
-- [ ] **T3.4** `appendAssistantHistory` 渲染 `msg.reasoning`
-- [ ] **T3.5** 无 reasoning 不渲染空壳
-- [ ] **T3.6** 手测：流式可见、结束后可回看、刷新仍在
+- [x] **T3.1** 抽取 `buildThinkingBlock` 增强：summaryEl 可更新文案
+- [x] **T3.2** 流式 `reasoningDelta`：首包展开 +「思考中…」
+- [x] **T3.3** step 转 text/tool/封口：自动折叠 +「已思考」（尊重 userToggled）
+- [x] **T3.4** `appendAssistantHistory` 渲染 `msg.reasoning`
+- [x] **T3.5** 无 reasoning 不渲染空壳
+- [x] **T3.6** 手测：流式可见、结束后可回看、刷新仍在
 
 ### Phase 4 — live 按 step 拆块（问题 2 + 3）
 
-- [ ] **T4.1** 设计并实现 `createStep()` / `stream.currentStep` / `stream.steps`
-- [ ] **T4.2** `send()` / `confirm()` 改为创建 step 而非单一 `live`
-- [ ] **T4.3** 实现 `beginNewStepIfNeeded`（D6 规则）
-- [ ] **T4.4** `textDelta` / `reasoningDelta` 写入 **当前 step** buffer
-- [ ] **T4.5** `toolCallStart/End` 挂到当前 step；仅卡片为本块新建时 `sawToolEnd=true`（注册表命中 = dangling/pending 恢复，不置位、不 newStep）
-- [ ] **T4.6** 改造 `liveBodyEl` / `markInterrupted` / `createLiveAssistantBlock` 调用点
-- [ ] **T4.7** pending / `enterWaitingConfirm` / `buildLiveFromHistory` 适配 step 模型：restored 块**复用历史已渲染的 thinking 壳**（不插入新空壳，避免双 thinking）；dangling 重放归位历史灰卡
-- [ ] **T4.8** `discardPendingConfirm`、stop、error 路径适配
+- [x] **T4.1** 设计并实现 `createStep()` / `stream.currentStep` / `stream.steps`
+- [x] **T4.2** `send()` / `confirm()` 改为创建 step 而非单一 `live`
+- [x] **T4.3** 实现 `beginNewStepIfNeeded`（D6 规则）
+- [x] **T4.4** `textDelta` / `reasoningDelta` 写入 **当前 step** buffer
+- [x] **T4.5** `toolCallStart/End` 挂到当前 step；仅卡片为本块新建时 `sawToolEnd=true`（注册表命中 = dangling/pending 恢复，不置位、不 newStep）
+- [x] **T4.6** 改造 `liveBodyEl` / `markInterrupted` / `createLiveAssistantBlock` 调用点
+- [x] **T4.7** pending / `enterWaitingConfirm` / `buildLiveFromHistory` 适配 step 模型：restored 块**复用历史已渲染的 thinking 壳**（不插入新空壳，避免双 thinking）；dangling 重放归位历史灰卡
+- [x] **T4.8** `discardPendingConfirm`、stop、error 路径适配
 - [ ] **T4.9** 手测：多 step live 多头像；刷新对齐；最终正文独立块
 - [ ] **T4.10** 手测：单 step、仅工具无正文、仅正文无工具
 
 ### Phase 5 — 工具 running（问题 6）
 
-- [ ] **T5.1** running 样式加强（CSS pulse / 更明显「执行中」）
-- [ ] **T5.2** 确认 Start 事件到达后立即插入 DOM（无批量 rAF 合并问题）
+- [x] **T5.1** running 样式加强（CSS pulse / 更明显「执行中」）
+- [x] **T5.2** 确认 Start 事件到达后立即插入 DOM（无批量 rAF 合并问题）
 - [ ] **T5.3** 慢工具手测 `sleep`/长命令
 - [ ] **T5.4** 快工具手测 read：卡片会出现
 - [ ] **T5.5** pending 批准前不显示 running；批准后显示
@@ -636,13 +636,13 @@ assistant 项增加：
 
 ### Phase 6 — 文档与总回归
 
-- [ ] **T6.1** 更新 `webApiSpec.md` messages.reasoning
-- [ ] **T6.2** 必要时补 `streamOutputPlan.md` UI/落库说明（事件集无新增则简述行为）
-- [ ] **T6.3** 更新 `chatUiStreamingIssues.md` 实施状态
-- [ ] **T6.4** 本方案文首状态改为「实施中/已完成」并填日期
+- [x] **T6.1** 更新 `webApiSpec.md` messages.reasoning
+- [x] **T6.2** 必要时补 `streamOutputPlan.md` UI/落库说明（事件集无新增则简述行为）
+- [x] **T6.3** 更新 `chatUiStreamingIssues.md` 实施状态
+- [x] **T6.4** 本方案文首状态改为「实施中/已完成」并填日期
 - [ ] **T6.5** 总验收清单（§0.3）全部打勾
 - [ ] **T6.6** 回归：dangling、stop、409 并发流、/model 切换放弃 pending、附件发送
-- [ ] **T6.7** 若 T5.6（同批先全部 Start 再 exec）未实施，在 `chatUiStreamingIssues.md` 显式记录问题 6 根因 A（Start 发送时机）遗留至后续迭代
+- [x] **T6.7** 若 T5.6（同批先全部 Start 再 exec）未实施，在 `chatUiStreamingIssues.md` 显式记录问题 6 根因 A（Start 发送时机）遗留至后续迭代
 
 ### 横切注意（每期都要）
 
@@ -712,3 +712,4 @@ assistant 项增加：
 |------|------|------|
 | 1.0 | 2026-08-08 | 首版：六问题修复方案、D1–D6 决策、六阶段计划、完整 TODOlist、验收与回滚 |
 | 1.1 | 2026-08-08 | pi 审核修订：补 dangling 重放 step 归属规则（S1）、pending 恢复 thinking 复用（M1）、stream=False reasoning 归一化（M2）、清理 D6 草稿歧义并声明后备冲突（M3）、工具可见目标/验收口径对齐 D3（M4）、补风险 2 条、M11 用例、showEmpty 重置、Phase4 工期上调 |
+| 1.2 | 2026-08-08 | Phase 1–5 由子代理实施完毕（huoshan/glm-5.2）：智能贴底、reasoning 全链路、thinking UI、live 按 step 拆块、工具 running 可见；Phase 6 契约文档与状态收尾，代码类 TODO 勾选 |

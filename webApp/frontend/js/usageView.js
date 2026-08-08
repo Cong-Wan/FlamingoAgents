@@ -1,10 +1,11 @@
 /*
 Author: wilbur
-Version: 1.1
-Date: 2026-08-07
+Version: 1.2
+Date: 2026-08-08
 Description: 用量统计页：顶部三卡片（总 prompt/cached/completion）+ 会话用量表格（契约 §2.3/§3.9）。
              v1.1 迭代一（§11.4/契约 §3.10）：Chart.js 组合图（每模型哈希固定色堆叠柱状 + 总量折线）、
              时/天/月粒度切换、任一模型 cost 非零时出「总费用」卡（month 全量求和口径）、双口径标注。
+             v1.2 tokensOf 去掉重复计入的 cachedTokens（其为 promptTokens 子集，OpenAI 原生语义），图表总量不再双计。
 */
 (function () {
   'use strict';
@@ -48,7 +49,8 @@ Description: 用量统计页：顶部三卡片（总 prompt/cached/completion）
   }
 
   function tokensOf(entry) {
-    return (entry.promptTokens || 0) + (entry.cachedTokens || 0) + (entry.completionTokens || 0);
+    // cachedTokens 是 promptTokens 的子集（OpenAI 原生语义），不再单加，避免双计（statusBarUsageFixPlan M3）
+    return (entry.promptTokens || 0) + (entry.completionTokens || 0);
   }
 
   /* ---------- 卡片区（三 token 卡原口径；费用卡 = month 全量求和） ---------- */

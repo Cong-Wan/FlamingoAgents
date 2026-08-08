@@ -1,9 +1,9 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-08-05
+Version: 1.2
+Date: 2026-08-08
 Description: 会话 jsonl 事件 → GET messages 的 UI 消息 DTO：过滤 systemMessage/modelError/timings，usage 按契约 §2.2-M1 嵌套字段归一化，tool.details 原样透传。
-            v1.1 随包改名调整 import（webApp.backend.*）。
+            v1.1 随包改名调整 import（webApp.backend.*）。v1.2（fixPlan Phase2）：assistant DTO 透传 event.reasoning（非空才带，供前端 thinking 历史渲染）。
 '''
 
 from __future__ import annotations
@@ -51,14 +51,18 @@ def loadMessages(sessionId: str) -> list[dict]:
                 for call in (event.get('toolCalls') or [])
                 if isinstance(call, dict)
             ]
-            messages.append({
+            assistantItem = {
                 'kind': 'assistant',
                 'content': event.get('content', ''),
                 'toolCalls': toolCalls,
                 'usage': normalizeUsage(event.get('usage')),
                 'model': event.get('model'),
                 'timestamp': timestamp,
-            })
+            }
+            reasoning = event.get('reasoning')
+            if reasoning:
+                assistantItem['reasoning'] = reasoning
+            messages.append(assistantItem)
         elif eventType == 'toolResult':
             messages.append({
                 'kind': 'tool',

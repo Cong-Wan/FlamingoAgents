@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.9
-Date: 2026-07-24
-Description: Maintains per-session conversation state (messages, session lock, pending confirmation). Messages are appended as atomic log events (systemMessage/userMessage/assistantMessage/toolResult); in-memory list is kept for the next model request. v1.6 adds session resume: replay the JSONL log into messages, track dangling/queued tool-call state, and accumulate a session usage total. v1.7 accumulates live-turn usage in appendAssistantMessage so usageTotal covers post-resume turns too. v1.8 restores the logged systemMessage on resume (instead of re-injecting the current one) so the resumed prefix matches the original and provider prompt cache stays hit. v1.9 tracks lastTurnTokens (last call's prompt+completion tokens, rebuilt on resume) for the web status bar's context-window estimate (docs/webAppIteration2Plan.md §3.6).
+Version: 1.10
+Date: 2026-08-08
+Description: Maintains per-session conversation state (messages, session lock, pending confirmation). Messages are appended as atomic log events (systemMessage/userMessage/assistantMessage/toolResult); in-memory list is kept for the next model request. v1.6 adds session resume: replay the JSONL log into messages, track dangling/queued tool-call state, and accumulate a session usage total. v1.7 accumulates live-turn usage in appendAssistantMessage so usageTotal covers post-resume turns too. v1.8 restores the logged systemMessage on resume (instead of re-injecting the current one) so the resumed prefix matches the original and provider prompt cache stays hit. v1.9 tracks lastTurnTokens (last call's prompt+completion tokens, rebuilt on resume) for the web status bar's context-window estimate (docs/webAppIteration2Plan.md §3.6). v1.10（fixPlan Phase2）：appendAssistantMessage 从 responsePayload 顶层读取 reasoning（非空才写 event['reasoning']）；_resumeFromLog 不把 reasoning 注入 chatMessage.content（D2 红线：reasoning 不得进入发往模型的 messages）。
 '''
 
 from __future__ import annotations
@@ -143,19 +143,23 @@ class conversation:
 
     def appendAssistantMessage(self, message: chatMessage, responsePayload: dict) -> None:
         toolCallCount = len(message.toolCalls)
+        reasoning = responsePayload.get('reasoning')
         if self.debugConsole:
             self.debugConsole.debug(
                 f'记录 assistantMessage contentChars={len(message.content)} '
                 f'toolCalls={toolCallCount} model={responsePayload.get("model")}'
             )
-        self.logger.logEvent({
+        event = {
             'type': 'assistantMessage',
             'model': responsePayload.get('model'),
             'content': message.content,
             'toolCalls': message.toolCalls,
             'usage': responsePayload.get('usage'),
             'timings': responsePayload.get('timings'),
-        })
+        }
+        if reasoning:
+            event['reasoning'] = reasoning
+        self.logger.logEvent(event)
         self._accumulateUsage(responsePayload.get('usage'))
         self.messages.append(message)
 

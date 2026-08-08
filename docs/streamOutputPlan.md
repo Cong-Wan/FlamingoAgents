@@ -1,8 +1,8 @@
 # 流式输出（Streaming）方案设计
 
 > Author: wilbur
-> Version: 2.3
-> Date: 2026-07-25
+> Version: 2.4
+> Date: 2026-08-08
 > 目的：为 `flamingoAgents` 的 LLM 请求增加流式输出能力。
 > v1.1：按 `docs/codeReview/260725_streamOutputPlan.md` 审核报告修订 12 处。
 > v1.2：落档用户已拍板决策——思维链也要流式（独立 `onReasoning` 回调）；保留 `modelConfig.stream = False` 回退开关。
@@ -10,6 +10,7 @@
 > v2.1：按 `docs/codeReview/260725_streamOutputPlanV2.md` 审核报告修订 11 处——**适配器层改为迭代器接口 `completeStream()`**（修复"回调无法同步透传为生成器事件"的架构级问题）、终态事件锁释放后再 yield、sessionId 预生成、前置 error 事件约定、toolCallStart 次序约定、事件改为独立 dataclass。
 > v2.2：按 `docs/codeReview/260725_streamOutputPlanV2_1.md` 二次审核修订——前置校验锁位置修正（pending 检查保留在锁内，复用 terminalEvent 机制）、流式 API 的 sessionId 改为必填、清理 §3 与选定结论矛盾的残留表述。
 > v2.3：三项待拍板问题全部按建议确认（1A 中断+新流 / 2A 旧 API 保留为包装 / 3A 7 种事件），方案定稿，进入实现。
+> v2.4：chatUiStreamingFixPlan 实施补记（§6.7）——事件集无新增（仍 7 事件）；UI 侧 live 按模型 step 拆块呈现；reasoning 落库 assistantMessage.reasoning（仅展示，不回灌模型）。
 
 ---
 
@@ -318,6 +319,12 @@ def runUserMessage(self, message, sessionId=None, onDelta=None, onReasoning=None
 3. ✅ **事件粒度：3A**——7 种事件，不加 stepFinish/耗时统计（§6.2）。
 
 方案定稿，按 §6.6 落地步骤实施。
+
+### 6.7 实施补记（2026-08-08，chatUiStreamingFixPlan）
+
+- SSE 事件集无新增，仍为 §6.2 的 7 种事件；step 边界由前端隐式推断（toolCallEnd 后再来 textDelta/reasoningDelta ⇒ 新 step），未引入 stepStart 事件。
+- `reasoning` 落库到 jsonl `assistantMessage.reasoning`（consumeSseStream 累积合成 responsePayload 顶层字段；非流式 `complete()` 出口从 `choices[0].message.reasoning_content` 归一化），仅用于 UI 展示与历史回放，**不进入发往模型的 messages**。
+- Web UI 侧 live 按模型 step 拆 assistant 块呈现（thinking → content → 本 step 的 tools），与历史 1:1 对齐。
 
 ---
 

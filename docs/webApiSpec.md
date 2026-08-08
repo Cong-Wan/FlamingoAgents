@@ -1,7 +1,7 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.3
+> Version: 1.6
 > Date: 2026-08-08
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 7 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
@@ -9,6 +9,10 @@
 > v1.2：迭代一（webAppPlan §11）——新增 probeWorkDir 端点（§3.4）与 usage/series 端点（§3.10）；POST /api/sessions 的 workDir 改必填 + 新增 allowCreate；原 §3.4–3.8、§3.9–3.11 顺延为 §3.5–3.9、§3.11–3.13。
 > v1.2.1：按 pi 审核修订——§3.4 probe 响应加 `creatable`/`defaultWorkDir` 字段 + 补「存在但不是目录」情形；§3.10 时区写死服务器本地、byModel key 改 `providerId/modelId`、补双口径声明与 month 空范围语义。
 > v1.3：迭代二（docs/webAppIteration2Plan.md）——新增 status（§3.14）/ PATCH model（§3.15）/ files（§3.16）/ fileContent（§3.17）端点；chat/stream 请求体新增 `attachments` 且 message 校验放宽（§4.1）；session 对象新增 `contextTokens`（§2.1）；user message content 可能含附件块标记（§2.2）。
+> v1.4：chatUiStreamingFixPlan Phase2 实施——§2.2 assistant message 新增 `reasoning` 可选字段（思维链全文，仅展示用、不回灌模型）。
+> v1.5：状态栏口径——§3.14 status 新增 `lastUsage`（最近一轮 token 增量）；`contextRemainingPercent` 改为 `contextUsedPercent`（使用率）；`usage`/`cost` 仍为会话累计。
+> v1.5.1：`lastUsage` 读路径——优先 sessions 索引；缺省回退 `usageTurns` 按 sessionId 最近一条（重启/升级前会话不显示 0）。
+> v1.6：状态栏修复（statusBarUsageFixPlan）——§3.10 费用公式修正为 prompt 减 cached 后不重复计费；§3.14 反转 v1.5 读取指引（状态栏 ↑↓⚡ 自 statusBar v1.3 起改读 `usage` 会话累计 + 前端减法归一化，`lastUsage` 保留但状态栏不再使用）。
 
 ---
 
@@ -87,12 +91,15 @@
 {
   "kind": "assistant",
   "content": "## 总结\n...",
+  "reasoning": "可选，思维链全文（v1.4 新增；仅展示用，不回灌模型；无 think 的模型省略或为空）",
   "toolCalls": [ { "id": "call_e7b93b...", "toolName": "read", "arguments": { "path": "/xx" } } ],
   "usage": { "promptTokens": 3948, "cachedTokens": 1024, "completionTokens": 558 },
   "model": "deepseek-v4-flash",
   "timestamp": "..."
 }
 ```
+
+- **`reasoning`（v1.4 新增，可选）**：该 step 模型输出的思维链全文（来源 jsonl `assistantMessage.reasoning`，仅非空时带）；旧 jsonl 无此字段时前端不渲染 thinking 块；旧客户端忽略未知字段 → 兼容。
 
 ```json
 {
@@ -304,7 +311,7 @@
 
 - 数据源：`webData/usage.db`（SQLite `usageTurns` 表，泵线程终态写入增量 + 空表时从 jsonl 回填一次，webAppPlan §11.4）；
 - 粒度与默认范围：`hour` = 近 72 小时（label `2026-08-07 13`）、`day` = 近 90 天（label `2026-08-07`）、`month` = 最早记录所在月 → 当前月，无记录返回空 `buckets`（label `2026-08`）；**空桶补齐**保证时间轴连续；**桶切分按服务器本地时区**（jsonl 时间戳为 UTC，聚合时先转本地时区再切桶，审核高 3）；
-- `cost` 查询时按 `config/models.yaml` 当前 cost 计算：`promptTokens×input/1M + completionTokens×output/1M + cachedTokens×cacheRead/1M`（美元；cacheWrite 无分开计数，恒不计）；**byModel/models 的 key 为 `providerId/modelId` 二元组**（不同 provider 下同 id 模型不撞桶、价格各自查，审核高 4）；yaml 中已删除的模型 cost 按 0 计；全部模型 cost 为 0 时所有 cost 字段恒 0，前端据此隐藏费用展示；
+- `cost` 查询时按 `config/models.yaml` 当前 cost 计算：`(promptTokens−cachedTokens)×input/1M + cachedTokens×cacheRead/1M + completionTokens×output/1M`（美元；promptTokens 含 cachedTokens，OpenAI 原生语义，cached 只按 cacheRead 折扣价计一次、不得重复计费；cacheWrite 无分开计数，恒不计）；**byModel/models 的 key 为 `providerId/modelId` 二元组**（不同 provider 下同 id 模型不撞桶、价格各自查，审核高 4）；yaml 中已删除的模型 cost 按 0 计；全部模型 cost 为 0 时所有 cost 字段恒 0，前端据此隐藏费用展示；
 - `models` 为出现过的全部 `providerId/modelId` 列表（前端配色/图例用）；
 - **口径声明（审核中 1）**：本接口基于 usageTurns（账单性质，删会话不删账）；§3.9 汇总卡基于 sessions 索引（删会话即扣减）——同页两个总数可能不一致，属预期行为，UI 需在图表区标注「含已删除会话的历史用量」。
 
@@ -327,7 +334,7 @@
 
 - 200：`{ "ok": true, "version": "0.1.0" }`（需认证）。
 
-### 3.14 GET /api/sessions/{sessionId}/status —— 会话状态栏聚合（v1.3 新增）
+### 3.14 GET /api/sessions/{sessionId}/status —— 会话状态栏聚合（v1.3 新增，v1.5 口径修订）
 
 - 200：
 
@@ -338,18 +345,25 @@
   "providerId": "volcano",
   "modelId": "deepseek-v4-flash",
   "usage": { "promptTokens": 1571, "cachedTokens": 0, "completionTokens": 236 },
+  "lastUsage": { "promptTokens": 420, "cachedTokens": 128, "completionTokens": 86 },
   "cost": 0.000286,
   "contextWindow": 1048576,
   "contextTokens": 1793,
-  "contextRemainingPercent": 99.8
+  "contextUsedPercent": 0.2
 }
 ```
 
 - `gitBranch`：`git -C <workDir> rev-parse --abbrev-ref HEAD`（参数数组无 shell、timeout=2s）每次现查不缓存；非 git 仓库 / workDir 已删 / 超时 → `null`，不报错；
-- `usage` / `contextTokens`：**单一数据源为 sessions 索引**（泵线程先回写索引后放流结束哨兵，前端在 SSE 连接关闭后刷新必然拿到新值）；
-- `cost`：usageTurns 按 sessionId 聚合、逐 turn 按其记录的 `providerId/modelId` 套 models.yaml 当前价求和（公式同 §3.10）；泵流进行中落后一轮属预期；
+- `usage` / `contextTokens` / `lastUsage`：**单一数据源为 sessions 索引**（泵线程先回写索引后放流结束哨兵，前端在 SSE 连接关闭后刷新必然拿到新值）；
+  - `usage`：**会话累计** token（OpenAI 原生语义，`promptTokens` 含 `cachedTokens` 子集）；状态栏 `↑↓⚡` 自 statusBar v1.3 起读此字段并前端减法归一化（`↑=max(0, promptTokens−cachedTokens)`、`↓=completionTokens`、`⚡=cachedTokens`，三者互不重叠、↑+⚡=总输入，对齐 pi footer）；
+  - `lastUsage`：**最近一轮（最近一次泵流）token 增量**，与写入 `usageTurns` 的 delta 同口径；字段保留，状态栏自 statusBar v1.3 起不再使用（v1.5 的「↑↓⚡ 应读此字段」指引已反转）。
+    - 读路径：优先 sessions 索引的 `lastUsage`；**索引缺该字段时回退** `usageTurns` 中该 sessionId `ORDER BY id DESC LIMIT 1`（保证进程重启 / 升级前会话仍能显示最近增量，而非全 0）；
+    - 会话从未产生过任何 usageTurns 时为全 0；
+  - `contextTokens`：最近一次模型调用的 `promptTokens + completionTokens`（窗口占用估计，迭代二 §3.6）；
+- `cost`：usageTurns 按 sessionId 聚合、逐 turn 按其记录的 `providerId/modelId` 套 models.yaml 当前价求和（公式同 §3.10）——**会话累计费用**；泵流进行中落后一轮属预期；
 - `contextWindow`：当前会话模型在 models.yaml 的 `contextWindow`；**yaml 缺失/损坏/模型无该字段 → `null` 且 cost 按 0 计，不影响其余字段**；
-- `contextRemainingPercent`：`clamp((1 − contextTokens/contextWindow) × 100, 0, 100)` 保留 1 位小数；`contextWindow` 为 `null` 时该字段为 `null`；
+- `contextUsedPercent`（v1.5）：**使用率** `clamp((contextTokens/contextWindow) × 100, 0, 100)` 保留 1 位小数；`contextWindow` 为 `null` 时该字段为 `null`。
+  - **破坏性变更**：原 `contextRemainingPercent`（剩余率 `(1 − contextTokens/contextWindow)×100`）已移除，前端须改读 `contextUsedPercent`；
 - 404：会话不存在。
 
 ### 3.15 PATCH /api/sessions/{sessionId}/model —— 切换当前会话模型（v1.3 新增，/model 指令）

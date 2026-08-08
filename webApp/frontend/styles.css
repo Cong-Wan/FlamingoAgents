@@ -1,12 +1,15 @@
 /*
 Author: wilbur
-Version: 1.3
+Version: 1.5
 Date: 2026-08-08
 Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅色侧栏 + 浅色主区）。
              v1.1 迭代一：侧栏浅色系并清理硬编码深色；侧栏收缩/悬浮展开按钮；设置页整页表单（tab 条/全宽字段/模型折叠卡片/固定保存栏）；用量页费用卡与图表区。
              v1.2 迭代二（方案 §4）：聊天页双栏（chat-center + 右侧 filePanel 文件树）；composer 改纵向（chip 区 + 输入行 + 两行状态栏）；
              /@指令面板、附件 chip/折叠块、文件预览弹层（高亮代码 + 行号列 + md 渲染）、toast、flamingo 头像。
              v1.3 文件预览弹层加宽加高，便于阅读代码；修正被通用 .modal{width:440px} 覆盖的优先级问题。
+             v1.4（fixPlan Phase1）：智能贴底--.chat-center 设 position:relative；新增「回到底部」悬浮按钮样式（固定消息区右下角）。
+             v1.5（fixPlan Phase5）：工具 running 态呼吸动画--.status-running 状态丸 pulse + .tool-card-running 卡边框呼吸，让「执行中」更醒目。
+             v1.6 取消文件预览字符截断限制，移除 .preview-truncated 样式。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -148,7 +151,7 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
 
 /* 迭代二：聊天页双栏布局 */
 .page-chat { flex-direction: row; }
-.chat-center { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.chat-center { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
 
 /* 右侧文件浏览器 */
 .file-panel {
@@ -185,6 +188,18 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
 
 /* ========== 消息流 ========== */
 .message-list { flex: 1; overflow-y: auto; padding: 20px 24px; }
+
+/* 智能贴底：回到底部按钮（fixPlan Phase1） */
+.jump-to-bottom {
+  position: absolute; right: 24px; z-index: 30;
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #fff; color: var(--text);
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: 6px 14px; font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0,0,0,.12);
+  transition: opacity .15s, transform .15s;
+}
+.jump-to-bottom:hover { background: var(--gray-block); }
 .chat-empty {
   flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
   color: var(--text-dim); font-size: 14px; gap: 12px;
@@ -255,7 +270,16 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .tool-status { font-size: 12px; border-radius: 999px; padding: 1px 8px; flex-shrink: 0; }
-.status-running { color: var(--accent); background: #eaf0fe; }
+.status-running { color: var(--accent); background: #eaf0fe; animation: tool-status-pulse 1.4s ease-in-out infinite; }
+@keyframes tool-status-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(59, 110, 246, .35); }
+  50% { box-shadow: 0 0 0 4px rgba(59, 110, 246, 0); }
+}
+.tool-card.tool-card-running { border-color: var(--accent); animation: tool-card-breathe 1.8s ease-in-out infinite; }
+@keyframes tool-card-breathe {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(59, 110, 246, 0); }
+  50% { box-shadow: 0 0 0 1px rgba(59, 110, 246, .25); }
+}
 .status-done { color: var(--ok); background: #e8f7ef; }
 .status-error { color: var(--danger); background: #fff2f2; }
 .status-rejected { color: var(--danger); background: #fff2f2; }
@@ -376,7 +400,6 @@ img.chat-empty-logo { width: 72px; height: 72px; border-radius: 50%; object-fit:
 .modal.file-preview-modal {
   width: min(1280px, 96vw);
   max-width: 96vw;
-  height: min(900px, 92vh);
   max-height: 92vh;
   display: flex;
   flex-direction: column;
@@ -399,10 +422,6 @@ img.chat-empty-logo { width: 72px; height: 72px; border-radius: 50%; object-fit:
 .preview-code {
   flex: 1; margin: 0; padding: 10px 12px; overflow-x: auto;
   font-family: "SF Mono", Menlo, Consolas, monospace; line-height: 1.55;
-}
-.preview-truncated {
-  padding: 6px 12px; background: #fff8e6; color: #8a6d1a; font-size: 12px;
-  border-bottom: 1px solid #f3e2ac;
 }
 .preview-markdown { padding: 14px 18px; }
 .modal-title { font-size: 17px; margin-bottom: 16px; }

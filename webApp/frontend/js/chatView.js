@@ -1,12 +1,20 @@
 /*
 Author: wilbur
-Version: 1.2
-Date: 2026-08-07
+Version: 1.5
+Date: 2026-08-08
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
              历史 user 消息的 attachment 块渲染为折叠 chip；流终态刷新状态栏；open/showEmpty 挂载 statusBar/fileExplorer/fileMention；
              新增 discardPendingConfirm（/model 切换放弃待确认）。
+             v1.3（fixPlan Phase1）：智能贴底--stickToBottom 状态 + scroll 监听；流式增量路径改 maybeScrollToBottom（不再抢视口）；
+             离底时显示「↓ 回到底部」按钮；发送/重载/切会话/终态重置贴底。
+             v1.4（fixPlan Phase3）：流式 thinking 交互--首包展开「思考中…」，转 text/tool/封口自动折叠「已思考」（尊重 userToggledThinking）；
+             appendAssistantHistory 渲染 msg.reasoning（content 之前，默认折叠）；无 reasoning 不渲染空壳。
+             v1.5（fixPlan Phase4+Phase5）：live 按模型 step 拆块（D1/D6 隐式边界推断）；step 持有独立 live/textBuf/reasoningBuf/sawToolEnd；
+             toolCallStart/End 仅本块新建卡片置 sawToolEnd（ownedByLiveBlock 标记，dangling 重放/pending 恢复命中注册表不置位、不 newStep，审核 S1）；
+             pending 恢复复用历史 thinking 壳避免双壳（审核 M1），restored step 初始 sawToolEnd=true 使 confirm 后续模型输出落新块；
+             工具 running 态加呼吸/pulse 动画（Phase5 T5.1）。
 */
 (function () {
   'use strict';
@@ -54,6 +62,53 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     messageListEl.scrollTop = messageListEl.scrollHeight;
   }
 
+  /* ---------- 智能贴底（fixPlan Phase1） ---------- */
+  var NEAR_BOTTOM_PX = 80;
+  var stickToBottom = true;
+  var jumpToBottomBtn = null;
+  var jumpToBottomVisible = false;
+
+  messageListEl.addEventListener('scroll', function () {
+    stickToBottom = (messageListEl.scrollHeight - messageListEl.scrollTop - messageListEl.clientHeight) <= NEAR_BOTTOM_PX;
+    if (stickToBottom) hideJumpToBottom();
+  });
+
+  function maybeScrollToBottom() {
+    if (stickToBottom) scrollToBottom();
+    else showJumpToBottom();
+  }
+
+  function ensureJumpBtn() {
+    if (jumpToBottomBtn) return;
+    var btn = document.createElement('button');
+    btn.className = 'jump-to-bottom hidden';
+    btn.type = 'button';
+    btn.textContent = '↓ 回到底部';
+    btn.addEventListener('click', function () {
+      stickToBottom = true;
+      scrollToBottom();
+      hideJumpToBottom();
+    });
+    document.querySelector('.chat-center').appendChild(btn);
+    jumpToBottomBtn = btn;
+  }
+
+  function showJumpToBottom() {
+    ensureJumpBtn();
+    if (jumpToBottomVisible) return;
+    var composer = document.querySelector('.composer');
+    var offset = (composer ? composer.offsetHeight : 0) + 12;
+    jumpToBottomBtn.style.bottom = offset + 'px';
+    jumpToBottomBtn.classList.remove('hidden');
+    jumpToBottomVisible = true;
+  }
+
+  function hideJumpToBottom() {
+    if (!jumpToBottomBtn) return;
+    jumpToBottomBtn.classList.add('hidden');
+    jumpToBottomVisible = false;
+  }
+
   function showError(message) {
     errorBarEl.innerHTML = '';
     var span = document.createElement('span');
@@ -75,6 +130,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     card.statusEl.textContent = meta.label;
     card.statusEl.className = 'tool-status ' + meta.cls;
     card.el.classList.toggle('dangling', status === 'dangling');
+    card.el.classList.toggle('tool-card-running', status === 'running'); // Phase5：running 态呼吸动画
   }
 
   function setCollapsibleText(preEl, text, containerEl) {
@@ -98,7 +154,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
   }
 
   function buildToolCard(toolCall, status, preview) {
-    var card = { status: status, toolName: toolCall.toolName, args: toolCall.arguments };
+    var card = { status: status, toolName: toolCall.toolName, args: toolCall.arguments, ownedByLiveBlock: false };
 
     var el = document.createElement('div');
     el.className = 'tool-card';
@@ -185,12 +241,13 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     if (existing) {
       setCardStatus(existing, 'running');
       if (preview) existing.previewEl.textContent = preview;
-      return existing;
+      return existing; // 注册表命中（dangling 重放/pending 恢复）：不参与本块 step 归属
     }
     var card = buildToolCard(toolCall, 'running', preview);
+    card.ownedByLiveBlock = true; // 本块新建：参与 step 归属判定（fixPlan Phase4 T4.5/审核 S1）
     toolCards[toolCall.id] = card;
     liveBodyEl().appendChild(card.el);
-    scrollToBottom();
+    maybeScrollToBottom();
     return card;
   }
 
@@ -203,13 +260,15 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         { id: toolResult.toolCallId, toolName: toolResult.toolName, arguments: {} },
         'running', ''
       );
+      card.ownedByLiveBlock = true; // 孤儿 End 在本块新建，参与 step 归属
       toolCards[toolResult.toolCallId] = card;
       liveBodyEl().appendChild(card.el);
     }
     setCardStatus(card, statusFromResult(toolResult));
     card.resultSection.classList.remove('hidden');
     setCollapsibleText(card.resultPre, toolResult.content || '', card.resultSection);
-    scrollToBottom();
+    maybeScrollToBottom();
+    return card;
   }
 
   // 历史渲染规则（契约 §2.2）：details.reason == 'userRejectedApproval' → 被拒绝；其余 isError → 失败
@@ -304,7 +363,23 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     content.className = 'thinking-content';
     details.appendChild(summary);
     details.appendChild(content);
-    return { el: details, contentEl: content };
+    return { el: details, summaryEl: summary, contentEl: content };
+  }
+
+  // 设置 thinking 块的 summary 文案与 open 状态；open 仅在用户未手动 toggle 时生效（fixPlan Phase3 D4）
+  function setThinkingState(live, summaryText, open) {
+    if (!live || !live.thinkingSummaryEl) return;
+    live.thinkingSummaryEl.textContent = summaryText;
+    if (live.userToggledThinking) return; // 用户手动 toggle 过，不再自动改 open
+    live.thinkingOpen = open;
+    if (open) live.thinkingEl.setAttribute('open', '');
+    else live.thinkingEl.removeAttribute('open');
+  }
+
+  // 本 step 转 text/tool/封口时折叠 thinking（D4）；已折叠或无 reasoning 则跳过
+  function collapseThinkingIfOpen(live) {
+    if (!live || !live.reasoningSeen || !live.thinkingOpen) return;
+    setThinkingState(live, '已思考', false);
   }
 
   // 新建一个流式 assistant 块（思维链容器 + 正文容器），作为增量渲染目标
@@ -317,34 +392,71 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     shell.body.appendChild(thinking.el);
     shell.body.appendChild(contentEl);
     messageListEl.appendChild(shell.row);
-    scrollToBottom();
-    return {
+    maybeScrollToBottom();
+    var live = {
       bodyEl: shell.body,
       rowEl: shell.row,
       thinkingEl: thinking.el,
+      thinkingSummaryEl: thinking.summaryEl,
       thinkingContentEl: thinking.contentEl,
+      thinkingOpen: false,
+      userToggledThinking: false,
+      reasoningSeen: false,
       contentEl: contentEl,
       interrupted: false
     };
+    thinking.summaryEl.addEventListener('click', function () { live.userToggledThinking = true; });
+    return live;
   }
 
-  // 当前流式渲染挂载点；无 live 块时（兜底）新建
+  // 创建一个模型 step：内含 live 块 + 本 step 自有 buffer 与工具阶段标记（fixPlan Phase4 D1/D6）
+  function createStep() {
+    return {
+      live: createLiveAssistantBlock(),
+      textBuf: '',
+      reasoningBuf: '',
+      sawToolEnd: false
+    };
+  }
+
+  // D6 隐式 step 边界：当前 step 已走过工具阶段（sawToolEnd=true）后又有模型输出（textDelta/reasoningDelta）
+  // -> 封口当前块、新建下一块。dangling 重放/pending 恢复命中注册表不置 sawToolEnd，故不触发 newStep。
+  function beginNewStepIfNeeded(eventKind) {
+    var stream = window.appStore.stream;
+    if (!stream) return;
+    var step = stream.currentStep;
+    if (!step) {
+      stream.currentStep = createStep();
+      stream.steps = [stream.currentStep];
+      return;
+    }
+    if (step.sawToolEnd && (eventKind === 'textDelta' || eventKind === 'reasoningDelta')) {
+      stream.currentStep = createStep();
+      stream.steps.push(stream.currentStep);
+    }
+  }
+
+  // 当前流式渲染挂载点；无 currentStep 时（兜底）新建
   function liveBodyEl() {
     var stream = window.appStore.stream;
-    if (stream && stream.live) return stream.live.bodyEl;
-    var live = createLiveAssistantBlock();
-    if (stream) stream.live = live;
-    return live.bodyEl;
+    if (stream && stream.currentStep && stream.currentStep.live) return stream.currentStep.live.bodyEl;
+    var step = createStep();
+    if (stream) {
+      stream.currentStep = step;
+      stream.steps = [step];
+    }
+    return step.live.bodyEl;
   }
 
   function markInterrupted() {
     var stream = window.appStore.stream;
-    if (!stream || !stream.live || stream.live.interrupted) return;
-    stream.live.interrupted = true;
+    if (!stream || !stream.currentStep || !stream.currentStep.live || stream.currentStep.live.interrupted) return;
+    var live = stream.currentStep.live;
+    live.interrupted = true;
     var badge = document.createElement('span');
     badge.className = 'msg-interrupted';
     badge.textContent = '已中断';
-    stream.live.bodyEl.appendChild(badge);
+    live.bodyEl.appendChild(badge);
   }
 
   /* ---------- 历史回放（契约 §2.2） ---------- */
@@ -375,6 +487,12 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var shell = buildAssistantShell();
     var contentEl = document.createElement('div');
     contentEl.className = 'markdown-content';
+    var thinking = null;
+    if (msg.reasoning) {
+      thinking = buildThinkingBlock();
+      thinking.contentEl.textContent = msg.reasoning;
+      shell.body.appendChild(thinking.el);
+    }
     shell.body.appendChild(contentEl);
     renderMarkdown(contentEl, msg.content || '');
 
@@ -397,7 +515,15 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     });
 
     messageListEl.appendChild(shell.row);
-    return { bodyEl: shell.body, contentEl: contentEl, content: msg.content || '' };
+    // 返回 thinking 壳引用（供 buildLiveFromHistory 复用，避免双壳--审核 M1）；无 reasoning 时为 null
+    return {
+      bodyEl: shell.body,
+      contentEl: contentEl,
+      content: msg.content || '',
+      thinkingEl: thinking ? thinking.el : null,
+      thinkingSummaryEl: thinking ? thinking.summaryEl : null,
+      thinkingContentEl: thinking ? thinking.contentEl : null
+    };
   }
 
   /* ---------- 确认框 ---------- */
@@ -472,36 +598,48 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
     switch (event) {
       case 'textDelta':
-        stream.textBuf += data.text || '';
-        if (stream.live) renderMarkdown(stream.live.contentEl, stream.textBuf);
-        scrollToBottom();
+        beginNewStepIfNeeded('textDelta');
+        stream.currentStep.textBuf += data.text || '';
+        collapseThinkingIfOpen(stream.currentStep.live);
+        renderMarkdown(stream.currentStep.live.contentEl, stream.currentStep.textBuf);
+        maybeScrollToBottom();
         break;
 
       case 'reasoningDelta':
-        stream.reasoningBuf += data.text || '';
-        if (stream.live) {
-          stream.live.thinkingEl.classList.remove('hidden');
-          stream.live.thinkingContentEl.textContent = stream.reasoningBuf;
-        }
-        scrollToBottom();
+        beginNewStepIfNeeded('reasoningDelta');
+        stream.currentStep.reasoningBuf += data.text || '';
+        stream.currentStep.live.thinkingEl.classList.remove('hidden');
+        stream.currentStep.live.reasoningSeen = true;
+        setThinkingState(stream.currentStep.live, '思考中…', true);
+        stream.currentStep.live.thinkingContentEl.textContent = stream.currentStep.reasoningBuf;
+        maybeScrollToBottom();
         break;
 
       case 'toolCallStart':
-        if (data.toolCall) upsertToolCardOnStart(data.toolCall, data.preview || '');
+        if (data.toolCall) {
+          collapseThinkingIfOpen(stream.currentStep.live);
+          upsertToolCardOnStart(data.toolCall, data.preview || '');
+        }
         break;
 
       case 'toolCallEnd':
-        if (data.toolResult) resolveToolCardOnEnd(data.toolResult);
+        if (data.toolResult) {
+          // 仅本块新建卡片（非注册表归位）参与 step 归属判定（fixPlan Phase4 T4.5/审核 S1）
+          var resolved = resolveToolCardOnEnd(data.toolResult);
+          if (resolved.ownedByLiveBlock) stream.currentStep.sawToolEnd = true;
+        }
         break;
 
       case 'confirmationRequired': // 终态：弹框 + 用帧内 toolCall 建「待确认」卡片
         stream.terminalSeen = true;
+        collapseThinkingIfOpen(stream.currentStep.live);
         if (data.toolCall) {
           var card = toolCards[data.toolCall.id];
           if (card) {
             setCardStatus(card, 'pending');
           } else {
             card = buildToolCard(data.toolCall, 'pending', data.commandPreview || '');
+            card.ownedByLiveBlock = true; // 本块新建待确认卡：confirm 后 End 触发 sawToolEnd
             toolCards[data.toolCall.id] = card;
             liveBodyEl().appendChild(card.el);
           }
@@ -511,17 +649,19 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         stream.pending = data;
         showConfirmModal(data);
         updateComposer();
-        scrollToBottom();
+        maybeScrollToBottom();
         break;
 
       case 'completed': // 终态：刷新侧栏（title/usage/updatedAt 已变）；状态栏在 onStreamClosed 统一刷新（泵线程回写时序）
         stream.terminalSeen = true;
+        collapseThinkingIfOpen(stream.currentStep.live);
         goIdle();
         window.sidebarView.refresh().then(function () { window.chatView.syncTopbar(); });
         break;
 
       case 'error': // 终态
         stream.terminalSeen = true;
+        collapseThinkingIfOpen(stream.currentStep.live);
         handleStreamError(data);
         break;
     }
@@ -560,12 +700,15 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
   function enterWaitingConfirm(pending, restoredLive) {
     var stream = window.appStore.stream;
     if (!stream) {
+      // restored 块复用历史 thinking 壳；sawToolEnd=true 表示该 step 已有工具阶段，
+      // confirm 后续模型输出将触发 newStep 落到新块（D6 continueConfirmation 边界）
+      var live = restoredLive ? buildLiveFromHistory(restoredLive) : null;
+      var step = live ? { live: live, textBuf: '', reasoningBuf: '', sawToolEnd: true } : null;
       stream = {
         phase: 'waitingConfirm',
         abort: null,
-        textBuf: restoredLive ? restoredLive.content : '',
-        reasoningBuf: '',
-        live: restoredLive ? buildLiveFromHistory(restoredLive) : null,
+        currentStep: step,
+        steps: step ? [step] : [],
         terminalSeen: true,
         pending: pending
       };
@@ -585,19 +728,26 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     updateComposer();
   }
 
-  // pending 恢复时，续流需渲染进同一 assistant 块：把历史末块包装为 live 结构
+  // pending 恢复时，续流需渲染进同一 assistant 块：把历史末块包装为 live 结构。
+  // fixPlan Phase4 T4.7（审核 M1 修复）：复用历史已渲染的 thinking 壳，不再插入新空壳（避免双 thinking）；
+  // 历史块无 reasoning 时 thinkingEl 为 null--续流 thinking 由新 step 块承担（confirm 后 End->sawToolEnd->delta 触发 newStep）。
   function buildLiveFromHistory(lastAssistant) {
-    var thinking = buildThinkingBlock();
-    thinking.el.classList.add('hidden');
-    lastAssistant.bodyEl.insertBefore(thinking.el, lastAssistant.bodyEl.firstChild);
-    return {
+    var live = {
       bodyEl: lastAssistant.bodyEl,
       rowEl: lastAssistant.bodyEl.parentNode,
-      thinkingEl: thinking.el,
-      thinkingContentEl: thinking.contentEl,
+      thinkingEl: lastAssistant.thinkingEl || null,
+      thinkingSummaryEl: lastAssistant.thinkingSummaryEl || null,
+      thinkingContentEl: lastAssistant.thinkingContentEl || null,
+      thinkingOpen: false,
+      userToggledThinking: false,
+      reasoningSeen: false,
       contentEl: lastAssistant.contentEl,
       interrupted: false
     };
+    if (live.thinkingSummaryEl) {
+      live.thinkingSummaryEl.addEventListener('click', function () { live.userToggledThinking = true; });
+    }
+    return live;
   }
 
   function onStreamClosed() {
@@ -626,6 +776,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
   function goIdle() {
     window.appStore.stream = null;
+    stickToBottom = true;
+    hideJumpToBottom();
     updateComposer();
   }
 
@@ -635,6 +787,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var sessionId = window.appStore.currentSessionId;
     var stream = window.appStore.stream;
     if (!sessionId || stream) return;
+    stickToBottom = true;
     var text = composerInput.value.trim();
     var attachments = window.fileMention.getAttachments();
     if (!text && attachments.length === 0) return; // D8：纯附件可发
@@ -644,12 +797,12 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     appendUserMessage(text, attachments);
     window.fileMention.clearChips();
 
+    var step = createStep();
     window.appStore.stream = {
       phase: 'streaming',
       abort: null,
-      textBuf: '',
-      reasoningBuf: '',
-      live: createLiveAssistantBlock(),
+      currentStep: step,
+      steps: [step],
       terminalSeen: false,
       pending: null
     };
@@ -672,7 +825,11 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     // [待确认] --批准/拒绝 POST confirm--> [流式中]（续流渲染进同一 assistant 块）
     stream.phase = 'streaming';
     stream.terminalSeen = false;
-    if (!stream.live) stream.live = createLiveAssistantBlock();
+    if (!stream.currentStep) {
+      var step = createStep();
+      stream.currentStep = step;
+      stream.steps = [step];
+    }
     updateComposer();
 
     var handle = window.sse.streamPost(
@@ -711,6 +868,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     if (pending) {
       enterWaitingConfirm(pending, lastAssistant);
     }
+    stickToBottom = true;
+    scrollToBottom();
   }
 
   function autoResize() {
@@ -723,6 +882,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
   window.chatView = {
     open: async function (sessionId) {
       window.appStore.currentSessionId = sessionId;
+      stickToBottom = true;
+      hideJumpToBottom();
       chatEmptyEl.classList.add('hidden');
       messageListEl.classList.remove('hidden');
       errorBarEl.classList.add('hidden');
@@ -746,6 +907,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
     showEmpty: function () {
       window.appStore.currentSessionId = null;
+      stickToBottom = true;
+      hideJumpToBottom();
       topbarTitleEl.textContent = 'FlamingoAgents';
       topbarModelEl.textContent = '';
       messageListEl.innerHTML = '';
@@ -764,6 +927,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       if (stream && stream.abort) stream.abort();
       window.appStore.stream = null;
       hideConfirmModal();
+      stickToBottom = true;
+      hideJumpToBottom();
     },
 
     // /model 切换放弃待确认（§3.3）：关确认框、回空闲态

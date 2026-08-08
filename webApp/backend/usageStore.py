@@ -1,11 +1,14 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-08-07
+Version: 1.3
+Date: 2026-08-08
 Description: webData/usage.db SQLite 用量统计库（契约 §3.10 / webAppPlan §11.4）：usageTurns 表 DDL 与增量写入（泵线程终态 delta，任一项 >0 才写）；
             空表时从 sessionLogs jsonl 一次性回填 assistantMessage 事件（providerId 从 sessions 索引补、缺省 unknown）；
             hour/day/month 聚合查询（UTC 转服务器本地时区切桶、空桶补齐、byModel key 为 providerId/modelId、cost 查询时按 models.yaml 当前价格计算）。
             v1.1 迭代二（方案 §3.2）：新增 querySessionCost（status 端点费用口径，按 sessionId 聚合逐 turn 计价）。
+            v1.2 状态栏：新增 queryLastUsageTurn（最近一轮 token 增量，供 status 在索引缺 lastUsage 时回退，重启不丢）。
+            v1.3 费用修复（statusBarUsageFixPlan P1）：费用公式改 calcTurnCost——promptTokens 含 cachedTokens（OpenAI 原生语义），
+            cached 部分只按 cacheRead 折扣价计一次，不再叠加 input 全价重复计费；querySessionCost/querySeries 统一调用。
 '''
 
 from __future__ import annotations
@@ -119,6 +122,31 @@ def writeUsageTurn(sessionId: str, providerId: str, modelId: str, delta: dict) -
         connection.commit()
 
 
+def queryLastUsageTurn(sessionId: str) -> dict | None:
+    # status 回退：索引尚未写入 lastUsage（升级前会话 / 进程重启前未跑过新泵）时，用 usageTurns 最近一条增量。
+    connection = getConnection()
+    with dbLock:
+        row = connection.execute(
+            'SELECT promptTokens, cachedTokens, completionTokens FROM usageTurns'
+            ' WHERE sessionId = ? ORDER BY id DESC LIMIT 1',
+            (sessionId,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        'promptTokens': int(row[0] or 0),
+        'cachedTokens': int(row[1] or 0),
+        'completionTokens': int(row[2] or 0),
+    }
+
+
+def calcTurnCost(promptTokens: int, cachedTokens: int, completionTokens: int, cost: dict) -> float:
+    # OpenAI 语义：promptTokens 含 cachedTokens（子集）；cached 按 cacheRead 折扣价、其余按 input 全价，不得重复计费。
+    nonCachedPrompt = max(0, promptTokens - cachedTokens)
+    return (nonCachedPrompt * cost['input'] + cachedTokens * cost['cacheRead']
+            + completionTokens * cost['output']) / 1_000_000
+
+
 def querySessionCost(sessionId: str) -> float:
     # status 端点费用（迭代二 §3.2 / D1-A）：按 sessionId 聚合 usageTurns，逐行套 costMap 当前价求和；
     # 模型已从 yaml 删除 → 该行按 0 计；泵流进行中落后一轮（D7 不轮询，可接受）。
@@ -133,8 +161,7 @@ def querySessionCost(sessionId: str) -> float:
     for providerId, modelId, promptTokens, cachedTokens, completionTokens in rows:
         cost = costMap.get(f'{providerId}/{modelId}')
         if cost:
-            total += (promptTokens * cost['input'] + completionTokens * cost['output']
-                      + cachedTokens * cost['cacheRead']) / 1_000_000
+            total += calcTurnCost(promptTokens, cachedTokens, completionTokens, cost)
     return total
 
 
@@ -222,8 +249,7 @@ def querySeries(granularity: str) -> dict:
         cost = costMap.get(modelKey)
         turnCost = 0.0
         if cost:
-            turnCost = (promptTokens * cost['input'] + completionTokens * cost['output']
-                        + cachedTokens * cost['cacheRead']) / 1_000_000
+            turnCost = calcTurnCost(promptTokens, cachedTokens, completionTokens, cost)
         modelBucket = bucket['byModel'].setdefault(
             modelKey, {'promptTokens': 0, 'cachedTokens': 0, 'completionTokens': 0, 'cost': 0.0}
         )

@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.10
-Date: 2026-07-26
-Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden).
+Version: 1.11
+Date: 2026-08-08
+Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden). v1.11（fixPlan Phase2）：流式累积 reasoningParts 并在流结束时写入顶层 responsePayload['reasoning']（非空才写，不入 messagePayload）；complete() 非流式出口归一化 choices[0].message.reasoning_content -> 顶层 reasoning，保持 choices[0].message 与非流式同构（reasoning 不得进入发往模型的 messages，D2 红线）。
 '''
 
 from __future__ import annotations
@@ -96,6 +96,11 @@ class chatCompletionsAdapter:
             responseText = response.read().decode('utf-8')
 
         payload = json.loads(responseText)
+        # stream=False 回退归一化：把 choices[0].message.reasoning_content 提升到顶层 reasoning
+        # （仅顶层，不删原字段、不入 chatMessage；D2 红线：reasoning 不得进入发往模型的 messages）
+        msg = ((payload.get('choices') or [{}])[0]).get('message') or {}
+        if msg.get('reasoning_content'):
+            payload['reasoning'] = msg['reasoning_content']
         if self.debugConsole:
             self.debugConsole.debug(f"\nSource response:\n{payload}")
         return modelCompletion(
@@ -115,6 +120,7 @@ class chatCompletionsAdapter:
     def consumeSseStream(self, requestPayload: dict[str, Any]) -> Iterator:
         contentParts: list[str] = []
         toolCallAccum: dict[int, dict[str, Any]] = {}
+        reasoningParts: list[str] = []
         responseModel: str | None = None
         usage: dict[str, Any] | None = None
         chunkCount = 0
@@ -124,7 +130,7 @@ class chatCompletionsAdapter:
                     if dataPayload == '[DONE]':
                         break
                     chunkCount += 1
-                    for event in self.processSseData(dataPayload, requestPayload, contentParts, toolCallAccum):
+                    for event in self.processSseData(dataPayload, requestPayload, contentParts, toolCallAccum, reasoningParts):
                         if isinstance(event, dict):
                             if event.get('model'):
                                 responseModel = event['model']
@@ -160,6 +166,9 @@ class chatCompletionsAdapter:
         }
         if usage is not None:
             responsePayload['usage'] = usage
+        reasoningText = ''.join(reasoningParts)
+        if reasoningText:
+            responsePayload['reasoning'] = reasoningText
         if self.debugConsole:
             self.debugConsole.debug(f"\nSource response (streamed, chunks={chunkCount}):\n{responsePayload}")
         yield finalChunk(completion=modelCompletion(
@@ -200,6 +209,7 @@ class chatCompletionsAdapter:
         requestPayload: dict[str, Any],
         contentParts: list[str],
         toolCallAccum: dict[int, dict[str, Any]],
+        reasoningParts: list[str],
     ) -> Iterator:
         try:
             data = json.loads(dataPayload)
@@ -239,6 +249,7 @@ class chatCompletionsAdapter:
             yield textChunk(text=text)
         reasoning = delta.get('reasoning_content')
         if reasoning:
+            reasoningParts.append(reasoning)
             yield reasoningChunk(text=reasoning)
         for rawToolCall in delta.get('tool_calls') or []:
             if not isinstance(rawToolCall, dict):

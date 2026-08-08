@@ -1,11 +1,12 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-08-07
+Version: 1.4
+Date: 2026-08-08
 Description: sessionId → agent 实例缓存（懒建、模型配置变更后置失效标记惰性重建）、活跃流登记（同会话并发 409）、停止标志与泵线程结构。
             v1.1 随包改名调整 import（webApp.backend.*）。
             v1.2 迭代一（方案 §11.4）：泵线程流开始快照 usageTotal、终态算 delta 先写 usageStore.usageTurns（后回写 sessions 索引，原有回写不变）。
             v1.3 迭代二（方案 §3.3/§3.6）：新增 dropAgentIfIdle（单锁完成查活跃流+丢缓存，/model 指令用）；泵线程回写索引时附带 contextTokens（conversation.lastTurnTokens）。
+            v1.4 状态栏口径：回写索引时附带 lastUsage=本轮 delta（↑↓⚡ 展示最近一轮，不再用会话累计）。
 '''
 
 from __future__ import annotations
@@ -158,4 +159,9 @@ class streamPump:
         delta = {key: finalUsage[key] - startUsage[key] for key in finalUsage}
         meta = sessionStore.getSession(self.sessionId) or {}
         usageStore.writeUsageTurn(self.sessionId, meta.get('providerId', 'unknown'), meta.get('modelId', ''), delta)
-        sessionStore.updateUsage(self.sessionId, finalUsage, contextTokens=int(currentConversation.lastTurnTokens or 0))
+        sessionStore.updateUsage(
+            self.sessionId,
+            finalUsage,
+            contextTokens=int(currentConversation.lastTurnTokens or 0),
+            lastUsage=delta,
+        )

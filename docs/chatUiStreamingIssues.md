@@ -1,15 +1,15 @@
 '''
 Author: wilbur
-Version: 1.2
+Version: 1.3
 Date: 2026-08-08
-Description: 聊天界面流式/历史渲染问题根因落档（thinking 不显示与不落库、工具卡位置漂移、多头像拆分、流式强制贴底、工具仅完成后才可见）。含直接代码证据与修复建议顺序。v1.2 增加修复方案链接。
+Description: 聊天界面流式/历史渲染问题根因落档（thinking 不显示与不落库、工具卡位置漂移、多头像拆分、流式强制贴底、工具仅完成后才可见）。含直接代码证据与修复建议顺序。v1.2 增加修复方案链接。v1.3：标注实施状态（fixPlan Phase 1–5 已实施）；问题 6 根因 A 遗留记录。
 '''
 
 # 聊天界面流式 / 历史渲染问题根因落档
 
 > 日期：2026-08-08  
 > 范围：`webApp/frontend/js/chatView.js`、`webApp/backend/historyView.py`、`flamingoAgents/core/agent.py`、`flamingoAgents/core/conversation.py`、`flamingoAgents/models/chatCompletions.py`  
-> 状态：问题诊断（未改业务代码）  
+> 状态：**Phase 1–5 已实施（2026-08-08，见 fixPlan），手测验收待联调**  
 > **修复方案（含分阶段计划与 TODOlist）→ [`docs/chatUiStreamingFixPlan.md`](./chatUiStreamingFixPlan.md)**
 
 ---
@@ -419,6 +419,8 @@ function resolveToolCardOnEnd(...) {
 
 #### 根因 A — `toolCallStart` 发得太晚（主因）
 
+> **实施注记（2026-08-08）**：本期未改根因 A（Start 发送时机需等本 step 模型流结束、finalChunk 落库后才发出）；fixPlan T5.6「同批先全部 Start 再 exec」**遗留至后续迭代**。Phase 5 已强化 running 可见性（Start 到达即时插入 DOM + 呼吸动画）。
+
 前端/后端**并非没有** running 态设计：
 
 - 后端会先 `yield toolCallStartEvent`，再 `executeToolCall`，再 `yield toolCallEndEvent`
@@ -620,3 +622,4 @@ function upsertToolCardOnStart(toolCall, preview) {
 | 1.0 | 2026-08-08 | 首版：5 个 UI/持久化问题根因 + 代码证据 + 修复顺序建议 |
 | 1.1 | 2026-08-08 | 增补问题 6：工具仅完成后可见；Start 过晚 + 短工具 Start/End 连发 + batch 串行 |
 | 1.2 | 2026-08-08 | 文首增加修复方案链接 `chatUiStreamingFixPlan.md` |
+| 1.3 | 2026-08-08 | 标注实施状态（fixPlan Phase 1–5 已实施，手测待联调）；问题 6 根因 A 遗留记录 |

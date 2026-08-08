@@ -1,13 +1,15 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-08-07
+Version: 1.5
+Date: 2026-08-08
 Description: FastAPI 应用与全部路由：认证依赖、统一异常映射（库 RuntimeError → 400 透传中文消息）、sessionId 入口校验、SSE 对话流、静态文件容忍空目录挂载。
             v1.1 随包改名调整 import（webApp.backend.*）；静态目录由 static/ 改为 webApp/frontend/，projectRoot 随目录加深改为 parents[2]。
             v1.2 迭代一（契约 v1.2 §3.3/§3.4/§3.10）：新增 probeWorkDir 与 usage/series 端点；create 会话 workDir 改必填 + allowCreate，
             校验顺序调整为先 providerId/modelId 预检再处理目录，已存在目录增加 R_OK|W_OK|X_OK 校验，mkdir TOCTOU 兜底。
             v1.3 迭代二（方案 webAppIteration2Plan §3）：新增 status（状态栏聚合）、PATCH model（/model）、files/fileContent（文件浏览器与@附件）端点；
             chat/stream 支持 attachments（后端拼接附件块）且 message 校验放宽为「与 attachments 不同时为空」。
+            v1.4 状态栏口径：status 返回 lastUsage（最近一轮增量）与 contextUsedPercent（使用率，替代剩余率展示语义）。
+            v1.5 lastUsage 优先 sessions 索引，缺省回退 usageTurns 最近一条（重启/升级前会话不丢增量）。
 '''
 
 from __future__ import annotations
@@ -222,19 +224,30 @@ def getSessionStatus(sessionId: str):
     except RuntimeError:
         contextWindow = None
     contextTokens = int(session.get('contextTokens', 0) or 0)
-    remainingPercent = None
+    usedPercent = None
     if contextWindow:
-        remainingPercent = round(max(0.0, min(100.0, (1 - contextTokens / contextWindow) * 100)), 1)
+        usedPercent = round(max(0.0, min(100.0, (contextTokens / contextWindow) * 100)), 1)
+    lastUsage = session.get('lastUsage')
+    if not isinstance(lastUsage, dict):
+        # 索引无 lastUsage（升级前会话或尚未经新泵回写）：回退 usageTurns 最近一轮增量，保证重启后仍显示「带历史的最近增量」。
+        lastUsage = usageStore.queryLastUsageTurn(sessionId) or dict(sessionStore.emptyUsage)
+    else:
+        lastUsage = {
+            'promptTokens': int(lastUsage.get('promptTokens', 0) or 0),
+            'cachedTokens': int(lastUsage.get('cachedTokens', 0) or 0),
+            'completionTokens': int(lastUsage.get('completionTokens', 0) or 0),
+        }
     return {
         'workDir': workDir,
         'gitBranch': gitBranch,
         'providerId': providerId,
         'modelId': modelId,
         'usage': session.get('usage') or dict(sessionStore.emptyUsage),
+        'lastUsage': lastUsage,
         'cost': usageStore.querySessionCost(sessionId),
         'contextWindow': contextWindow,
         'contextTokens': contextTokens,
-        'contextRemainingPercent': remainingPercent,
+        'contextUsedPercent': usedPercent,
     }
 
 
