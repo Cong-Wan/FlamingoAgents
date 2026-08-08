@@ -1,10 +1,11 @@
 /*
 Author: wilbur
-Version: 1.0
+Version: 1.1
 Date: 2026-08-07
 Description: 右侧文件浏览器（迭代二方案 §4.7/D6）：懒加载目录树（每层缓存、刷新清缓存）、折叠状态存 localStorage；
              文件预览弹层——代码 highlight.js 高亮（getLanguage 预判降级纯文本、输出过 DOMPurify）、
              .md marked 渲染（渲染/源码切换）、行号列；Esc 经 modalStack 只关栈顶。
+             v1.1 取消 PREVIEW_CHAR_LIMIT 预览截断限制，完整渲染文件内容。
 */
 (function () {
   'use strict';
@@ -155,8 +156,6 @@ Description: 右侧文件浏览器（迭代二方案 §4.7/D6）：懒加载目�
 
   /* ---------- 文件预览 ---------- */
 
-  var PREVIEW_CHAR_LIMIT = 100000;
-
   function highlightCode(content, path) {
     // D6/评审 M2：getLanguage 预判，未注册语言或 hljs 缺失降级纯文本；输出过 DOMPurify 再 innerHTML。
     var lang = languageMap[extOf(path)];
@@ -205,13 +204,6 @@ Description: 右侧文件浏览器（迭代二方案 §4.7/D6）：懒加载目�
   function renderPreviewBody() {
     previewBodyEl.innerHTML = '';
     var content = previewState.content;
-    if (content.length > PREVIEW_CHAR_LIMIT) {
-      var notice = document.createElement('div');
-      notice.className = 'preview-truncated';
-      notice.textContent = '内容过大，已截断显示前 ' + PREVIEW_CHAR_LIMIT + ' 字符';
-      previewBodyEl.appendChild(notice);
-      content = content.slice(0, PREVIEW_CHAR_LIMIT);
-    }
     if (previewState.isMarkdown && previewState.mode === 'rendered') {
       previewBodyEl.appendChild(buildMarkdownView(content));
     } else {

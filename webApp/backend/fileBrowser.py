@@ -1,9 +1,10 @@
 '''
 Author: wilbur
-Version: 1.0
+Version: 1.1
 Date: 2026-08-07
 Description: workDir 文件浏览纯函数层（迭代二方案 §3.8）：is_relative_to 路径拘禁、目录列举（目录在前、单条目 stat 失败跳过、
-            截断标记）、文本文件读取（大小/二进制校验）；OSError 统一转 RuntimeError 中文消息走 400 透传，不落 fallback 500。
+            截断标记）、文本文件读取（二进制校验）；OSError 统一转 RuntimeError 中文消息走 400 透传，不落 fallback 500。
+            v1.1 取消 maxFileBytes 单文件大小限制，readTextFile 不再校验文件大小，listDir 中 attachable 始终为 true。
 '''
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-maxFileBytes = 512 * 1024      # 单文件上限（读取/附件共用）
 maxTotalBytes = 1024 * 1024    # 附件合计上限
 maxAttachments = 8             # 单次附件个数上限
 maxEntries = 500               # 目录单层列举上限
@@ -33,8 +33,6 @@ def readTextFile(workDir: str, relPath: str) -> dict:
         if not target.is_file():
             raise RuntimeError(f'不是文件：{relPath}')
         size = target.stat().st_size
-        if size > maxFileBytes:
-            raise RuntimeError(f'文件过大（>{maxFileBytes // 1024}KB）：{relPath}')
         raw = target.read_bytes()
     except OSError as error:
         raise RuntimeError(f'文件不存在或不可读：{relPath}（{error}）')
@@ -61,7 +59,7 @@ def listDir(workDir: str, relPath: str | None) -> dict:
                 entry = {'name': item.name, 'type': 'dir' if isDir else 'file'}
                 if not isDir:
                     entry['size'] = size
-                    entry['attachable'] = size <= maxFileBytes
+                    entry['attachable'] = True
                 entries.append(entry)
                 if len(entries) >= maxEntries:
                     truncated = True
