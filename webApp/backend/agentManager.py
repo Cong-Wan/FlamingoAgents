@@ -1,12 +1,15 @@
 '''
 Author: wilbur
-Version: 1.4
-Date: 2026-08-08
+Version: 1.5
+Date: 2026-08-11
 Description: sessionId → agent 实例缓存（懒建、模型配置变更后置失效标记惰性重建）、活跃流登记（同会话并发 409）、停止标志与泵线程结构。
             v1.1 随包改名调整 import（webApp.backend.*）。
             v1.2 迭代一（方案 §11.4）：泵线程流开始快照 usageTotal、终态算 delta 先写 usageStore.usageTurns（后回写 sessions 索引，原有回写不变）。
             v1.3 迭代二（方案 §3.3/§3.6）：新增 dropAgentIfIdle（单锁完成查活跃流+丢缓存，/model 指令用）；泵线程回写索引时附带 contextTokens（conversation.lastTurnTokens）。
             v1.4 状态栏口径：回写索引时附带 lastUsage=本轮 delta（↑↓⚡ 展示最近一轮，不再用会话累计）。
+            v1.5 多窗口并行（multiWindowStreamingPlan §4.1）：streamPump 广播化——单队列改「事件 history + 多订阅者队列」（subLock 内回放/广播/关闭，不丢不重）；
+            startStream 增加 meta（baseCount/userMessage，attach 首帧用）；新增 getActivePump/subscribe/unsubscribe/compactDeltas；
+            stop 分支补广播 stopped 终态（其他订阅窗口静默收尾，不再误报连接中断）。
 '''
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ import queue
 import threading
 
 from flamingoAgents import createAgent
-from flamingoAgents.core.types import errorEvent, terminalEventTypes
+from flamingoAgents.core.types import errorEvent, reasoningDeltaEvent, terminalEventTypes, textDeltaEvent
 
 from webApp.backend import sessionStore, usageStore
 from webApp.backend.sessionStore import sessionLogsDir
@@ -79,12 +82,36 @@ def hasActiveStream(sessionId: str) -> bool:
         return sessionId in activeStreams
 
 
-def startStream(sessionId: str, agentInstance, stream) -> 'streamPump | None':
+def getActivePump(sessionId: str) -> 'streamPump | None':
+    # attach 路由用（multiWindowStreamingPlan §4.3）：无活跃流 → None（映射 404）。
+    with managerLock:
+        return activeStreams.get(sessionId)
+
+
+def compactDeltas(events: list) -> list:
+    # 合并相邻同型 textDelta/reasoningDelta（text 拼接），其余事件原样保序；
+    # 仅作用于 subscribe 回放副本（避免前端回放 O(n²) 重渲染），不改 history 本体。
+    compacted: list = []
+    for event in events:
+        if compacted:
+            previous = compacted[-1]
+            if isinstance(event, textDeltaEvent) and isinstance(previous, textDeltaEvent):
+                compacted[-1] = textDeltaEvent(text=previous.text + event.text)
+                continue
+            if isinstance(event, reasoningDeltaEvent) and isinstance(previous, reasoningDeltaEvent):
+                compacted[-1] = reasoningDeltaEvent(text=previous.text + event.text)
+                continue
+        compacted.append(event)
+    return compacted
+
+
+def startStream(sessionId: str, agentInstance, stream, meta: dict | None = None) -> 'streamPump | None':
     # 同会话已有活跃流时返回 None（路由层映射 409）；登记与启动在同一把锁内完成。
+    # meta = {'baseCount': int, 'userMessage': str|None}：attach 首帧 streamResume 用（multiWindowStreamingPlan §4.3）。
     with managerLock:
         if sessionId in activeStreams:
             return None
-        pump = streamPump(sessionId, agentInstance, stream)
+        pump = streamPump(sessionId, agentInstance, stream, meta=meta)
         activeStreams[sessionId] = pump
         pump.start()
         return pump
@@ -105,13 +132,18 @@ def requestStop(sessionId: str) -> bool:
 
 
 class streamPump:
-    # 泵线程 + 队列 + 停止标志（webAppPlan §4.3-H1）：SSE 生成器只从队列取事件，
+    # 泵线程 + 广播结构（multiWindowStreamingPlan §4.1）：事件 history + 多订阅者队列。
+    # subscribe/_broadcast/结束置 closed 均在 subLock 内 → 回放与实时无缝衔接，不丢不重；
     # stop 只置标志位，库生成器由泵线程自己 close（跨线程 close 会抛 ValueError）。
-    def __init__(self, sessionId: str, agentInstance, stream):
+    def __init__(self, sessionId: str, agentInstance, stream, meta: dict | None = None):
         self.sessionId = sessionId
         self.agent = agentInstance
         self.stream = stream
-        self.eventQueue: queue.Queue = queue.Queue()
+        self.meta = meta or {}
+        self.subLock = threading.Lock()
+        self.history: list = []
+        self.subscribers: list[queue.Queue] = []
+        self.closed = False
         self.stopFlag = threading.Event()
         self.thread = threading.Thread(target=self._pump, daemon=True)
 
@@ -121,22 +153,52 @@ class streamPump:
     def requestStop(self) -> None:
         self.stopFlag.set()
 
+    def subscribe(self) -> queue.Queue:
+        # 新订阅者：先回放 history（压缩连续 delta），泵已关则直接补哨兵，否则登记跟实时。
+        subscriber: queue.Queue = queue.Queue()
+        with self.subLock:
+            for event in compactDeltas(self.history):
+                subscriber.put(event)
+            if self.closed:
+                subscriber.put(None)
+            else:
+                self.subscribers.append(subscriber)
+        return subscriber
+
+    def unsubscribe(self, subscriber: queue.Queue) -> None:
+        # 订阅者断连反注册（sseGen finally 调用），防止死订阅队列继续堆积事件。
+        with self.subLock:
+            if subscriber in self.subscribers:
+                self.subscribers.remove(subscriber)
+
+    def _broadcast(self, event) -> None:
+        with self.subLock:
+            self.history.append(event)
+            for subscriber in self.subscribers:
+                subscriber.put(event)
+
     def _pump(self) -> None:
         startUsage = self._currentUsage()
         try:
             for event in self.stream:
                 if self.stopFlag.is_set():
+                    # stop 必须广播终态（multiWindowStreamingPlan 审核修复）：否则其他订阅窗口
+                    # onStreamClosed 命中 !terminalSeen 误报「连接中断」；前端按 errorType='stopped' 静默收尾。
+                    self._broadcast(errorEvent(message='已停止。', errorType='stopped'))
                     break
-                self.eventQueue.put(event)
+                self._broadcast(event)
                 if isinstance(event, terminalEventTypes):
                     break
         except Exception as error:
-            self.eventQueue.put(errorEvent(message=str(error), errorType=type(error).__name__))
+            self._broadcast(errorEvent(message=str(error), errorType=type(error).__name__))
         finally:
             self.stream.close()
             self._recordUsage(startUsage)
             unregisterStream(self.sessionId)
-            self.eventQueue.put(None)  # 哨兵：通知 SSE 生成器结束
+            with self.subLock:
+                self.closed = True
+                for subscriber in self.subscribers:
+                    subscriber.put(None)  # 哨兵：通知各 SSE 生成器结束
 
     def _currentUsage(self) -> dict:
         # 从已缓存 conversation 读 usageTotal（禁止 getConversation()，避免为未发消息会话落 jsonl 的副作用）。

@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.5
-Date: 2026-08-08
+Version: 1.6
+Date: 2026-08-11
 Description: FastAPI 应用与全部路由：认证依赖、统一异常映射（库 RuntimeError → 400 透传中文消息）、sessionId 入口校验、SSE 对话流、静态文件容忍空目录挂载。
             v1.1 随包改名调整 import（webApp.backend.*）；静态目录由 static/ 改为 webApp/frontend/，projectRoot 随目录加深改为 parents[2]。
             v1.2 迭代一（契约 v1.2 §3.3/§3.4/§3.10）：新增 probeWorkDir 与 usage/series 端点；create 会话 workDir 改必填 + allowCreate，
@@ -10,6 +10,8 @@ Description: FastAPI 应用与全部路由：认证依赖、统一异常映射�
             chat/stream 支持 attachments（后端拼接附件块）且 message 校验放宽为「与 attachments 不同时为空」。
             v1.4 状态栏口径：status 返回 lastUsage（最近一轮增量）与 contextUsedPercent（使用率，替代剩余率展示语义）。
             v1.5 lastUsage 优先 sessions 索引，缺省回退 usageTurns 最近一条（重启/升级前会话不丢增量）。
+            v1.6 多窗口并行（multiWindowStreamingPlan §4.3）：chatStream/chatConfirm 启动泵前采样 baseCount 并传 meta；
+            新增 POST /api/chat/attach（404=无活跃流；SSE 首帧 streamResume + 回放 + 实时）；sseResponse 走订阅队列。
 '''
 
 from __future__ import annotations
@@ -84,8 +86,9 @@ def requireSession(sessionId: str) -> dict:
     return session
 
 
-def sseResponse(pump) -> StreamingResponse:
-    return StreamingResponse(sseGen(pump), media_type='text/event-stream', headers=sseHeaders)
+def sseResponse(pump, meta=None) -> StreamingResponse:
+    # 统一走订阅队列（multiWindowStreamingPlan §4.2）：meta 非 None（attach）时首帧 streamResume；pump 传入供断连反注册。
+    return StreamingResponse(sseGen(pump.subscribe(), meta=meta, pump=pump), media_type='text/event-stream', headers=sseHeaders)
 
 
 # ---------- 登录（唯一免认证接口） ----------
@@ -415,7 +418,12 @@ def chatStream(body: dict = Body(...)):
         cleanMessage = fileBrowser.buildAttachmentMessage(cleanMessage, session['workDir'], attachments)
     agentInstance = agentManager.getAgent(sessionId)
     stream = agentInstance.runUserMessageStream(cleanMessage, sessionId)
-    pump = agentManager.startStream(sessionId, agentInstance, stream)
+    # baseCount 水位线（multiWindowStreamingPlan §4.3）：生成器惰性，appendUserMessage 在泵线程首次迭代才发生，采样必然先于写盘。
+    baseCount = len(historyView.loadMessages(sessionId))
+    pump = agentManager.startStream(
+        sessionId, agentInstance, stream,
+        meta={'baseCount': baseCount, 'userMessage': cleanMessage},
+    )
     if pump is None:
         raise HTTPException(status_code=409, detail='该会话已有活跃流，请稍后再试。')
     # 首条用户消息发出后标题自动改为前 20 字；发消息刷新 updatedAt（契约 §2.1）。
@@ -441,11 +449,27 @@ def chatConfirm(body: dict = Body(...)):
         raise HTTPException(status_code=400, detail='approved 必须是布尔值。')
     agentInstance = agentManager.getAgent(sessionId)
     stream = agentInstance.continueConfirmationStream(sessionId, confirmationId, approved)
-    pump = agentManager.startStream(sessionId, agentInstance, stream)
+    baseCount = len(historyView.loadMessages(sessionId))
+    pump = agentManager.startStream(
+        sessionId, agentInstance, stream,
+        meta={'baseCount': baseCount, 'userMessage': None},
+    )
     if pump is None:
         raise HTTPException(status_code=409, detail='该会话已有活跃流，请稍后再试。')
     sessionStore.touchSession(sessionId)
     return sseResponse(pump)
+
+
+@authedApi.post('/chat/attach')
+def chatAttach(body: dict = Body(...)):
+    # attach 回放式重连（multiWindowStreamingPlan §4.3）：无活跃流 → 404（前端静默保持历史态）；
+    # 否则首帧 streamResume（meta）+ history 压缩回放 + 实时事件。waitingConfirm 非活跃流，走 GET pending 恢复。
+    sessionId = checkSessionId(body.get('sessionId') if isinstance(body, dict) else None)
+    requireSession(sessionId)
+    pump = agentManager.getActivePump(sessionId)
+    if pump is None:
+        raise HTTPException(status_code=404, detail='该会话无活跃流。')
+    return sseResponse(pump, meta=pump.meta)
 
 
 @authedApi.post('/chat/stop')

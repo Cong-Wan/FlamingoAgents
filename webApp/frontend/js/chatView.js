@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.5
-Date: 2026-08-08
+Version: 1.6
+Date: 2026-08-11
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
@@ -15,6 +15,9 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              toolCallStart/End 仅本块新建卡片置 sawToolEnd（ownedByLiveBlock 标记，dangling 重放/pending 恢复命中注册表不置位、不 newStep，审核 S1）；
              pending 恢复复用历史 thinking 壳避免双壳（审核 M1），restored step 初始 sawToolEnd=true 使 confirm 后续模型输出落新块；
              工具 running 态加呼吸/pulse 动画（Phase5 T5.1）。
+             v1.6 多窗口并行（multiWindowStreamingPlan §5）：reloadSession 乐观 attach（历史先渲染，attach 成功按 baseCount 截断重渲染+回放续播）；
+             attaching 占位流态（close 可 abort、send 拦截、composer 禁用）+ sessionId/占位身份双重守卫；
+             onStreamEvent 四处 currentStep 空守卫；handleStreamError 新增 stopped 静默分支（跨窗口停止）。
 */
 (function () {
   'use strict';
@@ -567,6 +570,12 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       sendButton.disabled = false;
       sendButton.textContent = '停止';
       sendButton.classList.add('stop');
+    } else if (stream.phase === 'attaching') {
+      // attach 在途（multiWindowStreamingPlan §5.1）：禁用输入与按钮，防止初始化前发送撞 409
+      composerInput.disabled = true;
+      sendButton.disabled = true;
+      sendButton.textContent = '发送';
+      sendButton.classList.remove('stop');
     } else if (stream.phase === 'stopping') {
       composerInput.disabled = true;
       sendButton.disabled = true;
@@ -617,7 +626,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
       case 'toolCallStart':
         if (data.toolCall) {
-          collapseThinkingIfOpen(stream.currentStep.live);
+          if (stream.currentStep) collapseThinkingIfOpen(stream.currentStep.live); // attach 首事件可能无 step（§5.2）
           upsertToolCardOnStart(data.toolCall, data.preview || '');
         }
         break;
@@ -632,7 +641,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
       case 'confirmationRequired': // 终态：弹框 + 用帧内 toolCall 建「待确认」卡片
         stream.terminalSeen = true;
-        collapseThinkingIfOpen(stream.currentStep.live);
+        if (stream.currentStep) collapseThinkingIfOpen(stream.currentStep.live); // attach 回放可能无 step（§5.2）
         if (data.toolCall) {
           var card = toolCards[data.toolCall.id];
           if (card) {
@@ -654,14 +663,14 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
       case 'completed': // 终态：刷新侧栏（title/usage/updatedAt 已变）；状态栏在 onStreamClosed 统一刷新（泵线程回写时序）
         stream.terminalSeen = true;
-        collapseThinkingIfOpen(stream.currentStep.live);
+        if (stream.currentStep) collapseThinkingIfOpen(stream.currentStep.live); // attach 回放可能无 step（§5.2）
         goIdle();
         window.sidebarView.refresh().then(function () { window.chatView.syncTopbar(); });
         break;
 
       case 'error': // 终态
         stream.terminalSeen = true;
-        collapseThinkingIfOpen(stream.currentStep.live);
+        if (stream.currentStep) collapseThinkingIfOpen(stream.currentStep.live); // attach 回放可能无 step（§5.2）
         handleStreamError(data);
         break;
     }
@@ -669,6 +678,12 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
   function handleStreamError(data) {
     var sessionId = window.appStore.currentSessionId;
+    if (data.errorType === 'stopped') {
+      // 其他窗口点了停止（后端广播的 stopped 终态，multiWindowStreamingPlan §5.3）：半截消息加「已中断」，静默回空闲
+      markInterrupted();
+      goIdle();
+      return;
+    }
     if (data.errorType === 'pendingConfirmationExists') {
       // 契约 §5：GET pending → 重弹确认框
       window.api.getPending(sessionId).then(function (res) {
@@ -867,8 +882,75 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var lastAssistant = renderHistory(messages, pending);
     if (pending) {
       enterWaitingConfirm(pending, lastAssistant);
+    } else {
+      // 乐观 attach（multiWindowStreamingPlan §5.1）：历史已先渲染；有活跃流则截断重渲染 + 回放续播，404 静默保持历史态。
+      // pending 态必无活跃流（泵在 confirmationRequired 已终态），跳过 attach 以免占位态覆盖 waitingConfirm。
+      attachStream(sessionId, messages);
     }
     stickToBottom = true;
+    scrollToBottom();
+  }
+
+  /* ---------- attach 回放式重连（multiWindowStreamingPlan §5.1） ---------- */
+
+  function attachStream(sessionId, messages) {
+    var preInitBuf = []; // streamResume 之前到达的事件缓冲（meta 必为首帧，此为防御性缓冲）
+    var initialized = false;
+    // attaching 占位流态：close() 能 abort 在途 attach；send() 被 stream 非空拦截；updateComposer 禁用输入与按钮
+    var placeholder = { phase: 'attaching', abort: null, currentStep: null, steps: [], terminalSeen: false, pending: null };
+    window.appStore.stream = placeholder;
+    updateComposer();
+    var handle = window.sse.streamPost('/api/chat/attach', { sessionId: sessionId }, function (event, data) {
+      if (!initialized) {
+        if (event !== 'streamResume') { preInitBuf.push({ event: event, data: data }); return; }
+        if (sessionId !== window.appStore.currentSessionId) return; // 已切走，丢弃迟到初始化
+        if (window.appStore.stream !== placeholder) return; // 已被新 attach 替换（A→B→A 快速重进）
+        initAttachedStream(messages, data || {});
+        initialized = true;
+        preInitBuf.forEach(function (item) { onStreamEvent(item.event, item.data); });
+        preInitBuf = null;
+        return;
+      }
+      onStreamEvent(event, data);
+    });
+    placeholder.abort = handle.abort;
+    handle.done.then(function () {
+      if (!initialized) { resetToHistoryState(false); return; } // 未初始化即结束（极端竞态）
+      onStreamClosed();
+    }).catch(function (error) {
+      if (!initialized) { resetToHistoryState(error.status !== 404, error); return; } // 404 静默；其余提示
+      onStreamFailed(error);
+    });
+
+    // 历史已在 attach 前渲染（含 pending），兜底只需复位 composer；404=无活跃流/竞态结束属常态，静默
+    function resetToHistoryState(withHint, error) {
+      if (sessionId !== window.appStore.currentSessionId) return; // 已切走，不污染新视图
+      if (window.appStore.stream !== placeholder) return; // 别清掉新 attach 的占位
+      window.appStore.stream = null;
+      updateComposer();
+      if (withHint) showError('流恢复失败（' + error.message + '）；页面为静态历史，流可能仍在后台运行，刷新重试。');
+    }
+  }
+
+  function initAttachedStream(messages, meta) {
+    // baseCount 水位线截断：本次流已落盘的尾巴由事件回放重建，不丢不重（§3.1）
+    var baseCount = Math.min(meta.baseCount || 0, messages.length);
+    renderHistory(messages.slice(0, baseCount), null);
+    if (meta.userMessage) {
+      appendUserMessage(meta.userMessage); // 历史渲染同构（ATTACHMENT_RE 解析附件块）
+    } else {
+      // confirm 流（userMessage=null）可能中途落盘 queued 用户消息（agent.py driveConfirmation）：
+      // baseCount 之后的 user 消息不在回放事件里，需补渲染（位置近似，§6-E13 已声明）
+      messages.slice(baseCount).forEach(function (msg) {
+        if (msg.kind === 'user') appendUserMessage(msg.content);
+      });
+    }
+    var stream = window.appStore.stream; // 复用占位态，迁移为 streaming
+    stream.phase = 'streaming';
+    stream.currentStep = null; // 懒建：首个 delta/工具事件时建块，避免全归位历史卡片时留空气泡
+    stream.steps = [];
+    stickToBottom = true;
+    updateComposer();
     scrollToBottom();
   }
 

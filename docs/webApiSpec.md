@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.6
-> Date: 2026-08-08
+> Version: 1.7
+> Date: 2026-08-11
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 7 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -13,6 +13,7 @@
 > v1.5：状态栏口径——§3.14 status 新增 `lastUsage`（最近一轮 token 增量）；`contextRemainingPercent` 改为 `contextUsedPercent`（使用率）；`usage`/`cost` 仍为会话累计。
 > v1.5.1：`lastUsage` 读路径——优先 sessions 索引；缺省回退 `usageTurns` 按 sessionId 最近一条（重启/升级前会话不显示 0）。
 > v1.6：状态栏修复（statusBarUsageFixPlan）——§3.10 费用公式修正为 prompt 减 cached 后不重复计费；§3.14 反转 v1.5 读取指引（状态栏 ↑↓⚡ 自 statusBar v1.3 起改读 `usage` 会话累计 + 前端减法归一化，`lastUsage` 保留但状态栏不再使用）。
+> v1.7：多窗口并行（multiWindowStreamingPlan）——新增 §4.5 attach 回放式重连端点；§4.3 事件集新增 `streamResume`（attach 专属首帧）与 `errorType: "stopped"`（跨窗口停止广播）；§4.4 stop 语义补 stopped 终态广播；§5 状态机重进会话改 attach 续播；§6 移除「无 SSE 重连」声明。
 
 ---
 
@@ -452,8 +453,9 @@
 | `confirmationRequired` | `{ "confirmationId": "confirm_...", "reason": "删除类命令需确认", "commandPreview": "rm -rf /tmp/x", "toolCall": {"id","toolName","arguments"} }` | **终态**。弹确认框；用 toolCall 先建「待确认」卡片 |
 | `completed` | `{ "message": "完整回复全文" }` | **终态**。message 与已拼接的 textDelta 全文一致（前端可直接用拼接结果，不必替换） |
 | `error` | `{ "message": "...", "errorType": "..." }` | **终态**。errorType 取值见下 |
+| `streamResume` | `{ "baseCount": 0, "userMessage": "..." }` | **仅 attach 流（§4.5）的首帧**；原始 stream/confirm 流不下发 |
 
-`errorType` 取值（对齐库契约）：`pendingConfirmationExists` / `confirmationMismatch` / `maxStepsExceeded` / 模型调用异常类名（如 `modelRequestError`、`HTTPError`）/ 泵线程兜底异常类名。`emptyMessage` 仅库层兜底——REST 预检已拦截空消息，流内不可达，**前端无需为它写处理分支**（审核 L1）。
+`errorType` 取值（对齐库契约）：`pendingConfirmationExists` / `confirmationMismatch` / `maxStepsExceeded` / `stopped`（v1.7：任一窗口停止后泵广播的终态，非停止发起方的前端按「已中断」静默收尾，不弹错误条）/ 模型调用异常类名（如 `modelRequestError`、`HTTPError`）/ 泵线程兜底异常类名。`emptyMessage` 仅库层兜底——REST 预检已拦截空消息，流内不可达，**前端无需为它写处理分支**（审核 L1）。
 
 **典型事件序列**：
 
@@ -473,7 +475,26 @@
 
 - 200：`{ "stopped": true }`（置停止标志成功）或 `{ "stopped": false }`（该会话无活跃流，幂等不报错）；
 - 404：会话不存在；
-- **语义（webAppPlan §4.3-H1）**：非即时。SSE 连接在泵线程跑到下一个事件/当前 step 结束后关闭；停止后前端立即停渲染并给半截消息加「已中断」标记；半截文本不落 jsonl，刷新即消失。
+- **语义（webAppPlan §4.3-H1）**：非即时。SSE 连接在泵线程跑到下一个事件/当前 step 结束后关闭；停止后前端立即停渲染并给半截消息加「已中断」标记；半截文本不落 jsonl，刷新即消失；
+- **stopped 广播（v1.7）**：停止生效时泵向**所有订阅者**广播 `error` 帧（`errorType: "stopped"`）作为终态——停止发起方处于「停止中」态仅记录终态；其他 attach 窗口按「已中断」标记 + 静默回空闲处理。
+
+### 4.5 POST /api/chat/attach —— 回放式重连（v1.7 新增，multiWindowStreamingPlan）
+
+请求：`{ "sessionId": "session_0bcd11873ded" }`
+
+预检：sessionId 非法 → 400；会话不存在 → 404；**该会话无活跃流 → 404 `该会话无活跃流。`（前端静默保持历史态，不弹错误条——attach 即探针，重进会话时无条件发起）**。
+
+通过后返回 `text/event-stream`，帧序列：
+
+```
+streamResume（首帧，必到）→ 泵 history 压缩回放（连续同类 textDelta/reasoningDelta 已合并为单帧）→ 实时事件（同 §4.3）
+```
+
+- `streamResume.data.baseCount`：**泵启动前** `GET messages` 口径的消息条数（水位线）。前端重进会话时先全量渲染历史，attach 成功后以 `messages.slice(0, baseCount)` 截断重渲染，本次流已落盘的尾巴由回放事件重建——不丢不重；
+- `streamResume.data.userMessage`：本次流的用户消息最终文本（含附件块拼接，与落盘一致）；confirm 续跑流为 `null`——此时 `baseCount` 之后的 user 消息（queued 用户消息）需前端从 messages 补渲染；
+- 多订阅者：同一会话允许任意多个 attach 与原始流并存（多窗口同步观看）；停止/终态向全体广播；
+- waitingConfirm 不是活跃流（泵在 confirmationRequired 终态已结束）→ attach 返 404，待确认恢复仍走 §3.8 GET pending；
+- 泵结束后随即注销，迟到 attach 只能命中「已关闭未注销」的极小竞态窗口——此时回放含终态帧，前端按终态正常收尾。
 
 ## 5. 前端交互状态机（契约的消费侧约定）
 
@@ -490,18 +511,20 @@
 [流式中] --点停止 POST stop--> [停止中]（按钮禁用，等连接关闭）--> [空闲]
 进入/刷新会话页 --> GET messages + GET pending（并行）
   -- pending 非 null --> [待确认]（重弹确认框，对应 toolCall 渲染「待确认」卡片而非 dangling 灰卡）
-  -- pending null --> 按 §2.2 渲染历史
+  -- pending null --> 按 §2.2 渲染历史 + POST attach（乐观探测）
+      -- attach 404 --> 保持历史态（静默）
+      -- attach 成功 --> [流式中]（streamResume 首帧 → 按 baseCount 截断重渲染 → 回放续播，按钮变停止）
 任意请求 401 --> 清 localStorage token --> [登录门]
 ```
 
 - **dangling 重放归位（审核 M5）**：dangling 灰卡存在时发新消息，库会重放这些 toolCall，新流中出现**与灰卡同 id** 的 `toolCallStart/toolCallEnd`——前端命中同 id 卡片时**更新该卡片状态**（灰卡→执行中→完成/失败），不得新建重复卡片；重放触发的新 `confirmationRequired` 按正常待确认流程处理；
 - 刷新/重进页面：`GET /api/sessions` 进侧栏；`#/chat/{id}` 时 `GET messages` + `GET pending` 恢复现场；
-- 发送期间刷新页面：活跃流丢失但后端泵线程跑到终态；重进后拉 messages 即为最新完整状态（自愈，无需断线重连机制——本期不做 SSE 重连）。
+- 发送期间刷新页面/切走会话：前端订阅断开但后端泵线程跑到终态；重进后经 §4.5 attach 回放续播（v1.7 起为回放式重连）；若流已终态则 attach 404，拉 messages 即为最新完整状态（自愈）。
 
 ## 6. 明确不在契约内（防前端误依赖）
 
 - 无分页：sessions/messages 均全量返回（单用户规模）；
-- 无 WebSocket、无 SSE 重连/断点续传；
+- 无 WebSocket；SSE 断线重连仅指 §4.5 attach 回放式重连（无 Last-Event-ID 断点续传）；
 - 无消息编辑/删除/重生成接口；
 - 无 provider 连通性测试接口（保存配置后靠实际发消息验证）；
 - `completed.message` 与 textDelta 拼接结果的一致性由库保证，前端不做 diff 校验。
