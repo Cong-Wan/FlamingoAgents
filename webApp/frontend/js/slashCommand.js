@@ -1,10 +1,11 @@
 /*
 Author: wilbur
-Version: 1.0
-Date: 2026-08-07
+Version: 1.1
+Date: 2026-08-11
 Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册表（/model 切换当前会话模型、/new 同目录新开会话），
              capture 阶段键盘拦截（§4.3，先于 chatView 的 Enter→send）；不命中指令按普通文本发送。
              另暴露 window.toast 轻提示（供 fileMention/fileExplorer 复用）。
+             v1.1：修复 IME 组合态按 Enter 误执行指令（/new 执行后残留 new）——组合中放行让输入法先提交候选词，提交后再按 Enter 才执行。
 */
 (function () {
   'use strict';
@@ -197,6 +198,8 @@ Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册
   // 注意：textarea 是事件目标本身，同节点监听器按注册顺序都执行，必须 stopImmediatePropagation。
   composerInput.addEventListener('keydown', function (event) {
     if (!panelOpen) return;
+    // IME 组合态放行：此时 Enter 是提交候选词而非执行指令，否则 runItem 清空输入后 compositionend 会把残留字符写回
+    if (event.isComposing || event.keyCode === 229) return;
     if (['Enter', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown'].indexOf(event.key) < 0) return;
     event.stopImmediatePropagation();
     event.preventDefault();

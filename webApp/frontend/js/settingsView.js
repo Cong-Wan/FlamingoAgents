@@ -1,12 +1,14 @@
 /*
 Author: wilbur
-Version: 1.2
-Date: 2026-08-08
+Version: 1.4
+Date: 2026-08-11
 Description: 模型配置编辑页：整页表单化（§11.3）——顶部 provider tab 条 + 全宽纵向字段 + 模型折叠卡片 +
              底部固定保存/重置栏。内存工作副本：open 时 GET 一次，tab 切换不重拉（脏数据 confirm 提示），
              重置 = 放弃修改重拉，保存 = 工作副本全量 PUT（契约 §2.4/§3.11/§3.12）。
              apiKey 遵循 __KEEP__ / $ 引用 / 空串删除规则。
              v1.2：provider 级新增 headers 自定义请求头编辑（每行 Key: Value；空=删除该字段；可用于伪装 UA 绕过中转 CF 拦截）。
+             v1.3：新增 provider 改名时仅刷新 tab，避免每输入一个字符重建表单并导致 providerId 输入框失焦。
+             v1.4：新增 provider 的名称默认为空；模型表单隐藏 reasoning/thinking.type，仅保留思考强度选择。
 */
 (function () {
   'use strict';
@@ -41,7 +43,6 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
   var newProviderIds = {};      // 新建中的 provider（providerId 字段可编辑）
   var expandedModels = [];      // 展开的模型卡片（按对象引用）
   var dirty = false;            // 有未保存修改
-  var newProviderSeq = 0;
 
   function showError(message) {
     errorEl.textContent = message;
@@ -116,7 +117,7 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
     Object.keys(providers).forEach(function (providerId) {
       var tab = document.createElement('button');
       tab.className = 'provider-tab' + (providerId === currentProviderId ? ' active' : '');
-      tab.textContent = providerId;
+      tab.textContent = providerId || '未命名 provider';
       tab.addEventListener('click', function () { switchTab(providerId); });
       tabsEl.appendChild(tab);
     });
@@ -302,32 +303,12 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
     body.appendChild(makeField('contextWindow', makeTextInput(model.contextWindow || 0, function (v) { model.contextWindow = Number(v); }, true)));
     body.appendChild(makeField('maxTokens', makeTextInput(model.maxTokens || 0, function (v) { model.maxTokens = Number(v); }, true)));
 
-    // reasoning 开关
-    var reasoningLabel = document.createElement('label');
-    reasoningLabel.className = 'model-input-checks';
-    var reasoningCheckbox = document.createElement('input');
-    reasoningCheckbox.type = 'checkbox';
-    reasoningCheckbox.checked = !!model.reasoning;
-    reasoningCheckbox.addEventListener('change', function () { model.reasoning = reasoningCheckbox.checked; markDirty(); });
-    reasoningLabel.appendChild(reasoningCheckbox);
-    body.appendChild(makeField('reasoning', reasoningLabel));
-
-    // thinking.type 下拉：缺省 / enabled / disabled
-    body.appendChild(makeField('thinking.type', makeSelect(
-      [['', '（缺省）'], ['enabled', 'enabled'], ['disabled', 'disabled']],
-      model.thinking && model.thinking.type ? model.thinking.type : '',
-      function (v) {
-        if (v) model.thinking = { type: v };
-        else delete model.thinking;
-      }
-    )));
-
-    // reasoningEffort 下拉：缺省 / low / medium / high / max；yaml 现值不在列则动态补选项
+    // 思考强度：仅编辑 reasoningEffort；reasoning/thinking 保留工作副本原值但不暴露控件
     var effortPairs = [['', '（缺省）'], ['low', 'low'], ['medium', 'medium'], ['high', 'high'], ['max', 'max']];
     var effortValue = model.reasoningEffort || '';
     var known = effortPairs.some(function (pair) { return pair[0] === effortValue; });
     if (effortValue && !known) effortPairs.push([effortValue, effortValue]);
-    body.appendChild(makeField('reasoningEffort', makeSelect(effortPairs, effortValue, function (v) {
+    body.appendChild(makeField('思考强度', makeSelect(effortPairs, effortValue, function (v) {
       if (v) model.reasoningEffort = v;
       else delete model.reasoningEffort;
     })));
@@ -358,11 +339,11 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
     return card;
   }
 
-  // 新建 provider 改名：迁移工作副本 key（撞名/空值拦截并回退渲染）
+  // 新建 provider 改名：迁移工作副本 key（允许暂时为空；撞名时回退渲染）
   function renameProviderId(oldId, nextId) {
     nextId = (nextId || '').trim();
-    if (!nextId || nextId === oldId) return;
-    if (modelConfig.providers[nextId]) {
+    if (nextId === oldId) return;
+    if (Object.prototype.hasOwnProperty.call(modelConfig.providers, nextId)) {
       showError('provider「' + nextId + '」已存在。');
       render();
       return;
@@ -375,7 +356,7 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
       newProviderIds[nextId] = true;
     }
     currentProviderId = nextId;
-    render();
+    renderTabs();
   }
 
   /* ---------- 保存前校验（对齐契约 §2.4，失败给出中文字段名） ---------- */
@@ -389,6 +370,7 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
     if (ids.length === 0) return 'providers 不能为空。';
     for (var i = 0; i < ids.length; i++) {
       var providerId = ids[i];
+      if (!providerId.trim()) return 'providerId 不能为空。';
       var provider = providers[providerId];
       if (!provider.baseUrl || typeof provider.baseUrl !== 'string') {
         return 'provider「' + providerId + '」的 baseUrl 不能为空。';
@@ -475,11 +457,11 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
 
   function addProvider() {
     if (!modelConfig) return;
-    newProviderSeq += 1;
-    var providerId = 'newProvider' + newProviderSeq;
-    while (modelConfig.providers[providerId]) {
-      newProviderSeq += 1;
-      providerId = 'newProvider' + newProviderSeq;
+    var providerId = '';
+    if (Object.prototype.hasOwnProperty.call(modelConfig.providers, providerId)) {
+      currentProviderId = providerId;
+      render();
+      return;
     }
     var model = defaultModel();
     modelConfig.providers[providerId] = {

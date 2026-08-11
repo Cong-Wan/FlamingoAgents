@@ -1,10 +1,11 @@
 /*
 Author: wilbur
-Version: 1.0
-Date: 2026-08-07
+Version: 1.1
+Date: 2026-08-11
 Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须为行首/空白（防 user@example.com 误触发），
              目录下钻、文件名过滤、attachable:false 置灰；选中文件生成 chip（输入框上方），发送时随 attachments 提交。
              键盘拦截与 slashCommand 同约（capture 阶段，§4.3）。
+             v1.1：修复 IME 组合态按 Enter 误选中条目——组合中放行让输入法先提交候选词（同 slashCommand v1.1）。
 */
 (function () {
   'use strict';
@@ -201,6 +202,8 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
   // 注意：textarea 是事件目标本身，同节点监听器按注册顺序都执行，必须 stopImmediatePropagation。
   composerInput.addEventListener('keydown', function (event) {
     if (!panelOpen) return;
+    // IME 组合态放行：此时 Enter 是提交候选词而非选中条目（同 slashCommand v1.1）
+    if (event.isComposing || event.keyCode === 229) return;
     if (['Enter', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown'].indexOf(event.key) < 0) return;
     event.stopImmediatePropagation();
     event.preventDefault();
