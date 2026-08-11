@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.5
-Date: 2026-08-08
+Version: 1.7
+Date: 2026-08-11
 Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅色侧栏 + 浅色主区）。
              v1.1 迭代一：侧栏浅色系并清理硬编码深色；侧栏收缩/悬浮展开按钮；设置页整页表单（tab 条/全宽字段/模型折叠卡片/固定保存栏）；用量页费用卡与图表区。
              v1.2 迭代二（方案 §4）：聊天页双栏（chat-center + 右侧 filePanel 文件树）；composer 改纵向（chip 区 + 输入行 + 两行状态栏）；
@@ -10,6 +10,7 @@ Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅�
              v1.4（fixPlan Phase1）：智能贴底--.chat-center 设 position:relative；新增「回到底部」悬浮按钮样式（固定消息区右下角）。
              v1.5（fixPlan Phase5）：工具 running 态呼吸动画--.status-running 状态丸 pulse + .tool-card-running 卡边框呼吸，让「执行中」更醒目。
              v1.6 取消文件预览字符截断限制，移除 .preview-truncated 样式。
+             v1.7 markdown 代码块改为浅色背景（.gray-block + 浅边框），避免深色 pre 在浅色主区里很突允。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -228,8 +229,8 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
 /* markdown 正文 */
 .markdown-content > :first-child { margin-top: 0; }
 .markdown-content pre {
-  background: #28282b; color: #e8e8ea; border-radius: 8px;
-  padding: 12px; overflow-x: auto; font-size: 13px; margin: 10px 0;
+  background: var(--gray-block); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px; overflow-x: auto; font-size: 13px; margin: 10px 0;
 }
 .markdown-content code { font-family: "SF Mono", Menlo, Consolas, monospace; }
 .markdown-content pre code { background: none; padding: 0; }
