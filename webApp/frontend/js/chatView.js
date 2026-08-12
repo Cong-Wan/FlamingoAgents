@@ -1,6 +1,6 @@
 /*
 Author: wilbur
-Version: 1.6
+Version: 1.7
 Date: 2026-08-11
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
@@ -18,6 +18,10 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              v1.6 多窗口并行（multiWindowStreamingPlan §5）：reloadSession 乐观 attach（历史先渲染，attach 成功按 baseCount 截断重渲染+回放续播）；
              attaching 占位流态（close 可 abort、send 拦截、composer 禁用）+ sessionId/占位身份双重守卫；
              onStreamEvent 四处 currentStep 空守卫；handleStreamError 新增 stopped 静默分支（跨窗口停止）。
+             v1.7（streamingLatencyFixPlan Phase2/D4）：live paint rAF 合并——textDelta/reasoningDelta 只进 buffer + scheduleLivePaint，
+             DOM 写在 rAF/flushLivePaint（每帧最多一次 renderMarkdown，长正文不再每 token 全量 parse 卡主线程）；
+             强制 flush 清单：step 切换前、completed/error/confirmationRequired 入口、stop 进 stopping、goIdle 双保险、collapseThinking 前双 buffer 上屏；
+             工具卡/确认事件保持即时 DOM，不进文本 paint 队列。
 */
 (function () {
   'use strict';
@@ -413,13 +417,46 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
   }
 
   // 创建一个模型 step：内含 live 块 + 本 step 自有 buffer 与工具阶段标记（fixPlan Phase4 D1/D6）
+  // paintScheduled：rAF paint 合并标记（streamingLatencyFixPlan Phase2 D4）
   function createStep() {
     return {
       live: createLiveAssistantBlock(),
       textBuf: '',
       reasoningBuf: '',
-      sawToolEnd: false
+      sawToolEnd: false,
+      paintScheduled: false
     };
+  }
+
+  // rAF paint 合并（D4）：把本 step 的 reasoningBuf/textBuf 一次性写入 DOM 并清除调度标记。
+  // step 切换/终态/stop/goIdle/collapse 前必须调用（漏则丢尾）。
+  function flushLivePaint(step) {
+    if (!step || !step.live) return;
+    step.paintScheduled = false;
+    if (step.reasoningBuf && step.live.thinkingContentEl) {
+      step.live.thinkingContentEl.textContent = step.reasoningBuf;
+    }
+    if (step.textBuf) {
+      renderMarkdown(step.live.contentEl, step.textBuf);
+    }
+  }
+
+  // delta 只进 buffer，每帧最多一次 DOM 写；scroll 合入 paint 回调末尾
+  function scheduleLivePaint(step) {
+    if (step.paintScheduled) return;
+    step.paintScheduled = true;
+    requestAnimationFrame(function () {
+      if (!step.paintScheduled) return; // 已被 flushLivePaint 清掉
+      flushLivePaint(step);
+      maybeScrollToBottom();
+    });
+  }
+
+  // 折叠 thinking 前强制双 buffer 上屏（D4 清单 5：避免「已思考」少字/正文丢尾）；仅在实际将折叠时 flush，保住 rAF 合并收益
+  function flushAndCollapseThinking(step) {
+    if (!step || !step.live) return;
+    flushLivePaint(step);
+    collapseThinkingIfOpen(step.live);
   }
 
   // D6 隐式 step 边界：当前 step 已走过工具阶段（sawToolEnd=true）后又有模型输出（textDelta/reasoningDelta）
@@ -434,6 +471,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       return;
     }
     if (step.sawToolEnd && (eventKind === 'textDelta' || eventKind === 'reasoningDelta')) {
+      flushLivePaint(step); // 旧 step 封眼前强制上屏（D4 清单 1）
       stream.currentStep = createStep();
       stream.steps.push(stream.currentStep);
     }
@@ -609,9 +647,11 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       case 'textDelta':
         beginNewStepIfNeeded('textDelta');
         stream.currentStep.textBuf += data.text || '';
-        collapseThinkingIfOpen(stream.currentStep.live);
-        renderMarkdown(stream.currentStep.live.contentEl, stream.currentStep.textBuf);
-        maybeScrollToBottom();
+        // 即将折叠 thinking 时先 flush 双 buffer（collapse 只发生一次，不破坏 rAF 合并）
+        if (stream.currentStep.live.reasoningSeen && stream.currentStep.live.thinkingOpen) {
+          flushAndCollapseThinking(stream.currentStep);
+        }
+        scheduleLivePaint(stream.currentStep);
         break;
 
       case 'reasoningDelta':
@@ -620,13 +660,12 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         stream.currentStep.live.thinkingEl.classList.remove('hidden');
         stream.currentStep.live.reasoningSeen = true;
         setThinkingState(stream.currentStep.live, '思考中…', true);
-        stream.currentStep.live.thinkingContentEl.textContent = stream.currentStep.reasoningBuf;
-        maybeScrollToBottom();
+        scheduleLivePaint(stream.currentStep);
         break;
 
       case 'toolCallStart':
         if (data.toolCall) {
-          if (stream.currentStep) collapseThinkingIfOpen(stream.currentStep.live); // attach 首事件可能无 step（§5.2）
+          if (stream.currentStep) flushAndCollapseThinking(stream.currentStep); // attach 首事件可能无 step（§5.2）
           upsertToolCardOnStart(data.toolCall, data.preview || '');
         }
         break;
@@ -641,7 +680,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
       case 'confirmationRequired': // 终态：弹框 + 用帧内 toolCall 建「待确认」卡片
         stream.terminalSeen = true;
-        if (stream.currentStep) collapseThinkingIfOpen(stream.currentStep.live); // attach 回放可能无 step（§5.2）
+        if (stream.currentStep) flushAndCollapseThinking(stream.currentStep); // 终态入口强制 flush（D4 清单 2）；attach 回放可能无 step（§5.2）
         if (data.toolCall) {
           var card = toolCards[data.toolCall.id];
           if (card) {
@@ -663,14 +702,14 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
       case 'completed': // 终态：刷新侧栏（title/usage/updatedAt 已变）；状态栏在 onStreamClosed 统一刷新（泵线程回写时序）
         stream.terminalSeen = true;
-        if (stream.currentStep) collapseThinkingIfOpen(stream.currentStep.live); // attach 回放可能无 step（§5.2）
+        if (stream.currentStep) flushAndCollapseThinking(stream.currentStep); // 终态入口强制 flush（D4 清单 2）
         goIdle();
         window.sidebarView.refresh().then(function () { window.chatView.syncTopbar(); });
         break;
 
       case 'error': // 终态
         stream.terminalSeen = true;
-        if (stream.currentStep) collapseThinkingIfOpen(stream.currentStep.live); // attach 回放可能无 step（§5.2）
+        if (stream.currentStep) flushAndCollapseThinking(stream.currentStep); // 终态入口强制 flush（D4 清单 2）
         handleStreamError(data);
         break;
     }
@@ -718,7 +757,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       // restored 块复用历史 thinking 壳；sawToolEnd=true 表示该 step 已有工具阶段，
       // confirm 后续模型输出将触发 newStep 落到新块（D6 continueConfirmation 边界）
       var live = restoredLive ? buildLiveFromHistory(restoredLive) : null;
-      var step = live ? { live: live, textBuf: '', reasoningBuf: '', sawToolEnd: true } : null;
+      var step = live ? { live: live, textBuf: '', reasoningBuf: '', sawToolEnd: true, paintScheduled: false } : null;
       stream = {
         phase: 'waitingConfirm',
         abort: null,
@@ -790,6 +829,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
   }
 
   function goIdle() {
+    var stream = window.appStore.stream;
+    if (stream && stream.currentStep) flushLivePaint(stream.currentStep); // 双保险（D4 清单 4）
     window.appStore.stream = null;
     stickToBottom = true;
     hideJumpToBottom();
@@ -861,6 +902,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var stream = window.appStore.stream;
     if (!sessionId || !stream || stream.phase !== 'streaming') return;
     stream.phase = 'stopping';
+    if (stream.currentStep) flushLivePaint(stream.currentStep); // 进 stopping 前 buffer 强制上屏（D4 清单 3）
     markInterrupted(); // 立即停渲染 + 半截消息加「已中断」标记
     updateComposer();
     try {

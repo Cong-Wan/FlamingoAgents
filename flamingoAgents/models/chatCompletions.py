@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.11
-Date: 2026-08-08
-Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden). v1.11（fixPlan Phase2）：流式累积 reasoningParts 并在流结束时写入顶层 responsePayload['reasoning']（非空才写，不入 messagePayload）；complete() 非流式出口归一化 choices[0].message.reasoning_content -> 顶层 reasoning，保持 choices[0].message 与非流式同构（reasoning 不得进入发往模型的 messages，D2 红线）。
+Version: 1.12
+Date: 2026-08-11
+Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden). v1.11（fixPlan Phase2）：流式累积 reasoningParts 并在流结束时写入顶层 responsePayload['reasoning']（非空才写，不入 messagePayload）；complete() 非流式出口归一化 choices[0].message.reasoning_content -> 顶层 reasoning，保持 choices[0].message 与非流式同构（reasoning 不得进入发往模型的 messages，D2 红线）。v1.12（streamingLatencyFixPlan Phase1/T1.1）：iterSseData 改优先 read1(4096)（getattr fallback read），修复 chunked SSE 上 read(amt) 阻塞凑批导致的「长时间真空后一次性喷出」。
 '''
 
 from __future__ import annotations
@@ -180,8 +180,12 @@ class chatCompletionsAdapter:
     def iterSseData(self, response) -> Iterator[str]:
         # 按字节缓冲半行，凑满一行再 decode（多字节 UTF-8 可能跨 chunk 切断）；\n 是 ASCII，不会出现在 UTF-8 多字节序列内。
         buffer = b''
+        # read(amt) 在 chunked 响应上会阻塞凑满 amt 才返回，把匀速小增量攒成大批量；read1 有数据即返回（streamingLatencyFixPlan D1）。
+        readChunk = getattr(response, 'read1', None)
+        if not callable(readChunk):
+            readChunk = response.read
         while True:
-            data = response.read(4096)
+            data = readChunk(4096)
             if not data:
                 break
             buffer += data

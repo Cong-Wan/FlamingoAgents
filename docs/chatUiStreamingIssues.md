@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-08-08
-Description: 聊天界面流式/历史渲染问题根因落档（thinking 不显示与不落库、工具卡位置漂移、多头像拆分、流式强制贴底、工具仅完成后才可见）。含直接代码证据与修复建议顺序。v1.2 增加修复方案链接。v1.3：标注实施状态（fixPlan Phase 1–5 已实施）；问题 6 根因 A 遗留记录。
+Version: 1.4
+Date: 2026-08-11
+Description: 聊天界面流式/历史渲染问题根因落档（thinking 不显示与不落库、工具卡位置漂移、多头像拆分、流式强制贴底、工具仅完成后才可见）。含直接代码证据与修复建议顺序。v1.2 增加修复方案链接。v1.3：标注实施状态（fixPlan Phase 1–5 已实施）；问题 6 根因 A 遗留记录。v1.4：问题 6 增补 streamingLatencyFixPlan 落地注记（read1 + 可执行前缀批量 Start = 旧 T5.6，事件序脚本验证通过；final 前空白留二期 skeleton）。
 '''
 
 # 聊天界面流式 / 历史渲染问题根因落档
@@ -420,6 +420,8 @@ function resolveToolCardOnEnd(...) {
 #### 根因 A — `toolCallStart` 发得太晚（主因）
 
 > **实施注记（2026-08-08）**：本期未改根因 A（Start 发送时机需等本 step 模型流结束、finalChunk 落库后才发出）；fixPlan T5.6「同批先全部 Start 再 exec」**遗留至后续迭代**。Phase 5 已强化 running 可见性（Start 到达即时插入 DOM + 呼吸动画）。
+>
+> **实施注记（2026-08-11，`docs/streamingLatencyFixPlan.md`）**：旧 T5.6 已落地为该方案 D2「可执行前缀批量 Start」（`agent.py` v1.12）：final 后同批可执行前缀先全部 Start 再串行 exec，事件序表 #1–#8 脚本验证通过（`scripts/verifyBatchStart.py`）。根因 A 的「final 前空白」仍未消除，需二期 skeleton（该方案 Phase5，冰区）。另新增本方案覆盖的上游根因：适配器 `read(4096)` 在 chunked SSE 上阻塞凑批（`chatCompletions.py` v1.12 改 `read1`）；快工具肉眼 running 依赖条件让帧（Phase3.5，手测触发）。
 
 前端/后端**并非没有** running 态设计：
 
@@ -623,3 +625,4 @@ function upsertToolCardOnStart(toolCall, preview) {
 | 1.1 | 2026-08-08 | 增补问题 6：工具仅完成后可见；Start 过晚 + 短工具 Start/End 连发 + batch 串行 |
 | 1.2 | 2026-08-08 | 文首增加修复方案链接 `chatUiStreamingFixPlan.md` |
 | 1.3 | 2026-08-08 | 标注实施状态（fixPlan Phase 1–5 已实施，手测待联调）；问题 6 根因 A 遗留记录 |
+| 1.4 | 2026-08-11 | 问题 6 增补 `streamingLatencyFixPlan.md` 落地注记：read1 修复 + 旧 T5.6=可执行前缀批量 Start 已实施并脚本验证；final 前空白留二期 skeleton |

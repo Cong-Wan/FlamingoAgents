@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.11
-Date: 2026-07-26
-Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. v1.10 adds the event-stream API (docs/streamOutputPlan.md §6, v2.3 定稿): runUserMessageStream/continueConfirmationStream generators yield 7 event types with real-time text/reasoning deltas; terminal events (completed/confirmationRequired/error) are yielded only after the session lock is released; legacy sync APIs runUserMessage/continueConfirmation are kept as thin wrappers that drain the stream, map terminal events back to runResult, and accept optional onDelta/onReasoning callbacks. v1.11 调整 maxModelSteps 默认值 8 -> 32。
+Version: 1.12
+Date: 2026-08-11
+Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. v1.10 adds the event-stream API (docs/streamOutputPlan.md §6, v2.3 定稿): runUserMessageStream/continueConfirmationStream generators yield 7 event types with real-time text/reasoning deltas; terminal events (completed/confirmationRequired/error) are yielded only after the session lock is released; legacy sync APIs runUserMessage/continueConfirmation are kept as thin wrappers that drain the stream, map terminal events back to runResult, and accept optional onDelta/onReasoning callbacks. v1.11 调整 maxModelSteps 默认值 8 -> 32。v1.12（streamingLatencyFixPlan Phase3/D2）：driveToolBatch 改为「可执行前缀批量 Start」——从 startIndex 起连续可执行（未知或免确认）的工具先全部 yield toolCallStart，再串行 exec + toolCallEnd；遇需确认工具不发 Start，直接 setPending + confirmationRequired 终态（契约 §6.2 红线不变）。
 '''
 
 from __future__ import annotations
@@ -199,20 +199,39 @@ class agent:
         )
 
     def driveToolBatch(self, sessionId: str, toolCalls: list[toolCall], startIndex: int) -> Iterator:
-        # 调用前提：已持有会话锁。承载原 processToolBatch 逻辑；返回 True 表示已产出终态事件（confirmationRequired）。
+        # 调用前提：已持有会话锁。返回 True 表示已产出终态事件（confirmationRequired）。
+        # 可执行前缀批量 Start（streamingLatencyFixPlan D2）：从 startIndex 起连续可执行（未知或免确认）的工具
+        # 先全部 yield Start，再串行 exec + End；遇需确认工具停止扩展前缀，不发 Start，直接 confirmationRequired。
         currentConversation = self.getConversation(sessionId)
-        for index in range(startIndex, len(toolCalls)):
-            call = toolCalls[index]
-            definition = self.toolRegistry.get(call.toolName)
-            if definition is None:
-                # 未知工具不执行，但 Start/End 都发，保持配对（§6.2）。
-                yield toolCallStartEvent(toolCall=call, preview=str(call.arguments))
-                result = self.makeUnknownToolResult(call)
+        index = startIndex
+        while index < len(toolCalls):
+            # 1) 收集可执行前缀：unknown 或免确认；遇 requiresApproval 停止扩展
+            prefix: list[tuple[toolCall, toolDefinition | None]] = []
+            while index + len(prefix) < len(toolCalls):
+                call = toolCalls[index + len(prefix)]
+                definition = self.toolRegistry.get(call.toolName)
+                if definition is None:
+                    prefix.append((call, None))
+                    continue
+                decision = evaluateToolCall(definition, call, debugConsole=self.debugConsole)
+                if decision.requiresApproval:
+                    break
+                prefix.append((call, definition))
+            # 2) 前缀全部 Start（泵在每个 yield 后即 broadcast，多张卡先进入 running 语义）
+            for call, definition in prefix:
+                preview = str(call.arguments) if definition is None else self.buildToolPreview(definition, call)
+                yield toolCallStartEvent(toolCall=call, preview=preview)
+            # 3) 前缀串行 exec + End；jsonl 仍只按执行顺序写 toolResult，落盘语义不变
+            for call, definition in prefix:
+                result = self.makeUnknownToolResult(call) if definition is None else self.executeToolCall(call)
                 currentConversation.addToolResult(result)
                 yield toolCallEndEvent(toolResult=result)
-                continue
-            decision = evaluateToolCall(definition, call, debugConsole=self.debugConsole)
-            if decision.requiresApproval:
+            index += len(prefix)
+            # 4) 下一项需确认（prefix 为空即首项需确认）：不 Start，直接终态
+            if index < len(toolCalls):
+                call = toolCalls[index]
+                definition = self.toolRegistry.get(call.toolName)
+                decision = evaluateToolCall(definition, call, debugConsole=self.debugConsole)
                 confirmationId = 'confirm_' + uuid4().hex[:12]
                 currentConversation.setPending(pendingConfirm(
                     sessionId=sessionId,
@@ -233,10 +252,6 @@ class agent:
                     toolCall=call,
                 )
                 return True
-            yield toolCallStartEvent(toolCall=call, preview=self.buildToolPreview(definition, call))
-            result = self.executeToolCall(call)
-            currentConversation.addToolResult(result)
-            yield toolCallEndEvent(toolResult=result)
         return False
 
     # ---------- 同步 API（事件流的薄包装，§6.5） ----------
