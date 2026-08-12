@@ -1,14 +1,16 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-07-09
-Description: Provides executable handlers (execute/preview) for built-in tools and a name-keyed registry mapping them to schema-driven tool definitions. Schemas and permissions come from config/tools.yaml.
+Version: 1.5
+Date: 2026-08-12
+Description: Provides executable handlers (execute/preview) for built-in tools and a name-keyed registry mapping them to schema-driven tool definitions. Schemas and permissions come from config/tools.yaml. v1.4 adds askSubAgent: wraps sdkEntry.py as a sub-agent function call (600s timeout, JSON stdout parsed into toolOutput). v1.5: askSubAgent omits --system when not provided so the sub-agent falls back to the default config/systemPrompt.md.
 '''
 
 from __future__ import annotations
 
 import difflib
+import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,7 @@ from flamingoAgents.tools.toolDefinition import defineTool, toolDefinition, tool
 
 maxTimeoutSeconds = 120
 defaultTimeoutSeconds = 30
+subAgentTimeoutSeconds = 600
 
 
 # --- read ---
@@ -232,6 +235,78 @@ def decodeProcessText(value: str | bytes | None) -> str:
     return ''
 
 
+# --- askSubAgent ---
+
+sdkEntryPath = Path(__file__).resolve().parents[2] / 'sdkEntry.py'
+
+
+def previewAskSubAgentTool(arguments: dict[str, Any]) -> str:
+    model = str(arguments.get('model', ''))
+    prompt = str(arguments.get('prompt', ''))
+    return f'{model} prompt={prompt[:60]}'
+
+
+def askSubAgentTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:
+    model = str(arguments.get('model', '')).strip()
+    prompt = str(arguments.get('prompt', '')).strip()
+    if not model or '/' not in model:
+        return toolOutput(content='askSubAgent.model 必须是 provider/model 格式。', isError=True)
+    if not prompt:
+        return toolOutput(content='askSubAgent.prompt 不能为空。', isError=True)
+
+    command = [
+        sys.executable, str(sdkEntryPath),
+        '--model', model,
+        '--prompt', prompt,
+        '--json',
+    ]
+    # system 不传则不加 --system，让 sdkEntry 走默认（config/systemPrompt.md）；
+    # 传了则透传（sdkEntry 智能识别纯文本或 md 文件路径）。
+    system = str(arguments.get('system', '')).strip()
+    if system:
+        command += ['--system', system]
+    tools = str(arguments.get('tools', '')).strip()
+    if tools:
+        command += ['--tools', tools]
+    workDir = str(arguments.get('workDir', '')).strip() or str(context.workDir)
+    command += ['--work-dir', workDir]
+
+    if context.debugConsole:
+        context.debugConsole.debug(f'子代理开始 model={model} workDir={workDir} tools={tools or "<none>"}')
+    try:
+        completedProcess = subprocess.run(
+            command,
+            cwd=str(context.workDir),
+            capture_output=True,
+            text=True,
+            timeout=subAgentTimeoutSeconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return toolOutput(content=f'子代理超时被终止（{subAgentTimeoutSeconds}s）。', isError=True)
+
+    # stdout 最后一行是 --json 输出的单行 JSON。
+    stdoutLines = [line for line in completedProcess.stdout.splitlines() if line.strip()]
+    payload: dict[str, Any] = {}
+    if stdoutLines:
+        try:
+            payload = json.loads(stdoutLines[-1])
+        except json.JSONDecodeError:
+            payload = {}
+    reply = payload.get('reply')
+    error = payload.get('error')
+    isError = completedProcess.returncode != 0 or error is not None
+    if context.debugConsole:
+        context.debugConsole.debug(f'子代理完成 exitCode={completedProcess.returncode} isError={isError}')
+    if isError:
+        content = f'子代理失败 exitCode={completedProcess.returncode}：{error or (completedProcess.stderr.strip()[:500] or "未知错误")}'
+        return toolOutput(content=content, isError=True)
+    return toolOutput(
+        content=str(reply),
+        details={'model': model, 'workDir': workDir, 'tools': tools, 'exitCode': completedProcess.returncode},
+    )
+
+
 # --- schema-driven assembly ---
 
 executableMap: dict[str, tuple[toolExecuteFunction, toolPreviewFunction]] = {
@@ -239,6 +314,7 @@ executableMap: dict[str, tuple[toolExecuteFunction, toolPreviewFunction]] = {
     'write': (writeTool, previewWriteTool),
     'edit': (editTool, previewEditTool),
     'bash': (bashTool, previewBashTool),
+    'askSubAgent': (askSubAgentTool, previewAskSubAgentTool),
 }
 
 

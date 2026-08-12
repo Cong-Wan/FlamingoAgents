@@ -93,3 +93,28 @@ tools:
             - 'os\.(remove|unlink|rmdir)\s*\('
             - 'shutil\.rmtree\s*\('
             - 'pathlib\.[A-Za-z0-9_\.]+\.(unlink|rmdir)\s*\('
+
+  - name: askSubAgent
+    description: "调用子代理完成独立子任务。子代理在独立会话中运行，可使用指定模型与工具，返回最终文本回复。注意：tools 仅支持 read/write/edit/bash，不要传 askSubAgent（避免无限嵌套）。"
+    parameters:
+      type: object
+      properties:
+        model:
+          type: string
+          description: provider/model，如 volcano/deepseek-v4-flash
+        prompt:
+          type: string
+          description: 交给子代理的用户任务描述
+        system:
+          type: string
+          description: 子代理系统提示词：纯文本或 .md 文件路径；不传则默认使用项目 config/systemPrompt.md
+        tools:
+          type: string
+          description: 逗号分隔的工具白名单（read/write/edit/bash），留空则无工具
+        workDir:
+          type: string
+          description: 子代理工作目录，留空则用当前工作目录
+      required:
+        - model
+        - prompt
+      additionalProperties: false
