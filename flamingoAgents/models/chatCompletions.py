@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.12
-Date: 2026-08-11
-Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden). v1.11（fixPlan Phase2）：流式累积 reasoningParts 并在流结束时写入顶层 responsePayload['reasoning']（非空才写，不入 messagePayload）；complete() 非流式出口归一化 choices[0].message.reasoning_content -> 顶层 reasoning，保持 choices[0].message 与非流式同构（reasoning 不得进入发往模型的 messages，D2 红线）。v1.12（streamingLatencyFixPlan Phase1/T1.1）：iterSseData 改优先 read1(4096)（getattr fallback read），修复 chunked SSE 上 read(amt) 阻塞凑批导致的「长时间真空后一次性喷出」。
+Version: 1.13
+Date: 2026-08-12
+Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden). v1.11（fixPlan Phase2）：流式累积 reasoningParts 并在流结束时写入顶层 responsePayload['reasoning']（非空才写，不入 messagePayload）；complete() 非流式出口归一化 choices[0].message.reasoning_content -> 顶层 reasoning，保持 choices[0].message 与非流式同构（reasoning 不得进入发往模型的 messages，D2 红线）。v1.12（streamingLatencyFixPlan Phase1/T1.1）：iterSseData 改优先 read1(4096)（getattr fallback read），修复 chunked SSE 上 read(amt) 阻塞凑批导致的「长时间真空后一次性喷出」。v1.13：默认 User-Agent 为 OpenAI/JS 6.26.0，避免 urllib 自动带上 Python-urllib/x.y；models.yaml 自定义 headers 仍可覆盖。
 '''
 
 from __future__ import annotations
@@ -60,8 +60,10 @@ class chatCompletionsAdapter:
     def openRequest(self, requestPayload: dict[str, Any]):
         requestUrl = self.config.baseUrl.rstrip('/') + '/chat/completions'
         requestBytes = json.dumps(requestPayload, ensure_ascii=False).encode('utf-8')
-        # 自定义头（如 User-Agent 伪装绕过中转 CF 拦截）在底，系统头始终覆盖，防误配破坏鉴权。
-        requestHeaders = dict(self.config.headers or {})
+        # 默认伪装 OpenAI 官方 JS SDK UA，避免 urllib 自动带上 Python-urllib/x.y；
+        # models.yaml 自定义 headers 覆盖同名键；Authorization/Content-Type 始终由系统覆盖。
+        requestHeaders = {'User-Agent': 'OpenAI/JS 6.26.0'}
+        requestHeaders.update(self.config.headers or {})
         requestHeaders['Authorization'] = self.auth.authorizationHeader
         requestHeaders['Content-Type'] = 'application/json'
         request = urllib.request.Request(

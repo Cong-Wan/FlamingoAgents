@@ -101,7 +101,7 @@ tools:
       properties:
         model:
           type: string
-          description: provider/model，如 volcano/deepseek-v4-flash
+          description: provider/model，如 kimi/k3
         prompt:
           type: string
           description: 交给子代理的用户任务描述

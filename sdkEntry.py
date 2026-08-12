@@ -1,6 +1,6 @@
 '''
 Author: wilbur
-Version: 1.3
+Version: 1.4
 Date: 2026-08-12
 Description: SDK 入口：可编程调用 runSdk() 或 CLI 单独运行，传入 provider/model、systemPrompt、userPrompt、validTools、workDir；
              事件流逐字打印并返回完整正文；需确认工具直接拒绝（非交互）；validTools 不传则不挂任何工具。
@@ -8,6 +8,7 @@ Description: SDK 入口：可编程调用 runSdk() 或 CLI 单独运行，传入
              --json 机器友好输出（stdout 仅一行 JSON，思维链/工具事件挪到 stderr），供子代理 function call 解析。
              v1.2 新增：--system 智能识别文件路径（传入存在的 .md 等文件路径则读取内容作为系统提示词，否则按纯文本）。
              v1.3 变更：--system 默认读取 config/systemPrompt.md，除非显式传入纯文本或其它文件路径。
+             v1.4 变更：--model 帮助示例改为 kimi/k3。
 '''
 
 import argparse
@@ -121,7 +122,7 @@ def runSdk(
 
 def parseArgs() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='FlamingoAgents SDK 入口。')
-    parser.add_argument('--model', required=True, help='provider/model，如 volcano/deepseek-v4-flash')
+    parser.add_argument('--model', required=True, help='provider/model，如 kimi/k3')
     parser.add_argument('--system', default=None, help='系统提示词：纯文本，或存在的文件路径（如 .md 文件）则读取其内容；不传则默认 config/systemPrompt.md')
     parser.add_argument('--prompt', required=True, help='用户提示词')
     parser.add_argument('--tools', default='', help='逗号分隔的工具白名单，不传则不挂工具')
