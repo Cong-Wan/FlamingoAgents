@@ -1,11 +1,12 @@
 /*
 Author: wilbur
-Version: 1.1
-Date: 2026-08-11
+Version: 1.2
+Date: 2026-08-13
 Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册表（/model 切换当前会话模型、/new 同目录新开会话），
              capture 阶段键盘拦截（§4.3，先于 chatView 的 Enter→send）；不命中指令按普通文本发送。
              另暴露 window.toast 轻提示（供 fileMention/fileExplorer 复用）。
              v1.1：修复 IME 组合态按 Enter 误执行指令（/new 执行后残留 new）——组合中放行让输入法先提交候选词，提交后再按 Enter 才执行。
+             v1.2：方向键切换 /model 列表高亮时，用面板自身 scrollTop 把当前项拉进 260px 视口，不带动外层滚动。
 */
 (function () {
   'use strict';
@@ -58,6 +59,20 @@ Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册
     });
     panelEl.classList.remove('hidden');
     panelOpen = true;
+    scrollActiveIntoView();
+  }
+
+  // 只改面板自身的 scrollTop，避免 scrollIntoView 沿祖先链带动整页
+  function scrollActiveIntoView() {
+    var active = panelEl.querySelector('.command-item.active');
+    if (!active) return;
+    var panelRect = panelEl.getBoundingClientRect();
+    var itemRect = active.getBoundingClientRect();
+    if (itemRect.top < panelRect.top) {
+      panelEl.scrollTop -= panelRect.top - itemRect.top;
+    } else if (itemRect.bottom > panelRect.bottom) {
+      panelEl.scrollTop += itemRect.bottom - panelRect.bottom;
+    }
   }
 
   function closePanel() {

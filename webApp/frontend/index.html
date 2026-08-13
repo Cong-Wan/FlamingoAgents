@@ -1,12 +1,13 @@
 <!--
 Author: wilbur
-Version: 1.3
-Date: 2026-08-12
+Version: 1.4
+Date: 2026-08-13
 Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局骨架：侧栏 + 主区 + 弹层 + 登录门）。
              v1.1 迭代一：新建弹窗加探建内联确认区；侧栏浅色化 + 收缩/悬浮展开按钮；设置页改 tab + 整页表单 + 固定保存栏；用量页加费用卡与 Chart.js 图表区。
              v1.2 迭代二（方案 webAppIteration2Plan §4）：favicon 与 flamingo2 头像；聊天页改双栏（chat-center + 右侧文件树 filePanel）；
              composer 加附件 chip 区、/@面板容器、两行状态栏；新增文件预览弹层；引入 highlight.js 与 4 个新 JS 模块。
              v1.3 聊天页 topbar 末尾加 streamIndicator 穿梭灯条节点（模型输出中/attach 时显示）。
+             v1.4 上传 models.json 导入：设置页加「从 pi 导入」按钮与可隐藏面板（文件选择 / 三开关 / 预览 / 应用 / 取消 / 报告）。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -97,12 +98,28 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
         <header class="topbar"><span class="topbar-title">模型配置</span></header>
         <div class="page-body settings-body">
           <div class="settings-notice">与 CLI 共用 <code>config/models.yaml</code>，保存后立即生效（已建会话下次发消息时按新配置重建）。</div>
+          <div id="piImportPanel" class="pi-import-panel hidden">
+            <div class="settings-field">
+              <label class="form-label">选择 models.json</label>
+              <input id="piImportFile" class="form-input" type="file" accept="application/json,.json">
+            </div>
+            <label><input id="piOverwriteModels" type="checkbox"> 覆盖已有同名模型</label>
+            <label><input id="piOverwriteProviderFields" type="checkbox"> 覆盖已有 provider 的 baseUrl/headers</label>
+            <label><input id="piOverwriteApiKey" type="checkbox"> 用文件中的 apiKey 覆盖已有密钥（仅当文件密钥非空）</label>
+            <div>
+              <button id="piImportPreviewButton" class="btn" type="button" disabled>预览转换</button>
+              <button id="piImportApplyButton" class="btn btn-primary" type="button" disabled>应用到编辑区</button>
+              <button id="piImportCancelButton" class="btn" type="button">取消</button>
+            </div>
+            <div id="piImportReport" class="pi-import-report"></div>
+          </div>
           <div id="settingsError" class="error-bar settings-error hidden"></div>
           <div id="providerTabs" class="provider-tabs"></div>
           <div id="providerForm" class="provider-form"></div>
         </div>
         <footer class="settings-savebar">
           <span id="settingsDirtyHint" class="settings-dirty-hint hidden">有未保存修改</span>
+          <button id="importPiModelsButton" class="btn" type="button">从 pi 导入</button>
           <button id="resetModelsButton" class="btn">重置</button>
           <button id="saveModelsButton" class="btn btn-primary">保存</button>
         </footer>

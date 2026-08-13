@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.4
-Date: 2026-08-12
+Version: 1.5
+Date: 2026-08-13
 Description: SDK 入口：可编程调用 runSdk() 或 CLI 单独运行，传入 provider/model、systemPrompt、userPrompt、validTools、workDir；
              事件流逐字打印并返回完整正文；需确认工具直接拒绝（非交互）；validTools 不传则不挂任何工具。
              v1.1 新增：venv 自举（相对脚本位置定位 .venv/bin/python 重执行，跨机器迁移零配置）；
@@ -9,6 +9,7 @@ Description: SDK 入口：可编程调用 runSdk() 或 CLI 单独运行，传入
              v1.2 新增：--system 智能识别文件路径（传入存在的 .md 等文件路径则读取内容作为系统提示词，否则按纯文本）。
              v1.3 变更：--system 默认读取 config/systemPrompt.md，除非显式传入纯文本或其它文件路径。
              v1.4 变更：--model 帮助示例改为 kimi/k3。
+             v1.5 变更：maxModelSteps 改为 -1，子代理不再被 20 步硬截断。
 '''
 
 import argparse
@@ -105,7 +106,7 @@ def runSdk(
         toolNames=validTools if validTools else [],
         debug=debug,
     )
-    flamingo.maxModelSteps = 20
+    flamingo.maxModelSteps = -1
 
     out = sys.stderr if quiet else sys.stdout
     sessionId = flamingo.createSessionId()

@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.6
-Date: 2026-08-11
+Version: 1.7
+Date: 2026-08-13
 Description: FastAPI 应用与全部路由：认证依赖、统一异常映射（库 RuntimeError → 400 透传中文消息）、sessionId 入口校验、SSE 对话流、静态文件容忍空目录挂载。
             v1.1 随包改名调整 import（webApp.backend.*）；静态目录由 static/ 改为 webApp/frontend/，projectRoot 随目录加深改为 parents[2]。
             v1.2 迭代一（契约 v1.2 §3.3/§3.4/§3.10）：新增 probeWorkDir 与 usage/series 端点；create 会话 workDir 改必填 + allowCreate，
@@ -12,10 +12,12 @@ Description: FastAPI 应用与全部路由：认证依赖、统一异常映射�
             v1.5 lastUsage 优先 sessions 索引，缺省回退 usageTurns 最近一条（重启/升级前会话不丢增量）。
             v1.6 多窗口并行（multiWindowStreamingPlan §4.3）：chatStream/chatConfirm 启动泵前采样 baseCount 并传 meta；
             新增 POST /api/chat/attach（404=无活跃流；SSE 首帧 streamResume + 回放 + 实时）；sseResponse 走订阅队列。
+            v1.7 上传 models.json 导入：新增 POST /api/models/importPi（只收 rawText，纯转换不读盘不写盘）。
 '''
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -30,6 +32,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from flamingoAgents.models.modelConfig import loadModelConfigFromYaml
 
 from webApp.backend import agentManager, fileBrowser, historyView, modelConfigStore, sessionStore, usageStore
+from webApp.backend.piModelsImport import convertPiDocument
 from webApp.backend.auth import authDependency, checkToken
 from webApp.backend.sseCodec import sseGen
 
@@ -397,6 +400,21 @@ def putModels(body: dict = Body(...)):
     modelConfigStore.writeModelsConfig(body)
     agentManager.invalidateAllAgents()
     return {'ok': True}
+
+
+@authedApi.post('/models/importPi')
+def importPiModels(body: dict = Body(...)):
+    rawText = body.get('rawText') if isinstance(body, dict) else None
+    if not isinstance(rawText, str) or not rawText.strip():
+        raise HTTPException(status_code=400, detail='请上传 models.json 文件。')
+    try:
+        parsed = json.loads(rawText)
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=400, detail=f'models.json 不是合法 JSON：{error}')
+    if not isinstance(parsed, dict) or not isinstance(parsed.get('providers'), dict):
+        raise HTTPException(status_code=400, detail='models.json 必须是包含 providers 对象的 JSON。')
+    providers, report = convertPiDocument(parsed)
+    return {'providers': providers, 'report': report}
 
 
 @authedApi.post('/chat/stream')

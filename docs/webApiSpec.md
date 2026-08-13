@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.8
-> Date: 2026-08-12
+> Version: 1.9
+> Date: 2026-08-13
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 8 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -15,6 +15,7 @@
 > v1.6：状态栏修复（statusBarUsageFixPlan）——§3.10 费用公式修正为 prompt 减 cached 后不重复计费；§3.14 反转 v1.5 读取指引（状态栏 ↑↓⚡ 自 statusBar v1.3 起改读 `usage` 会话累计 + 前端减法归一化，`lastUsage` 保留但状态栏不再使用）。
 > v1.7：多窗口并行（multiWindowStreamingPlan）——新增 §4.5 attach 回放式重连端点；§4.3 事件集新增 `streamResume`（attach 专属首帧）与 `errorType: "stopped"`（跨窗口停止广播）；§4.4 stop 语义补 stopped 终态广播；§5 状态机重进会话改 attach 续播；§6 移除「无 SSE 重连」声明。
 > v1.8：模型调用重试——§4.3 事件集新增非终态 `retryNotice`（连接建立期失败退避通知；进泵内存 history 可 attach 回放，不落 jsonl；中途断流不重试）。
+> v1.9：上传 pi models.json 导入——新增 §3.18 POST /api/models/importPi（只收 rawText；不读盘不写盘；响应 providers 含上传文件明文 apiKey，鉴权内有意为之）。
 
 ---
 
@@ -406,6 +407,53 @@
 
 - 200：`{ "path": "src/a.py", "size": 1234, "content": "<utf-8 文本>" }`（`errors='replace'` 解码）；
 - 400：路径越拘禁 / 不是文件 / 超过 512KB / 含 NUL 字节（二进制）/ 不存在或不可读；404：会话不存在。
+
+### 3.18 POST /api/models/importPi —— 预览用户上传的 pi models.json（不写盘、不读盘）
+
+鉴权：与其它 `/api/*` 相同。
+
+请求：
+
+```json
+{ "rawText": "{ ... pi models.json 原文 ... }" }
+```
+
+| 字段 | 规则 |
+|---|---|
+| `rawText` | 必填非空字符串，服务端 `json.loads` |
+
+缺字段 / 非字符串 / 空白 → 400 `请上传 models.json 文件。`
+
+**红线**：端点**只认请求体里的 JSON 文本**。不读 `~/.pi/**`、不接收服务器本地 path、不提供「读取本机默认文件」开关。出现 `path` / `useDefaultPath` / `document` 等未知字段一律忽略，不当作输入。
+
+200：
+
+```json
+{
+  "providers": { "...flamingo §2.4 形状，apiKey 为上传文件原值（明文或 $ 引用，不做 __KEEP__ 脱敏）..." },
+  "report": {
+    "importedProviders": ["deepseek"],
+    "importedModels": [{ "providerId": "deepseek", "modelId": "deepseek-v4-flash" }],
+    "skippedProviders": [{ "id": "huoshan", "reason": "api 为 anthropic-messages，当前仅支持 openai-completions。" }],
+    "skippedModels": [],
+    "warnings": [
+      "provider「sub2api_gpt」模型「gpt-5.6-sol」的 cost.tiers 已忽略（flamingo 不支持分档计价）。",
+      "provider「kimi」的 compat 已忽略。"
+    ]
+  }
+}
+```
+
+- 不回 `source` / `path`（没有默认路径这回事）。
+- `providers`：**不是**脱敏后的 GET 形状。apiKey 保持上传文件原值，方便「新建 provider」写入工作副本。已有 provider 是否采用该 key 由前端合并策略决定。**响应含上传文件明文 apiKey，鉴权内有意为之。**
+- `providers` 允许为空对象（全部被跳过也是 200，报告里写原因）。前端据此禁用「应用到编辑区」。
+
+400：
+
+- JSON 文本非法：`models.json 不是合法 JSON：…`
+- 顶层不是对象 / 无 `providers` 对象：`models.json 必须是包含 providers 对象的 JSON。`
+
+无副作用：不读不写 `models.yaml`、不读 `~/.pi/**`、不动 agent 缓存。
 
 ## 4. SSE 流式接口
 

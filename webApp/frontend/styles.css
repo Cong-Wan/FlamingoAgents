@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.8
-Date: 2026-08-12
+Version: 1.9
+Date: 2026-08-13
 Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅色侧栏 + 浅色主区）。
              v1.1 迭代一：侧栏浅色系并清理硬编码深色；侧栏收缩/悬浮展开按钮；设置页整页表单（tab 条/全宽字段/模型折叠卡片/固定保存栏）；用量页费用卡与图表区。
              v1.2 迭代二（方案 §4）：聊天页双栏（chat-center + 右侧 filePanel 文件树）；composer 改纵向（chip 区 + 输入行 + 两行状态栏）；
@@ -12,6 +12,7 @@ Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅�
              v1.6 取消文件预览字符截断限制，移除 .preview-truncated 样式。
              v1.7 markdown 代码块改为浅色背景（.gray-block + 浅边框），避免深色 pre 在浅色主区里很突允。
              v1.8 聊天页 topbar 底边模型输出穿梭灯条（.stream-indicator + streamShuttle 动画）。
+             v1.9 上传 models.json 导入：设置页 pi 导入面板边框/间距与报告区。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -486,6 +487,9 @@ img.chat-empty-logo { width: 72px; height: 72px; border-radius: 50%; object-fit:
   background: #fff8e6; border: 1px solid #f3e2ac; color: #8a6d1a;
   border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 16px;
 }
+.pi-import-panel { border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 16px; }
+.pi-import-panel label { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 8px 0; }
+.pi-import-report { font-size: 13px; white-space: pre-wrap; margin-top: 12px; color: var(--text-dim); }
 .settings-error { margin: 0 0 16px; }
 .provider-tabs {
   display: flex; gap: 6px; flex-wrap: wrap;

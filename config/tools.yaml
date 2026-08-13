@@ -95,7 +95,7 @@ tools:
             - 'pathlib\.[A-Za-z0-9_\.]+\.(unlink|rmdir)\s*\('
 
   - name: askSubAgent
-    description: "调用子代理完成独立子任务。子代理在独立会话中运行，可使用指定模型与工具，返回最终文本回复。注意：tools 仅支持 read/write/edit/bash，不要传 askSubAgent（避免无限嵌套）。"
+    description: "调用子代理完成独立子任务。子代理在独立会话中运行，可使用指定模型与工具，返回最终文本回复。注意：tools 仅支持 read/write/edit/bash，不要传 askSubAgent（避免无限嵌套）。可按任务复杂度传入 timeout（秒，默认 600，上限 3600）。"
     parameters:
       type: object
       properties:
@@ -114,6 +114,12 @@ tools:
         workDir:
           type: string
           description: 子代理工作目录，留空则用当前工作目录
+        timeout:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          default: 600
+          description: 子进程硬超时（秒）。按任务复杂度传入：短问答 60–180，常规编码 300–600，长审 / 多轮工具 900–3600。不传默认 600。
       required:
         - model
         - prompt

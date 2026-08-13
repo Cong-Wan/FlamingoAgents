@@ -1,10 +1,11 @@
 /*
 Author: wilbur
-Version: 1.2
-Date: 2026-08-07
+Version: 1.3
+Date: 2026-08-13
 Description: fetch 封装：自动带 Bearer token；任意请求 401 → 清 token → 登录门（契约 §1.1/§3.1/§5）。
              v1.1 迭代一：新增 probeWorkDir（§3.4）与 getUsageSeries（§3.10）。
              v1.2 迭代二（方案 §4.9）：新增 getSessionStatus / updateSessionModel / listFiles / getFileContent。
+             v1.3 上传 models.json 导入：新增 importPiModels → POST /api/models/importPi { rawText }。
 */
 (function () {
   'use strict';
@@ -95,6 +96,9 @@ Description: fetch 封装：自动带 Bearer token；任意请求 401 → 清 to
     },
     getModels: function () { return request('/api/models'); },
     putModels: function (config) { return request('/api/models', { method: 'PUT', body: config }); },
+    importPiModels: function (rawText) {
+      return request('/api/models/importPi', { method: 'POST', body: { rawText: rawText } });
+    },
 
     // 迭代二：状态栏 / /model 指令 / 文件浏览器与@附件
     getSessionStatus: function (sessionId) {

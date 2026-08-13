@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.4
-Date: 2026-08-11
+Version: 1.5
+Date: 2026-08-13
 Description: 模型配置编辑页：整页表单化（§11.3）——顶部 provider tab 条 + 全宽纵向字段 + 模型折叠卡片 +
              底部固定保存/重置栏。内存工作副本：open 时 GET 一次，tab 切换不重拉（脏数据 confirm 提示），
              重置 = 放弃修改重拉，保存 = 工作副本全量 PUT（契约 §2.4/§3.11/§3.12）。
@@ -9,6 +9,7 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
              v1.2：provider 级新增 headers 自定义请求头编辑（每行 Key: Value；空=删除该字段；可用于伪装 UA 绕过中转 CF 拦截）。
              v1.3：新增 provider 改名时仅刷新 tab，避免每输入一个字符重建表单并导致 providerId 输入框失焦。
              v1.4：新增 provider 的名称默认为空；模型表单隐藏 reasoning/thinking.type，仅保留思考强度选择。
+             v1.5：上传 models.json 导入：设置页面板选择文件，预览/应用走 POST /api/models/importPi + mergePiImport 合进工作副本。
 */
 (function () {
   'use strict';
@@ -36,6 +37,16 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
   var saveButton = document.getElementById('saveModelsButton');
   var resetButton = document.getElementById('resetModelsButton');
   var dirtyHintEl = document.getElementById('settingsDirtyHint');
+  var importPiModelsButton = document.getElementById('importPiModelsButton');
+  var piImportPanel = document.getElementById('piImportPanel');
+  var piImportFile = document.getElementById('piImportFile');
+  var piOverwriteModels = document.getElementById('piOverwriteModels');
+  var piOverwriteProviderFields = document.getElementById('piOverwriteProviderFields');
+  var piOverwriteApiKey = document.getElementById('piOverwriteApiKey');
+  var piImportPreviewButton = document.getElementById('piImportPreviewButton');
+  var piImportApplyButton = document.getElementById('piImportApplyButton');
+  var piImportCancelButton = document.getElementById('piImportCancelButton');
+  var piImportReport = document.getElementById('piImportReport');
 
   var modelConfig = null;       // GET /api/models 原始返回（编辑工作副本，tab 切换不重拉）
   var fetchedApiKeys = {};      // providerId → GET 返回的 apiKey 原值（判断是否为「新输入」）
@@ -43,6 +54,7 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
   var newProviderIds = {};      // 新建中的 provider（providerId 字段可编辑）
   var expandedModels = [];      // 展开的模型卡片（按对象引用）
   var dirty = false;            // 有未保存修改
+  var cachedImport = null;      // {providers, report} 当前文件的转换结果
 
   function showError(message) {
     errorEl.textContent = message;
@@ -477,6 +489,282 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
     render();
   }
 
+  /* ---------- 上传 models.json 导入（方案 §4 / D5 / D6） ---------- */
+
+  function deepCopy(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function mergePiImport(working, imported, policy, dryRun) {
+    var schemaKeys = [
+      'id', 'name', 'input', 'contextWindow', 'maxTokens',
+      'reasoning', 'thinking', 'reasoningEffort', 'cost', 'headers'
+    ];
+    var addedProviders = [];
+    var addedModels = [];
+    var overwrittenModels = [];
+    var skippedExistingModels = [];
+    var keptApiKeysBecauseEmpty = [];
+    var importedProviders = (imported && imported.providers) || imported || {};
+    var workingProviders = (working && working.providers) || {};
+    if (!dryRun) {
+      if (!working.providers || typeof working.providers !== 'object') working.providers = {};
+      workingProviders = working.providers;
+    }
+    Object.keys(importedProviders).forEach(function (providerId) {
+      var importedProvider = importedProviders[providerId];
+      if (!importedProvider || typeof importedProvider !== 'object') return;
+      var existing = Object.prototype.hasOwnProperty.call(workingProviders, providerId)
+        ? workingProviders[providerId]
+        : null;
+      if (!existing) {
+        addedProviders.push(providerId);
+        var newProviderModels = Array.isArray(importedProvider.models) ? importedProvider.models : [];
+        newProviderModels.forEach(function (newModel) {
+          if (newModel && newModel.id) addedModels.push({ providerId: providerId, modelId: newModel.id });
+        });
+        if (!dryRun) {
+          workingProviders[providerId] = deepCopy(importedProvider);
+          newProviderIds[providerId] = true;
+        }
+        return;
+      }
+      if (!dryRun) {
+        if (policy.overwriteProviderFields) {
+          existing.baseUrl = importedProvider.baseUrl;
+          if (Object.prototype.hasOwnProperty.call(importedProvider, 'headers')) {
+            existing.headers = deepCopy(importedProvider.headers);
+          } else {
+            existing.headers = {};
+          }
+        }
+        if (policy.overwriteApiKey) {
+          if (typeof importedProvider.apiKey === 'string' && importedProvider.apiKey) {
+            existing.apiKey = importedProvider.apiKey;
+          } else {
+            keptApiKeysBecauseEmpty.push(providerId);
+          }
+        }
+        existing.api = 'openai-completions';
+        if (!Array.isArray(existing.models)) existing.models = [];
+      } else if (policy.overwriteApiKey) {
+        if (!(typeof importedProvider.apiKey === 'string' && importedProvider.apiKey)) {
+          keptApiKeysBecauseEmpty.push(providerId);
+        }
+      }
+      var existingModels = (existing && Array.isArray(existing.models)) ? existing.models : [];
+      var importedModels = Array.isArray(importedProvider.models) ? importedProvider.models : [];
+      importedModels.forEach(function (newModel) {
+        if (!newModel || typeof newModel !== 'object' || !newModel.id) return;
+        var foundIndex = -1;
+        for (var i = 0; i < existingModels.length; i++) {
+          if (existingModels[i] && existingModels[i].id === newModel.id) {
+            foundIndex = i;
+            break;
+          }
+        }
+        if (foundIndex === -1) {
+          addedModels.push({ providerId: providerId, modelId: newModel.id });
+          if (!dryRun) existing.models.push(deepCopy(newModel));
+          return;
+        }
+        if (!policy.overwriteModels) {
+          skippedExistingModels.push({ providerId: providerId, modelId: newModel.id });
+          return;
+        }
+        overwrittenModels.push({ providerId: providerId, modelId: newModel.id });
+        if (dryRun) return;
+        var oldModel = existing.models[foundIndex];
+        var replaced = {};
+        Object.keys(oldModel).forEach(function (key) {
+          if (schemaKeys.indexOf(key) === -1) replaced[key] = oldModel[key];
+        });
+        var copy = deepCopy(newModel);
+        Object.keys(copy).forEach(function (key) { replaced[key] = copy[key]; });
+        if (!Object.prototype.hasOwnProperty.call(newModel, 'thinking')) delete replaced.thinking;
+        if (!Object.prototype.hasOwnProperty.call(newModel, 'reasoningEffort')) delete replaced.reasoningEffort;
+        if (!Object.prototype.hasOwnProperty.call(newModel, 'headers')) replaced.headers = {};
+        existing.models[foundIndex] = replaced;
+      });
+    });
+    return {
+      addedProviders: addedProviders,
+      addedModels: addedModels,
+      overwrittenModels: overwrittenModels,
+      skippedExistingModels: skippedExistingModels,
+      keptApiKeysBecauseEmpty: keptApiKeysBecauseEmpty
+    };
+  }
+
+  function readImportPolicy() {
+    return {
+      overwriteModels: !!piOverwriteModels.checked,
+      overwriteProviderFields: !!piOverwriteProviderFields.checked,
+      overwriteApiKey: !!piOverwriteApiKey.checked
+    };
+  }
+
+  function readSelectedFileText() {
+    return new Promise(function (resolve, reject) {
+      var file = piImportFile.files && piImportFile.files[0];
+      if (!file) {
+        reject(new Error('请选择 models.json 文件。'));
+        return;
+      }
+      var reader = new FileReader();
+      reader.onload = function () {
+        var text = typeof reader.result === 'string' ? reader.result : '';
+        if (!text.trim()) {
+          reject(new Error('文件为空或全是空白字符。'));
+          return;
+        }
+        resolve(text);
+      };
+      reader.onerror = function () {
+        reject(new Error('读取文件失败。'));
+      };
+      reader.readAsText(file, 'UTF-8');
+    });
+  }
+
+  function hasSelectedImportFile() {
+    return !!(piImportFile.files && piImportFile.files[0]);
+  }
+
+  function syncImportButtons() {
+    var hasFile = hasSelectedImportFile();
+    piImportPreviewButton.disabled = !hasFile;
+    if (!hasFile) {
+      piImportApplyButton.disabled = true;
+      return;
+    }
+    if (cachedImport && Object.keys(cachedImport.providers || {}).length === 0) {
+      piImportApplyButton.disabled = true;
+      return;
+    }
+    piImportApplyButton.disabled = false;
+  }
+
+  function formatIdList(items) {
+    if (!items || items.length === 0) return '（无）';
+    return items.join('、');
+  }
+
+  function formatPairList(items) {
+    if (!items || items.length === 0) return '（无）';
+    return items.map(function (item) {
+      return item.providerId + '/' + item.modelId;
+    }).join('、');
+  }
+
+  function formatSkippedList(items) {
+    if (!items || items.length === 0) return '（无）';
+    return items.map(function (item) {
+      var id = item.id || item.modelId || '';
+      var prefix = item.providerId ? (item.providerId + '/' + id) : id;
+      return prefix + (item.reason ? '（' + item.reason + '）' : '');
+    }).join('\n  ');
+  }
+
+  function formatEndpointReport(report) {
+    report = report || {};
+    var warnings = report.warnings || [];
+    var lines = [
+      '【转换报告】',
+      '可导入 provider：' + formatIdList(report.importedProviders),
+      '可导入模型：' + formatPairList(report.importedModels),
+      '跳过 provider：' + formatSkippedList(report.skippedProviders),
+      '跳过模型：' + formatSkippedList(report.skippedModels),
+      '警告：' + (warnings.length ? ('\n  ' + warnings.join('\n  ')) : '（无）')
+    ];
+    return lines.join('\n');
+  }
+
+  function formatDryRunReport(stats) {
+    var lines = [
+      '【相对当前编辑区】',
+      '将新增 provider：' + formatIdList(stats.addedProviders),
+      '将新增模型：' + formatPairList(stats.addedModels),
+      '将覆盖模型：' + formatPairList(stats.overwrittenModels),
+      '因同名未开覆盖而跳过：' + formatPairList(stats.skippedExistingModels),
+      '因文件密钥为空而保留现有密钥：' + formatIdList(stats.keptApiKeysBecauseEmpty)
+    ];
+    return lines.join('\n');
+  }
+
+  function showImportPanelError(message) {
+    piImportReport.textContent = message || '导入失败。';
+  }
+
+  function openImportPanel() {
+    if (!modelConfig) return;
+    piImportPanel.classList.remove('hidden');
+    syncImportButtons();
+  }
+
+  function closeImportPanel() {
+    piImportPanel.classList.add('hidden');
+    piImportFile.value = '';
+    piImportReport.textContent = '';
+    cachedImport = null;
+    syncImportButtons();
+  }
+
+  async function ensureCachedImport() {
+    if (cachedImport) return cachedImport;
+    var rawText = await readSelectedFileText();
+    cachedImport = await window.api.importPiModels(rawText);
+    return cachedImport;
+  }
+
+  async function previewPiImport() {
+    if (!modelConfig) return;
+    piImportReport.textContent = '';
+    try {
+      var result = await ensureCachedImport();
+      var providers = (result && result.providers) || {};
+      syncImportButtons();
+      var stats = mergePiImport(modelConfig, providers, readImportPolicy(), true);
+      piImportReport.textContent = formatEndpointReport(result.report) + '\n\n' + formatDryRunReport(stats);
+    } catch (error) {
+      cachedImport = null;
+      syncImportButtons();
+      showImportPanelError(error.message);
+    }
+  }
+
+  async function applyPiImport() {
+    if (!modelConfig) return;
+    if (dirty && !window.confirm('将在当前未保存修改上继续导入。继续？')) return;
+    try {
+      var result = await ensureCachedImport();
+      var providers = (result && result.providers) || {};
+      if (Object.keys(providers).length === 0) {
+        syncImportButtons();
+        showImportPanelError(formatEndpointReport(result.report) + '\n\n转换结果没有可导入的 provider，未改动编辑区。');
+        return;
+      }
+      var hadNoTab = currentProviderId == null;
+      var stats = mergePiImport(modelConfig, providers, readImportPolicy(), false);
+      if (hadNoTab && stats.addedProviders.length > 0) {
+        currentProviderId = stats.addedProviders[0];
+      }
+      markDirty();
+      render();
+      window.alert(
+        '已应用到编辑区（尚未保存）。\n' +
+        '新增 provider：' + stats.addedProviders.length + '\n' +
+        '新增模型：' + stats.addedModels.length + '\n' +
+        '覆盖模型：' + stats.overwrittenModels.length + '\n' +
+        '跳过已有模型：' + stats.skippedExistingModels.length + '\n' +
+        '因文件密钥为空而保留现有密钥：' + stats.keptApiKeysBecauseEmpty.length
+      );
+      closeImportPanel();
+    } catch (error) {
+      showImportPanelError(error.message);
+    }
+  }
+
   window.settingsView = {
     // open 时 GET 一次存工作副本；之后 tab 切换不重拉
     open: async function () {
@@ -487,6 +775,7 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
       dirtyHintEl.classList.add('hidden');
       newProviderIds = {};
       expandedModels = [];
+      closeImportPanel();
       try {
         modelConfig = await window.api.getModels();
         fetchedApiKeys = {};
@@ -513,4 +802,21 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
 
   saveButton.addEventListener('click', save);
   resetButton.addEventListener('click', reset);
+  importPiModelsButton.addEventListener('click', openImportPanel);
+  piImportCancelButton.addEventListener('click', closeImportPanel);
+  piImportFile.addEventListener('change', function () {
+    piImportReport.textContent = '';
+    cachedImport = null;
+    syncImportButtons();
+  });
+  function refreshDryRunIfPreviewed() {
+    if (!cachedImport || !modelConfig) return;
+    var stats = mergePiImport(modelConfig, cachedImport.providers || {}, readImportPolicy(), true);
+    piImportReport.textContent = formatEndpointReport(cachedImport.report) + '\n\n' + formatDryRunReport(stats);
+  }
+  piOverwriteModels.addEventListener('change', refreshDryRunIfPreviewed);
+  piOverwriteProviderFields.addEventListener('change', refreshDryRunIfPreviewed);
+  piOverwriteApiKey.addEventListener('change', refreshDryRunIfPreviewed);
+  piImportPreviewButton.addEventListener('click', previewPiImport);
+  piImportApplyButton.addEventListener('click', applyPiImport);
 })();

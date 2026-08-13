@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.5
-Date: 2026-08-12
-Description: Provides executable handlers (execute/preview) for built-in tools and a name-keyed registry mapping them to schema-driven tool definitions. Schemas and permissions come from config/tools.yaml. v1.4 adds askSubAgent: wraps sdkEntry.py as a sub-agent function call (600s timeout, JSON stdout parsed into toolOutput). v1.5: askSubAgent omits --system when not provided so the sub-agent falls back to the default config/systemPrompt.md.
+Version: 1.6
+Date: 2026-08-13
+Description: Provides executable handlers (execute/preview) for built-in tools and a name-keyed registry mapping them to schema-driven tool definitions. Schemas and permissions come from config/tools.yaml. v1.4 adds askSubAgent: wraps sdkEntry.py as a sub-agent function call (JSON stdout parsed into toolOutput). v1.5: askSubAgent omits --system when not provided so the sub-agent falls back to the default config/systemPrompt.md. v1.6: askSubAgent timeout is a passthrough argument (default 600s, max 3600s) instead of a hardcoded 600s.
 '''
 
 from __future__ import annotations
@@ -20,7 +20,8 @@ from flamingoAgents.tools.toolDefinition import defineTool, toolDefinition, tool
 
 maxTimeoutSeconds = 120
 defaultTimeoutSeconds = 30
-subAgentTimeoutSeconds = 600
+defaultSubAgentTimeoutSeconds = 600
+maxSubAgentTimeoutSeconds = 3600
 
 
 # --- read ---
@@ -243,7 +244,8 @@ sdkEntryPath = Path(__file__).resolve().parents[2] / 'sdkEntry.py'
 def previewAskSubAgentTool(arguments: dict[str, Any]) -> str:
     model = str(arguments.get('model', ''))
     prompt = str(arguments.get('prompt', ''))
-    return f'{model} prompt={prompt[:60]}'
+    timeout = arguments.get('timeout', defaultSubAgentTimeoutSeconds)
+    return f'{model} timeout={timeout} prompt={prompt[:60]}'
 
 
 def askSubAgentTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:
@@ -253,6 +255,12 @@ def askSubAgentTool(arguments: dict[str, Any], context: toolContext) -> toolOutp
         return toolOutput(content='askSubAgent.model 必须是 provider/model 格式。', isError=True)
     if not prompt:
         return toolOutput(content='askSubAgent.prompt 不能为空。', isError=True)
+
+    timeout = int(arguments.get('timeout', defaultSubAgentTimeoutSeconds))
+    if timeout < 1:
+        timeout = defaultSubAgentTimeoutSeconds
+    if timeout > maxSubAgentTimeoutSeconds:
+        timeout = maxSubAgentTimeoutSeconds
 
     command = [
         sys.executable, str(sdkEntryPath),
@@ -272,18 +280,24 @@ def askSubAgentTool(arguments: dict[str, Any], context: toolContext) -> toolOutp
     command += ['--work-dir', workDir]
 
     if context.debugConsole:
-        context.debugConsole.debug(f'子代理开始 model={model} workDir={workDir} tools={tools or "<none>"}')
+        context.debugConsole.debug(f'子代理开始 model={model} workDir={workDir} tools={tools or "<none>"} timeout={timeout}')
     try:
         completedProcess = subprocess.run(
             command,
             cwd=str(context.workDir),
             capture_output=True,
             text=True,
-            timeout=subAgentTimeoutSeconds,
+            timeout=timeout,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return toolOutput(content=f'子代理超时被终止（{subAgentTimeoutSeconds}s）。', isError=True)
+        if context.debugConsole:
+            context.debugConsole.debug(f'子代理超时 model={model} timeout={timeout}')
+        return toolOutput(
+            content=f'子代理超时被终止（{timeout}s）。',
+            isError=True,
+            details={'timeout': timeout, 'timeoutExpired': True, 'model': model},
+        )
 
     # stdout 最后一行是 --json 输出的单行 JSON。
     stdoutLines = [line for line in completedProcess.stdout.splitlines() if line.strip()]
@@ -297,13 +311,13 @@ def askSubAgentTool(arguments: dict[str, Any], context: toolContext) -> toolOutp
     error = payload.get('error')
     isError = completedProcess.returncode != 0 or error is not None
     if context.debugConsole:
-        context.debugConsole.debug(f'子代理完成 exitCode={completedProcess.returncode} isError={isError}')
+        context.debugConsole.debug(f'子代理完成 exitCode={completedProcess.returncode} isError={isError} timeout={timeout}')
     if isError:
         content = f'子代理失败 exitCode={completedProcess.returncode}：{error or (completedProcess.stderr.strip()[:500] or "未知错误")}'
         return toolOutput(content=content, isError=True)
     return toolOutput(
         content=str(reply),
-        details={'model': model, 'workDir': workDir, 'tools': tools, 'exitCode': completedProcess.returncode},
+        details={'model': model, 'workDir': workDir, 'tools': tools, 'exitCode': completedProcess.returncode, 'timeout': timeout},
     )
 
 
