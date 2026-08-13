@@ -1,9 +1,10 @@
 '''
 Author: wilbur
-Version: 1.5
-Date: 2026-08-12
+Version: 1.6
+Date: 2026-08-13
 Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.4 adds streaming structures (docs/streamOutputPlan.md §6.2): 3 adapter-layer chunks (textChunk/reasoningChunk/finalChunk) and 7 agent event classes (textDeltaEvent/reasoningDeltaEvent/toolCallStartEvent/toolCallEndEvent/confirmationRequiredEvent/completedEvent/errorEvent) plus the terminalEventTypes tuple.
              v1.5 新增 retryNoticeEvent（模型调用重试非终态事件，不进 terminalEventTypes）。
+             v1.6 新增 modelInterruptedError（用户中断信号：shutdown 唤醒/退避打断专用，非模型错误，非 modelRequestError 子类）。
 '''
 
 from __future__ import annotations
@@ -91,6 +92,11 @@ class reasoningChunk:
 class finalChunk:
     # completion 为 models.chatCompletions.modelCompletion，此处用 Any 避免 core → models 的循环导入。
     completion: Any
+
+
+# 用户中断信号：shutdown 唤醒/退避打断专用，非模型错误
+class modelInterruptedError(Exception):
+    pass
 
 
 # ---------- agent 事件流 ----------

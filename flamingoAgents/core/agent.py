@@ -1,12 +1,13 @@
 '''
 Author: wilbur
-Version: 1.14
+Version: 1.16
 Date: 2026-08-13
-Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. v1.10 adds the event-stream API (docs/streamOutputPlan.md §6, v2.3 定稿): runUserMessageStream/continueConfirmationStream generators yield 7 event types with real-time text/reasoning deltas; terminal events (completed/confirmationRequired/error) are yielded only after the session lock is released; legacy sync APIs runUserMessage/continueConfirmation are kept as thin wrappers that drain the stream, map terminal events back to runResult, and accept optional onDelta/onReasoning callbacks. v1.11 调整 maxModelSteps 默认值 8 -> 32。v1.12（streamingLatencyFixPlan Phase3/D2）：driveToolBatch 改为「可执行前缀批量 Start」——从 startIndex 起连续可执行（未知或免确认）的工具先全部 yield toolCallStart，再串行 exec + toolCallEnd；遇需确认工具不发 Start，直接 setPending + confirmationRequired 终态（契约 §6.2 红线不变）。v1.13 模型调用重试：连接建立期(chunkSeen=False)可重试错误 3 次指数退避，分片可中断，retryNotice 通知前端。v1.14 maxModelSteps 支持 None/<=0 表示不限制模型循环步数。
+Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. v1.10 adds the event-stream API (docs/streamOutputPlan.md §6, v2.3 定稿): runUserMessageStream/continueConfirmationStream generators yield 7 event types with real-time text/reasoning deltas; terminal events (completed/confirmationRequired/error) are yielded only after the session lock is released; legacy sync APIs runUserMessage/continueConfirmation are kept as thin wrappers that drain the stream, map terminal events back to runResult, and accept optional onDelta/onReasoning callbacks. v1.11 调整 maxModelSteps 默认值 8 -> 32。v1.12（streamingLatencyFixPlan Phase3/D2）：driveToolBatch 改为「可执行前缀批量 Start」——从 startIndex 起连续可执行（未知或免确认）的工具先全部 yield toolCallStart，再串行 exec + toolCallEnd；遇需确认工具不发 Start，直接 setPending + confirmationRequired 终态（契约 §6.2 红线不变）。v1.13 模型调用重试：连接建立期(chunkSeen=False)可重试错误 3 次指数退避，分片可中断，retryNotice 通知前端。v1.14 maxModelSteps 支持 None/<=0 表示不限制模型循环步数。v1.15（stopResponsivenessPlan L3）：interruptEvent + interruptActiveStreams 薄封装；driveModelLoop 透传 stopEvent、except modelInterruptedError 直通 return、completion is None 先查中断、退避片末尾检查。v1.16 中断事件改按会话存储（interruptEvents dict + getInterruptEvent），修复验收发现的「一会在飞 + 他会话新流 clear 误杀在飞中断」竞态。
 '''
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from threading import RLock
@@ -20,6 +21,7 @@ from flamingoAgents.core.types import (
     confirmationRequiredEvent,
     errorEvent,
     finalChunk,
+    modelInterruptedError,
     pendingConfirm,
     reasoningChunk,
     reasoningDeltaEvent,
@@ -68,6 +70,27 @@ class agent:
         self.conversations: dict[str, conversation] = {}
         self.sessionLocks: dict[str, RLock] = {}
         self.sessionLocksGuard = RLock()
+        # 按会话的中断事件（Task A 验收修复）：单 Event 放实例上会在「一会在飞 + 他会话新流 clear」时被误清。
+        self.interruptEvents: dict[str, threading.Event] = {}
+
+    def getInterruptEvent(self, sessionId: str) -> threading.Event:
+        # 与会话锁同锁获取，保证 driveModelLoop 的 clear 与 requestStop 的 set 不会互相覆盖。
+        with self.sessionLocksGuard:
+            event = self.interruptEvents.get(sessionId)
+            if event is None:
+                event = threading.Event()
+                self.interruptEvents[sessionId] = event
+            return event
+
+    def interruptActiveStreams(self, sessionId: str):
+        self.getInterruptEvent(sessionId).set()
+        interruptFn = getattr(self.modelAdapter, 'interruptActiveStreams', None)
+        if interruptFn is None:
+            return
+        try:
+            interruptFn()
+        except Exception:
+            pass
 
     # ---------- 事件流 API（docs/streamOutputPlan.md §6.3） ----------
 
@@ -162,6 +185,8 @@ class agent:
     def driveModelLoop(self, sessionId: str) -> Iterator:
         # 调用前提：已持有会话锁。承载原 continueModelLoop 逻辑。
         # maxModelSteps 为 None 或 <=0 时不限制步数。
+        interruptEvent = self.getInterruptEvent(sessionId)
+        interruptEvent.clear()
         currentConversation = self.getConversation(sessionId)
         stepIndex = 0
         while True:
@@ -181,7 +206,7 @@ class agent:
             for attempt in range(MODEL_RETRY_MAX_ATTEMPTS + 1):
                 chunkSeen = False
                 try:
-                    for chunk in self.modelAdapter.completeStream(currentConversation.messages, modelTools):
+                    for chunk in self.modelAdapter.completeStream(currentConversation.messages, modelTools, stopEvent=interruptEvent):
                         if isinstance(chunk, textChunk):
                             chunkSeen = True
                             yield textDeltaEvent(text=chunk.text)
@@ -192,8 +217,12 @@ class agent:
                             chunkSeen = True
                             completion = chunk.completion
                     if completion is None:
+                        if interruptEvent.is_set():
+                            return
                         raise RuntimeError('模型流式响应缺少最终结果。')
                     break
+                except modelInterruptedError:
+                    return
                 except Exception as error:
                     self.logModelError(currentConversation, error)
                     statusCode = getattr(error, 'statusCode', None)
@@ -225,6 +254,8 @@ class agent:
                         sliceSeconds = min(0.1, remaining)
                         time.sleep(sliceSeconds)
                         remaining -= sliceSeconds
+                        if interruptEvent.is_set():
+                            return
                         yield retryNoticeEvent(
                             message=str(error),
                             attempt=attempt + 1,

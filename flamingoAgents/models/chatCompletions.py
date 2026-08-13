@@ -1,14 +1,16 @@
 '''
 Author: wilbur
-Version: 1.14
-Date: 2026-08-12
-Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden). v1.11（fixPlan Phase2）：流式累积 reasoningParts 并在流结束时写入顶层 responsePayload['reasoning']（非空才写，不入 messagePayload）；complete() 非流式出口归一化 choices[0].message.reasoning_content -> 顶层 reasoning，保持 choices[0].message 与非流式同构（reasoning 不得进入发往模型的 messages，D2 红线）。v1.12（streamingLatencyFixPlan Phase1/T1.1）：iterSseData 改优先 read1(4096)（getattr fallback read），修复 chunked SSE 上 read(amt) 阻塞凑批导致的「长时间真空后一次性喷出」。v1.13：默认 User-Agent 为 OpenAI/JS 6.26.0，避免 urllib 自动带上 Python-urllib/x.y；models.yaml 自定义 headers 仍可覆盖。v1.14 modelRequestError 新增 retryAfterSeconds（解析 429 Retry-After 头，秒/HTTP-date）。
+Version: 1.15
+Date: 2026-08-13
+Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden). v1.11（fixPlan Phase2）：流式累积 reasoningParts 并在流结束时写入顶层 responsePayload['reasoning']（非空才写，不入 messagePayload）；complete() 非流式出口归一化 choices[0].message.reasoning_content -> 顶层 reasoning，保持 choices[0].message 与非流式同构（reasoning 不得进入发往模型的 messages，D2 红线）。v1.12（streamingLatencyFixPlan Phase1/T1.1）：iterSseData 改优先 read1(4096)（getattr fallback read），修复 chunked SSE 上 read(amt) 阻塞凑批导致的「长时间真空后一次性喷出」。v1.13：默认 User-Agent 为 OpenAI/JS 6.26.0，避免 urllib 自动带上 Python-urllib/x.y；models.yaml 自定义 headers 仍可覆盖。v1.14 modelRequestError 新增 retryAfterSeconds（解析 429 Retry-After 头，秒/HTTP-date）。v1.15（stopResponsivenessPlan L3）：activeResponses 登记 + interruptActiveStreams shutdown 唤醒；completeStream/consumeSseStream/iterSseData 透传 stopEvent，三路径（IncompleteRead/空字节/OSError）统一 raise modelInterruptedError；interrupt 时给 response 打 _flamingoInterrupted 标记，覆盖「先 shutdown 后 set stopEvent」竞态。
 '''
 
 from __future__ import annotations
 
 import http.client
 import json
+import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -16,7 +18,7 @@ from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import Any, Iterator
 
-from flamingoAgents.core.types import chatMessage, finalChunk, reasoningChunk, textChunk, toolCall
+from flamingoAgents.core.types import chatMessage, finalChunk, modelInterruptedError, reasoningChunk, textChunk, toolCall
 from flamingoAgents.models.modelAuth import modelAuth
 from flamingoAgents.models.modelConfig import modelConfig
 
@@ -42,6 +44,23 @@ class chatCompletionsAdapter:
         self.config = config
         self.auth = auth
         self.debugConsole = debugConsole
+        self.activeResponses: set = set()
+        self.activeResponsesLock = threading.Lock()
+
+    def interruptActiveStreams(self):
+        with self.activeResponsesLock:
+            responses = list(self.activeResponses)
+        for response in responses:
+            # 先打标再 shutdown：调用方若先 interrupt 后 set stopEvent，
+            # read1 可能在 set 之前就以空字节/异常返回，必须靠标记识别中断。
+            try:
+                setattr(response, '_flamingoInterrupted', True)
+            except Exception:
+                pass
+            try:
+                response.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
 
     def buildRequestPayload(self, messages: list[chatMessage], tools: list[dict[str, Any]], stream: bool) -> dict[str, Any]:
         requestPayload: dict[str, Any] = {
@@ -127,15 +146,15 @@ class chatCompletionsAdapter:
             responsePayload=payload,
         )
 
-    def completeStream(self, messages: list[chatMessage], tools: list[dict[str, Any]]) -> Iterator:
+    def completeStream(self, messages: list[chatMessage], tools: list[dict[str, Any]], stopEvent=None) -> Iterator:
         # stream=False 回退：迭代器退化为单发 finalChunk，走现有非流式路径。
         if not self.config.stream:
             yield finalChunk(completion=self.complete(messages, tools))
             return
         requestPayload = self.buildRequestPayload(messages, tools, stream=True)
-        yield from self.consumeSseStream(requestPayload)
+        yield from self.consumeSseStream(requestPayload, stopEvent=stopEvent)
 
-    def consumeSseStream(self, requestPayload: dict[str, Any]) -> Iterator:
+    def consumeSseStream(self, requestPayload: dict[str, Any], stopEvent=None) -> Iterator:
         contentParts: list[str] = []
         toolCallAccum: dict[int, dict[str, Any]] = {}
         reasoningParts: list[str] = []
@@ -144,18 +163,26 @@ class chatCompletionsAdapter:
         chunkCount = 0
         try:
             with self.openRequest(requestPayload) as response:
-                for dataPayload in self.iterSseData(response):
-                    if dataPayload == '[DONE]':
-                        break
-                    chunkCount += 1
-                    for event in self.processSseData(dataPayload, requestPayload, contentParts, toolCallAccum, reasoningParts):
-                        if isinstance(event, dict):
-                            if event.get('model'):
-                                responseModel = event['model']
-                            if event.get('usage') is not None:
-                                usage = event['usage']
-                        else:
-                            yield event
+                with self.activeResponsesLock:
+                    self.activeResponses.add(response)
+                try:
+                    for dataPayload in self.iterSseData(response, stopEvent=stopEvent):
+                        if dataPayload == '[DONE]':
+                            break
+                        chunkCount += 1
+                        for event in self.processSseData(dataPayload, requestPayload, contentParts, toolCallAccum, reasoningParts):
+                            if isinstance(event, dict):
+                                if event.get('model'):
+                                    responseModel = event['model']
+                                if event.get('usage') is not None:
+                                    usage = event['usage']
+                            else:
+                                yield event
+                    if self._isStreamInterrupted(response, stopEvent):
+                        raise modelInterruptedError('用户已停止')
+                finally:
+                    with self.activeResponsesLock:
+                        self.activeResponses.discard(response)
         except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
             raise modelRequestError(
                 message=f'模型流式响应中断：{error}',
@@ -195,7 +222,12 @@ class chatCompletionsAdapter:
             responsePayload=responsePayload,
         ))
 
-    def iterSseData(self, response) -> Iterator[str]:
+    def _isStreamInterrupted(self, response, stopEvent) -> bool:
+        if stopEvent is not None and stopEvent.is_set():
+            return True
+        return bool(getattr(response, '_flamingoInterrupted', False))
+
+    def iterSseData(self, response, stopEvent=None) -> Iterator[str]:
         # 按字节缓冲半行，凑满一行再 decode（多字节 UTF-8 可能跨 chunk 切断）；\n 是 ASCII，不会出现在 UTF-8 多字节序列内。
         buffer = b''
         # read(amt) 在 chunked 响应上会阻塞凑满 amt 才返回，把匀速小增量攒成大批量；read1 有数据即返回（streamingLatencyFixPlan D1）。
@@ -203,7 +235,12 @@ class chatCompletionsAdapter:
         if not callable(readChunk):
             readChunk = response.read
         while True:
-            data = readChunk(4096)
+            try:
+                data = readChunk(4096)
+            except Exception:
+                if self._isStreamInterrupted(response, stopEvent):
+                    raise modelInterruptedError('用户已停止')
+                raise
             if not data:
                 break
             buffer += data
@@ -212,6 +249,8 @@ class chatCompletionsAdapter:
                 payload = self.parseSseLine(line)
                 if payload is not None:
                     yield payload
+        if self._isStreamInterrupted(response, stopEvent):
+            raise modelInterruptedError('用户已停止')
         tail = self.parseSseLine(buffer)
         if tail is not None:
             yield tail

@@ -1,8 +1,16 @@
 /*
 Author: wilbur
-Version: 1.0
-Date: 2026-08-07
-Description: 启动引导 + 登录门 + hash 路由（#/chat、#/chat/{id}、#/settings/models、#/usage）
+Version: 1.4
+Date: 2026-08-13
+Description: 启动引导 + 登录门 + hash 路由（#/chat、#/chat/{id}、#/settings/models、#/usage）。
+             v1.1（composerFocusShortcutPlan T2）：全局快捷键 Cmd+N（mac）/ Ctrl+N（win）新建应用窗口
+             （浏览器保留键拦不住时走原生行为；登录门态/弹层打开时不响应）。
+             v1.2：快捷键 N → K（Cmd+K / Ctrl+K）——N 是浏览器保留键普通标签页拦不到，
+             K 可派发可 preventDefault（GitHub/Linear 同款），拦截后不再走浏览器地址栏搜索。
+             v1.3（F2 改方案 A）：快捷键语义由「新开浏览器窗口」改为「直达新建会话弹窗」——
+             用户反馈新建窗口无 workDir 确认流程，真正诉求是快速新建会话；调 sidebarView.openNewSessionModal()。
+             v1.4（F2 discoverability）：启动时按平台渲染「新建会话」按钮的快捷键提示
+             （navigator.platform 判 mac 显 ⌘K，其余显 Ctrl+K；含 kbd 文本与 title 悬停）。
 */
 (function () {
   'use strict';
@@ -108,6 +116,28 @@ Description: 启动引导 + 登录门 + hash 路由（#/chat、#/chat/{id}、#/s
   }
 
   window.addEventListener('hashchange', route);
+
+  // 全局快捷键（composerFocusShortcutPlan F2 方案 A）：Cmd+K（mac）/ Ctrl+K（win）直达「新建会话」弹窗
+  // 按钮快捷键提示按平台渲染（mac 显示 ⌘K，win 显示 Ctrl+K）
+  (function renderShortcutHint() {
+    var isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+    var hint = isMac ? '⌘K' : 'Ctrl+K';
+    var kbdEl = document.querySelector('#newSessionButton .kbd-hint');
+    if (kbdEl) kbdEl.textContent = hint;
+    var btn = document.getElementById('newSessionButton');
+    if (btn) btn.title = '新建会话（' + hint + '）';
+  })();
+
+  document.addEventListener('keydown', function (event) {
+    if (!(event.metaKey || event.ctrlKey)) return;
+    if (event.altKey || event.shiftKey) return; // 不抢 Cmd+Option+K / Cmd+Shift+K 等其它组合
+    if (event.key.toLowerCase() !== 'k') return;
+    if (appEl.classList.contains('hidden')) return; // 登录门态不响应
+    if (document.querySelector('.modal-mask:not(.hidden)')) return; // 弹层打开时不响应（含新建会话弹窗自身）
+    event.preventDefault(); // 拦截浏览器默认行为（地址栏搜索）
+    window.sidebarView.openNewSessionModal(); // 方案 A：打开新建会话弹窗（含 workDir 探建确认）
+  });
+
   loginButton.addEventListener('click', onLogin);
   loginTokenInput.addEventListener('keydown', function (event) {
     if (event.key === 'Enter') onLogin();

@@ -1,6 +1,6 @@
 /*
 Author: wilbur
-Version: 1.9
+Version: 1.11
 Date: 2026-08-13
 Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅色侧栏 + 浅色主区）。
              v1.1 迭代一：侧栏浅色系并清理硬编码深色；侧栏收缩/悬浮展开按钮；设置页整页表单（tab 条/全宽字段/模型折叠卡片/固定保存栏）；用量页费用卡与图表区。
@@ -13,6 +13,8 @@ Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅�
              v1.7 markdown 代码块改为浅色背景（.gray-block + 浅边框），避免深色 pre 在浅色主区里很突允。
              v1.8 聊天页 topbar 底边模型输出穿梭灯条（.stream-indicator + streamShuttle 动画）。
              v1.9 上传 models.json 导入：设置页 pi 导入面板边框/间距与报告区。
+             v1.10 topbar 穿梭灯条周期 1.2s → 3s，减慢跑马灯频率。
+             v1.11（composerFocusShortcutPlan F2 discoverability）：新建会话按钮内 .kbd-hint 快捷键提示样式（右浮动 kbd 胶囊）。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -86,6 +88,12 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
   padding: 10px; font-size: 14px; text-align: left;
 }
 .btn-new-session:hover { background: var(--sidebar-hover); }
+/* 按钮内快捷键提示（kbd 胶囊，右浮动靠右对齐） */
+.kbd-hint {
+  float: right; padding: 1px 6px; font-size: 11px; font-family: inherit;
+  color: var(--sidebar-dim); background: var(--sidebar-hover);
+  border: 1px solid var(--border); border-radius: 4px; line-height: 1.6;
+}
 .sidebar-collapse-btn {
   flex-shrink: 0; width: 32px; align-self: stretch;
   background: transparent; color: var(--sidebar-dim);
@@ -155,7 +163,7 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
 .stream-indicator {
   position: absolute; left: 0; bottom: 0; height: 3px; width: 30%; border-radius: 3px;
   background: linear-gradient(90deg, transparent, var(--accent), transparent);
-  animation: streamShuttle 1.2s ease-in-out infinite;
+  animation: streamShuttle 3s ease-in-out infinite;
 }
 @keyframes streamShuttle {
   0% { transform: translateX(0); }

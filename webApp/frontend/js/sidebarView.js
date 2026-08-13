@@ -1,10 +1,12 @@
 /*
 Author: wilbur
-Version: 1.1
-Date: 2026-08-07
+Version: 1.2
+Date: 2026-08-13
 Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新建会话弹窗、重命名/删除、底部入口高亮。
              v1.1 迭代一：新建弹窗探建交互（契约 §3.3/§3.4 先探后建 + allowCreate 内联确认）；
              侧栏完全隐藏/悬浮展开（localStorage sidebarCollapsed）。
+             v1.2（composerFocusShortcutPlan F2 改方案 A）：openModal 经 window.sidebarView 暴露，
+             供 Cmd/Ctrl+K 快捷键直达「新建会话」弹窗（含 workDir 探建确认）。
 */
 (function () {
   'use strict';
@@ -298,7 +300,10 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
     },
 
     // 新建会话成功后模型配置可能变化，使缓存失效
-    invalidateModelConfig: function () { cachedModelConfig = null; }
+    invalidateModelConfig: function () { cachedModelConfig = null; },
+
+    // Cmd/Ctrl+K 快捷键直达「新建会话」弹窗（方案 A，composerFocusShortcutPlan）；私有 openModal 的对外口
+    openNewSessionModal: function () { openModal(); }
   };
 
   document.getElementById('newSessionButton').addEventListener('click', openModal);

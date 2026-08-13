@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.9
-Date: 2026-08-12
+Version: 1.12
+Date: 2026-08-13
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
@@ -24,6 +24,15 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              工具卡/确认事件保持即时 DOM，不进文本 paint 队列。
              v1.8 聊天页 topbar 穿梭灯条：syncStreamIndicator 在 streaming/attaching 亮、其余灭；挂 updateComposer 末尾统一驱动。
              v1.9 重试提示块（retryNotice 实时更新/终态清除）+ 模型错误内联块（emptyMessage/无 step 回退顶部 errorBar）。
+             v1.10（composerFocusShortcutPlan T1）：回答结束后光标自动回落输入框——新增 focusComposerIfReady（三守卫：
+             聊天页可见/输入框可用/无 .modal-mask 弹层），挂载点：onStreamClosed（stopping 早退分支+末尾）、
+             reloadSession 无 pending 分支（confirmationMismatch 重载路径）、onStreamFailed（REST 预检失败路径）。
+             v1.11（grok 验收返工）：修复 F1 主路径不生效——completed/error/stopped 先 goIdle 置空 stream，
+             onStreamClosed 的 !stream 早退改为补 focus 后再 return；C1 挂载点从 reloadSession 移除
+             （attachStream 同步禁用 composer，focus 必被守卫拦截，属死代码），改挂 resetToHistoryState
+             （attach 落空/失败、composer 恢复可用后）；顺带修复 open() 裸 focus 打在 attaching 禁用输入框上的既有竞态。
+             v1.12（grok 复核建议项）：focusComposerIfReady 守卫 +1——#app 隐藏（登录门态）不 focus，
+             堵「completed → goIdle 启用输入框 → 401 跳登录门 → onStreamClosed 补 focus」窄窗口抢登录框焦点。
 */
 (function () {
   'use strict';
@@ -680,6 +689,16 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     syncStreamIndicator();
   }
 
+  // 回答结束后光标回落输入框（composerFocusShortcutPlan §3.2）：仅聊天页可见、输入框可用、无弹层时聚焦
+  function focusComposerIfReady() {
+    var chatPageEl = document.getElementById('chatPage');
+    if (chatPageEl.classList.contains('hidden')) return;
+    if (document.getElementById('app').classList.contains('hidden')) return; // v1.12：登录门态不抢焦点（窄窗口：completed 后 401 跳登录门）
+    if (composerInput.disabled) return;
+    if (document.querySelector('.modal-mask:not(.hidden)')) return; // 任一弹层可见不抢焦点
+    composerInput.focus();
+  }
+
   /* ---------- 流式事件处理（契约 §4.3 事件集） ---------- */
 
   function onStreamEvent(event, data) {
@@ -882,10 +901,11 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var stream = window.appStore.stream;
     // 连接关闭 = 泵线程已回写用量（先回写后哨兵，D7）；completed 已 goIdle 置空 stream 也需刷新，statusBar 内部防会话竞态
     window.statusBar.refresh();
-    if (!stream) return; // 已复位（离开页面/completed 已处理）
-    if (stream.phase === 'waitingConfirm') return; // 等用户确认，保持该态
+    if (!stream) { focusComposerIfReady(); return; } // v1.11：completed/error/stopped 已 goIdle 置空 stream，早退前必须补 focus（F1 主路径）；切页/登录门由三守卫拦截
+    if (stream.phase === 'waitingConfirm') return; // 等用户确认，保持该态，不抢焦点
     if (stream.phase === 'stopping') {
       goIdle();
+      focusComposerIfReady(); // 本窗口点停止：早退分支单独补 focus（v1.10）
       return;
     }
     if (!stream.terminalSeen) {
@@ -894,12 +914,14 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       showError('连接中断：未收到终态事件，刷新页面可恢复最新状态。');
     }
     goIdle();
+    focusComposerIfReady(); // 主收口：终态/中断/跨窗口 stopped 后的连接关闭（v1.10）
   }
 
   function onStreamFailed(error) {
     // REST 预检失败（400/404/409，未开流）：回空闲态；待确认场景可重进会话经 GET pending 自愈
     showError(error.message);
     goIdle();
+    focusComposerIfReady(); // 预检失败不经 onStreamClosed，单独补 focus（v1.10）
   }
 
   function goIdle() {
@@ -1002,6 +1024,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       // 乐观 attach（multiWindowStreamingPlan §5.1）：历史已先渲染；有活跃流则截断重渲染 + 回放续播，404 静默保持历史态。
       // pending 态必无活跃流（泵在 confirmationRequired 已终态），跳过 attach 以免占位态覆盖 waitingConfirm。
       attachStream(sessionId, messages);
+      // 此处不补 focus：attachStream 同步置 attaching 禁用 composer，focus 必被守卫 2 拦截（v1.11 验收发现 v1.10 死代码）。
+      // attach 落空/失败由 resetToHistoryState 补，attach 成功的终态由 onStreamClosed(!stream) 补。
     }
     stickToBottom = true;
     scrollToBottom();
@@ -1044,6 +1068,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       if (window.appStore.stream !== placeholder) return; // 别清掉新 attach 的占位
       window.appStore.stream = null;
       updateComposer();
+      focusComposerIfReady(); // v1.11：attach 落空/失败后 composer 恢复可用，回落焦点（C1 真正生效点）
       if (withHint) showError('流恢复失败（' + error.message + '）；页面为静态历史，流可能仍在后台运行，刷新重试。');
     }
   }

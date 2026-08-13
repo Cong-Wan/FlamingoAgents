@@ -1,6 +1,6 @@
 <!--
 Author: wilbur
-Version: 1.4
+Version: 1.5
 Date: 2026-08-13
 Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局骨架：侧栏 + 主区 + 弹层 + 登录门）。
              v1.1 迭代一：新建弹窗加探建内联确认区；侧栏浅色化 + 收缩/悬浮展开按钮；设置页改 tab + 整页表单 + 固定保存栏；用量页加费用卡与 Chart.js 图表区。
@@ -8,6 +8,7 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
              composer 加附件 chip 区、/@面板容器、两行状态栏；新增文件预览弹层；引入 highlight.js 与 4 个新 JS 模块。
              v1.3 聊天页 topbar 末尾加 streamIndicator 穿梭灯条节点（模型输出中/attach 时显示）。
              v1.4 上传 models.json 导入：设置页加「从 pi 导入」按钮与可隐藏面板（文件选择 / 三开关 / 预览 / 应用 / 取消 / 报告）。
+             v1.5（composerFocusShortcutPlan F2  discoverability）：「新建会话」按钮加 ⌘K kbd 快捷键提示 + title 悬停提示（⌘K / Ctrl+K）。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -36,7 +37,7 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
     <!-- 左侧浅色侧栏 -->
     <aside class="sidebar">
       <div class="sidebar-top">
-        <button id="newSessionButton" class="btn-new-session">＋ 新建会话</button>
+        <button id="newSessionButton" class="btn-new-session" title="新建会话（⌘K / Ctrl+K）">＋ 新建会话 <kbd class="kbd-hint">⌘K</kbd></button>
         <button id="sidebarCollapseButton" class="sidebar-collapse-btn" title="收起侧栏">‹</button>
       </div>
       <nav id="sessionList" class="session-list"></nav>
