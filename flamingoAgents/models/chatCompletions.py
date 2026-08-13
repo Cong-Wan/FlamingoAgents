@@ -1,17 +1,19 @@
 '''
 Author: wilbur
-Version: 1.13
+Version: 1.14
 Date: 2026-08-12
-Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden). v1.11（fixPlan Phase2）：流式累积 reasoningParts 并在流结束时写入顶层 responsePayload['reasoning']（非空才写，不入 messagePayload）；complete() 非流式出口归一化 choices[0].message.reasoning_content -> 顶层 reasoning，保持 choices[0].message 与非流式同构（reasoning 不得进入发往模型的 messages，D2 红线）。v1.12（streamingLatencyFixPlan Phase1/T1.1）：iterSseData 改优先 read1(4096)（getattr fallback read），修复 chunked SSE 上 read(amt) 阻塞凑批导致的「长时间真空后一次性喷出」。v1.13：默认 User-Agent 为 OpenAI/JS 6.26.0，避免 urllib 自动带上 Python-urllib/x.y；models.yaml 自定义 headers 仍可覆盖。
+Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden). v1.11（fixPlan Phase2）：流式累积 reasoningParts 并在流结束时写入顶层 responsePayload['reasoning']（非空才写，不入 messagePayload）；complete() 非流式出口归一化 choices[0].message.reasoning_content -> 顶层 reasoning，保持 choices[0].message 与非流式同构（reasoning 不得进入发往模型的 messages，D2 红线）。v1.12（streamingLatencyFixPlan Phase1/T1.1）：iterSseData 改优先 read1(4096)（getattr fallback read），修复 chunked SSE 上 read(amt) 阻塞凑批导致的「长时间真空后一次性喷出」。v1.13：默认 User-Agent 为 OpenAI/JS 6.26.0，避免 urllib 自动带上 Python-urllib/x.y；models.yaml 自定义 headers 仍可覆盖。v1.14 modelRequestError 新增 retryAfterSeconds（解析 429 Retry-After 头，秒/HTTP-date）。
 '''
 
 from __future__ import annotations
 
 import http.client
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any, Iterator
 
 from flamingoAgents.core.types import chatMessage, finalChunk, reasoningChunk, textChunk, toolCall
@@ -27,11 +29,12 @@ class modelCompletion:
 
 
 class modelRequestError(Exception):
-    def __init__(self, message: str, requestPayload: dict[str, Any], statusCode: int | None = None, responseBody: str = ''):
+    def __init__(self, message: str, requestPayload: dict[str, Any], statusCode: int | None = None, responseBody: str = '', retryAfterSeconds: float | None = None):
         super().__init__(message)
         self.requestPayload = requestPayload
         self.statusCode = statusCode
         self.responseBody = responseBody
+        self.retryAfterSeconds = retryAfterSeconds
 
 
 class chatCompletionsAdapter:
@@ -78,11 +81,24 @@ class chatCompletionsAdapter:
             return urllib.request.urlopen(request, timeout=60)
         except urllib.error.HTTPError as error:
             errorText = error.read().decode('utf-8', errors='replace')
+            retryAfterSeconds = None
+            retryAfterValue = error.headers.get('Retry-After') if error.headers else None
+            if retryAfterValue is not None:
+                try:
+                    retryAfterSeconds = float(retryAfterValue)
+                except (TypeError, ValueError):
+                    try:
+                        retryAfterSeconds = parsedate_to_datetime(retryAfterValue).timestamp() - time.time()
+                        if retryAfterSeconds < 0:
+                            retryAfterSeconds = None
+                    except (TypeError, ValueError, IndexError, OverflowError):
+                        retryAfterSeconds = None
             raise modelRequestError(
                 message=f'模型请求失败：status={error.code} body={errorText[:1000]}',
                 requestPayload=requestPayload,
                 statusCode=error.code,
                 responseBody=errorText,
+                retryAfterSeconds=retryAfterSeconds,
             ) from error
         except urllib.error.URLError as error:
             raise modelRequestError(

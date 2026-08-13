@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.7
-Date: 2026-08-11
+Version: 1.9
+Date: 2026-08-12
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
@@ -22,6 +22,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              DOM 写在 rAF/flushLivePaint（每帧最多一次 renderMarkdown，长正文不再每 token 全量 parse 卡主线程）；
              强制 flush 清单：step 切换前、completed/error/confirmationRequired 入口、stop 进 stopping、goIdle 双保险、collapseThinking 前双 buffer 上屏；
              工具卡/确认事件保持即时 DOM，不进文本 paint 队列。
+             v1.8 聊天页 topbar 穿梭灯条：syncStreamIndicator 在 streaming/attaching 亮、其余灭；挂 updateComposer 末尾统一驱动。
+             v1.9 重试提示块（retryNotice 实时更新/终态清除）+ 模型错误内联块（emptyMessage/无 step 回退顶部 errorBar）。
 */
 (function () {
   'use strict';
@@ -33,6 +35,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
   var errorBarEl = document.getElementById('errorBar');
   var composerInput = document.getElementById('composerInput');
   var sendButton = document.getElementById('sendButton');
+  var streamIndicatorEl = document.getElementById('streamIndicator');
 
   var confirmModalEl = document.getElementById('confirmModal');
   var confirmToolNameEl = document.getElementById('confirmToolName');
@@ -500,6 +503,51 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     live.bodyEl.appendChild(badge);
   }
 
+  // 重试提示块：在当前 step.live.bodyEl 内 upsert .msg-retry-notice（modelUxImprovePlan D6/T9）
+  function upsertRetryNotice(step, data) {
+    if (!step || !step.live || !step.live.bodyEl) return;
+    data = data || {};
+    var text = '模型请求失败，第 ' + (data.attempt || 1) + ' 次重试';
+    if (data.retryAfterMs) text += '，' + Math.ceil(data.retryAfterMs / 1000) + '秒后';
+    text += '…';
+    var el = step.live.retryNoticeEl;
+    if (!el || !el.parentNode) {
+      el = document.createElement('div');
+      el.className = 'msg-retry-notice';
+      step.live.bodyEl.appendChild(el);
+      step.live.retryNoticeEl = el;
+    }
+    el.textContent = text;
+    maybeScrollToBottom();
+  }
+
+  // 清除本 step 的重试提示块（后续 textDelta/reasoningDelta/completed/error 时调用）
+  function clearRetryNotice(step) {
+    if (!step || !step.live) return;
+    var el = step.live.retryNoticeEl;
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+    step.live.retryNoticeEl = null;
+  }
+
+  // 模型错误内联块：挂在 bodyEl 下方，含文案 + ✕ 关闭（modelUxImprovePlan D5/T10）
+  function appendInlineErrorBlock(bodyEl, message) {
+    if (!bodyEl) return;
+    var block = document.createElement('div');
+    block.className = 'msg-error-block';
+    var span = document.createElement('span');
+    span.textContent = message || '模型调用失败';
+    var closeBtn = document.createElement('button');
+    closeBtn.className = 'msg-error-close';
+    closeBtn.textContent = '✕';
+    closeBtn.addEventListener('click', function () {
+      if (block.parentNode) block.parentNode.removeChild(block);
+    });
+    block.appendChild(span);
+    block.appendChild(closeBtn);
+    bodyEl.appendChild(block);
+    maybeScrollToBottom();
+  }
+
   /* ---------- 历史回放（契约 §2.2） ---------- */
 
   function renderHistory(messages, pending) {
@@ -588,6 +636,12 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
   /* ---------- composer 状态（契约 §5 各态） ---------- */
 
+  function syncStreamIndicator() {
+    var stream = window.appStore.stream;
+    var active = !!(stream && (stream.phase === 'streaming' || stream.phase === 'attaching'));
+    streamIndicatorEl.classList.toggle('hidden', !active);
+  }
+
   function updateComposer() {
     var stream = window.appStore.stream;
     var hasSession = !!window.appStore.currentSessionId;
@@ -596,9 +650,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       sendButton.disabled = true;
       sendButton.textContent = '发送';
       sendButton.classList.remove('stop');
-      return;
-    }
-    if (!stream) { // 空闲
+    } else if (!stream) { // 空闲
       composerInput.disabled = false;
       sendButton.disabled = false;
       sendButton.textContent = '发送';
@@ -625,6 +677,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       sendButton.textContent = '发送';
       sendButton.classList.remove('stop');
     }
+    syncStreamIndicator();
   }
 
   /* ---------- 流式事件处理（契约 §4.3 事件集） ---------- */
@@ -646,6 +699,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     switch (event) {
       case 'textDelta':
         beginNewStepIfNeeded('textDelta');
+        clearRetryNotice(stream.currentStep);
         stream.currentStep.textBuf += data.text || '';
         // 即将折叠 thinking 时先 flush 双 buffer（collapse 只发生一次，不破坏 rAF 合并）
         if (stream.currentStep.live.reasoningSeen && stream.currentStep.live.thinkingOpen) {
@@ -656,11 +710,18 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
       case 'reasoningDelta':
         beginNewStepIfNeeded('reasoningDelta');
+        clearRetryNotice(stream.currentStep);
         stream.currentStep.reasoningBuf += data.text || '';
         stream.currentStep.live.thinkingEl.classList.remove('hidden');
         stream.currentStep.live.reasoningSeen = true;
         setThinkingState(stream.currentStep.live, '思考中…', true);
         scheduleLivePaint(stream.currentStep);
+        break;
+
+      case 'retryNotice': // 非终态：消息下方「重试中」提示块（modelUxImprovePlan D6/T9）
+        if (stream.currentStep && stream.currentStep.live) {
+          upsertRetryNotice(stream.currentStep, data);
+        }
         break;
 
       case 'toolCallStart':
@@ -702,14 +763,20 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
       case 'completed': // 终态：刷新侧栏（title/usage/updatedAt 已变）；状态栏在 onStreamClosed 统一刷新（泵线程回写时序）
         stream.terminalSeen = true;
-        if (stream.currentStep) flushAndCollapseThinking(stream.currentStep); // 终态入口强制 flush（D4 清单 2）
+        if (stream.currentStep) {
+          clearRetryNotice(stream.currentStep);
+          flushAndCollapseThinking(stream.currentStep); // 终态入口强制 flush（D4 清单 2）
+        }
         goIdle();
         window.sidebarView.refresh().then(function () { window.chatView.syncTopbar(); });
         break;
 
       case 'error': // 终态
         stream.terminalSeen = true;
-        if (stream.currentStep) flushAndCollapseThinking(stream.currentStep); // 终态入口强制 flush（D4 清单 2）
+        if (stream.currentStep) {
+          clearRetryNotice(stream.currentStep);
+          flushAndCollapseThinking(stream.currentStep); // 终态入口强制 flush（D4 清单 2）
+        }
         handleStreamError(data);
         break;
     }
@@ -745,8 +812,15 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       showError('确认已失效（' + (data.message || 'confirmationMismatch') + '），已刷新会话。');
       return;
     }
-    // 其它 errorType：空闲 + 错误提示条
-    showError(data.message || '模型调用失败');
+    // 其它 errorType：优先内联到当前 step 消息体；emptyMessage / 无 step 回退顶部 errorBar（D5/T10）
+    var stream = window.appStore.stream;
+    var canInline = data.errorType !== 'emptyMessage'
+      && stream && stream.currentStep && stream.currentStep.live && stream.currentStep.live.bodyEl;
+    if (canInline) {
+      appendInlineErrorBlock(stream.currentStep.live.bodyEl, data.message || '模型调用失败');
+    } else {
+      showError(data.message || '模型调用失败');
+    }
     goIdle();
   }
 

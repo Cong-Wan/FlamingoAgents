@@ -1,10 +1,10 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.7
-> Date: 2026-08-11
+> Version: 1.8
+> Date: 2026-08-12
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
-> 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 7 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
+> 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 8 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
 > v1.2：迭代一（webAppPlan §11）——新增 probeWorkDir 端点（§3.4）与 usage/series 端点（§3.10）；POST /api/sessions 的 workDir 改必填 + 新增 allowCreate；原 §3.4–3.8、§3.9–3.11 顺延为 §3.5–3.9、§3.11–3.13。
 > v1.2.1：按 pi 审核修订——§3.4 probe 响应加 `creatable`/`defaultWorkDir` 字段 + 补「存在但不是目录」情形；§3.10 时区写死服务器本地、byModel key 改 `providerId/modelId`、补双口径声明与 month 空范围语义。
@@ -14,6 +14,7 @@
 > v1.5.1：`lastUsage` 读路径——优先 sessions 索引；缺省回退 `usageTurns` 按 sessionId 最近一条（重启/升级前会话不显示 0）。
 > v1.6：状态栏修复（statusBarUsageFixPlan）——§3.10 费用公式修正为 prompt 减 cached 后不重复计费；§3.14 反转 v1.5 读取指引（状态栏 ↑↓⚡ 自 statusBar v1.3 起改读 `usage` 会话累计 + 前端减法归一化，`lastUsage` 保留但状态栏不再使用）。
 > v1.7：多窗口并行（multiWindowStreamingPlan）——新增 §4.5 attach 回放式重连端点；§4.3 事件集新增 `streamResume`（attach 专属首帧）与 `errorType: "stopped"`（跨窗口停止广播）；§4.4 stop 语义补 stopped 终态广播；§5 状态机重进会话改 attach 续播；§6 移除「无 SSE 重连」声明。
+> v1.8：模型调用重试——§4.3 事件集新增非终态 `retryNotice`（连接建立期失败退避通知；进泵内存 history 可 attach 回放，不落 jsonl；中途断流不重试）。
 
 ---
 
@@ -450,10 +451,13 @@
 | `reasoningDelta` | `{ "text": "先分析..." }` | 思维链增量，渲染进折叠思考块 |
 | `toolCallStart` | `{ "toolCall": {"id","toolName","arguments"}, "preview": "path=/xx" }` | 工具进入执行 |
 | `toolCallEnd` | `{ "toolResult": {"toolCallId","toolName","isError","content","details"} }` | 工具完成；**拒绝路径会出现无配对 Start 的孤儿 End**（isError=true） |
+| `retryNotice` | `{ "message": "...", "attempt": 1, "retryAfterMs": 1000, "status": "waiting" }` | 非终态。模型调用连接建立期失败重试通知（v1.8 新增）；attempt 为第几次重试，retryAfterMs 为下次重试倒计时毫秒，status=waiting 为退避心跳；前端在消息下方显示「重试中」提示块，后续 textDelta/reasoningDelta/completed/error 到达时清除 |
 | `confirmationRequired` | `{ "confirmationId": "confirm_...", "reason": "删除类命令需确认", "commandPreview": "rm -rf /tmp/x", "toolCall": {"id","toolName","arguments"} }` | **终态**。弹确认框；用 toolCall 先建「待确认」卡片 |
 | `completed` | `{ "message": "完整回复全文" }` | **终态**。message 与已拼接的 textDelta 全文一致（前端可直接用拼接结果，不必替换） |
 | `error` | `{ "message": "...", "errorType": "..." }` | **终态**。errorType 取值见下 |
 | `streamResume` | `{ "baseCount": 0, "userMessage": "..." }` | **仅 attach 流（§4.5）的首帧**；原始 stream/confirm 流不下发 |
+
+`retryNotice` 进泵内存 history（attach 可回放），但不落 jsonl；仅在未产出任何 chunk（chunkSeen=False）的连接建立期才重试，中途断流不重试直接 error 终态。
 
 `errorType` 取值（对齐库契约）：`pendingConfirmationExists` / `confirmationMismatch` / `maxStepsExceeded` / `stopped`（v1.7：任一窗口停止后泵广播的终态，非停止发起方的前端按「已中断」静默收尾，不弹错误条）/ 模型调用异常类名（如 `modelRequestError`、`HTTPError`）/ 泵线程兜底异常类名。`emptyMessage` 仅库层兜底——REST 预检已拦截空消息，流内不可达，**前端无需为它写处理分支**（审核 L1）。
 

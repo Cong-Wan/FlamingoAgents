@@ -1,8 +1,9 @@
 '''
 Author: wilbur
-Version: 1.4
-Date: 2026-07-26
+Version: 1.5
+Date: 2026-08-12
 Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.4 adds streaming structures (docs/streamOutputPlan.md §6.2): 3 adapter-layer chunks (textChunk/reasoningChunk/finalChunk) and 7 agent event classes (textDeltaEvent/reasoningDeltaEvent/toolCallStartEvent/toolCallEndEvent/confirmationRequiredEvent/completedEvent/errorEvent) plus the terminalEventTypes tuple.
+             v1.5 新增 retryNoticeEvent（模型调用重试非终态事件，不进 terminalEventTypes）。
 '''
 
 from __future__ import annotations
@@ -133,6 +134,14 @@ class completedEvent:
 class errorEvent:
     message: str
     errorType: str
+
+
+@dataclass
+class retryNoticeEvent:
+    message: str
+    attempt: int
+    retryAfterMs: int
+    status: str
 
 
 # 终态事件：消费者收到时会话锁必然已释放（docs/streamOutputPlan.md §6.4）。

@@ -1,11 +1,12 @@
 <!--
 Author: wilbur
-Version: 1.2
-Date: 2026-08-07
+Version: 1.3
+Date: 2026-08-12
 Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局骨架：侧栏 + 主区 + 弹层 + 登录门）。
              v1.1 迭代一：新建弹窗加探建内联确认区；侧栏浅色化 + 收缩/悬浮展开按钮；设置页改 tab + 整页表单 + 固定保存栏；用量页加费用卡与 Chart.js 图表区。
              v1.2 迭代二（方案 webAppIteration2Plan §4）：favicon 与 flamingo2 头像；聊天页改双栏（chat-center + 右侧文件树 filePanel）；
              composer 加附件 chip 区、/@面板容器、两行状态栏；新增文件预览弹层；引入 highlight.js 与 4 个新 JS 模块。
+             v1.3 聊天页 topbar 末尾加 streamIndicator 穿梭灯条节点（模型输出中/attach 时显示）。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -56,6 +57,7 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
             <span id="topbarModel" class="topbar-model"></span>
             <span class="topbar-spacer"></span>
             <button id="filePanelToggle" class="file-panel-toggle hidden" title="文件浏览器">🗂</button>
+            <span id="streamIndicator" class="stream-indicator hidden"></span>
           </header>
           <div id="errorBar" class="error-bar hidden"></div>
           <div id="messageList" class="message-list"></div>

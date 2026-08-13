@@ -1,10 +1,11 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-08-11
+Version: 1.2
+Date: 2026-08-12
 Description: 库 7 种事件 dataclass → SSE 文本帧（ensure_ascii=False 单行 JSON），以及只消费订阅队列的 SSE 生成器（15s 空闲发 keep-alive 注释帧）。
             v1.1 多窗口并行（multiWindowStreamingPlan §4.2）：sseGen 签名改 (eventQueue, meta, pump)——attach 订阅首发
             streamResume 帧（baseCount/userMessage）；finally 经 pump.unsubscribe 反注册死订阅。
+            v1.2 新增 retryNotice 事件映射（模型调用重试非终态事件）。
 '''
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from flamingoAgents.core.types import (
     confirmationRequiredEvent,
     errorEvent,
     reasoningDeltaEvent,
+    retryNoticeEvent,
     textDeltaEvent,
     toolCallEndEvent,
     toolCallStartEvent,
@@ -57,6 +59,13 @@ def eventToFrame(event) -> tuple[str, dict]:
         }
     if isinstance(event, completedEvent):
         return 'completed', {'message': event.message}
+    if isinstance(event, retryNoticeEvent):
+        return 'retryNotice', {
+            'message': event.message,
+            'attempt': event.attempt,
+            'retryAfterMs': event.retryAfterMs,
+            'status': event.status,
+        }
     if isinstance(event, errorEvent):
         return 'error', {'message': event.message, 'errorType': event.errorType}
     # 泵线程兜底异常已被包装为 errorEvent；走到这里属于未知事件，按 error 帧兜底。

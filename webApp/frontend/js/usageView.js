@@ -1,11 +1,13 @@
 /*
 Author: wilbur
-Version: 1.2
-Date: 2026-08-08
+Version: 1.4
+Date: 2026-08-12
 Description: 用量统计页：顶部三卡片（总 prompt/cached/completion）+ 会话用量表格（契约 §2.3/§3.9）。
              v1.1 迭代一（§11.4/契约 §3.10）：Chart.js 组合图（每模型哈希固定色堆叠柱状 + 总量折线）、
              时/天/月粒度切换、任一模型 cost 非零时出「总费用」卡（month 全量求和口径）、双口径标注。
              v1.2 tokensOf 去掉重复计入的 cachedTokens（其为 promptTokens 子集，OpenAI 原生语义），图表总量不再双计。
+             v1.3 配色去重：20 色 palette + assignColors 同图去重。
+             v1.4 tooltip 过滤：label/afterBody 跳过 0 用量模型，全 0 桶兜底。
 */
 (function () {
   'use strict';
@@ -25,7 +27,9 @@ Description: 用量统计页：顶部三卡片（总 prompt/cached/completion）
 
   // 每模型固定一色：按 providerId/modelId 字符串 djb2 哈希到预设调色板
   var palette = ['#3b6ef6', '#30a46c', '#f5a524', '#e5484d', '#8e4ec6',
-                 '#12a594', '#e93d82', '#6d7ff2', '#ad5700', '#5b5bd6'];
+                 '#12a594', '#e93d82', '#6d7ff2', '#ad5700', '#5b5bd6',
+                 '#0090ff', '#46a758', '#ff6b35', '#ab4aba', '#0d9488',
+                 '#f43f5e', '#3b82f6', '#ca8a04', '#64748b', '#d6409f'];
 
   function colorFor(modelKey) {
     var hash = 5381;
@@ -33,6 +37,34 @@ Description: 用量统计页：顶部三卡片（总 prompt/cached/completion）
       hash = ((hash << 5) + hash + modelKey.charCodeAt(i)) >>> 0;
     }
     return palette[hash % palette.length];
+  }
+
+  // 同图去重：先取偏好色，被占用则从偏好下标起线性探测下一未占用色；>20 允许复用
+  function assignColors(models) {
+    var used = {};
+    var colorMap = {};
+    for (var i = 0; i < models.length; i++) {
+      var modelKey = models[i];
+      var preferred = colorFor(modelKey);
+      var startIdx = palette.indexOf(preferred);
+      var color = preferred;
+      if (used[color]) {
+        var found = false;
+        for (var step = 1; step < palette.length; step++) {
+          var candidate = palette[(startIdx + step) % palette.length];
+          if (!used[candidate]) {
+            color = candidate;
+            found = true;
+            break;
+          }
+        }
+        // 超 20 模型时全部颜色已占，复用偏好色，不报错
+        if (!found) color = preferred;
+      }
+      used[color] = true;
+      colorMap[modelKey] = color;
+    }
+    return colorMap;
   }
 
   function formatNumber(num) {
@@ -139,12 +171,13 @@ Description: 用量统计页：顶部三卡片（总 prompt/cached/completion）
 
     var hasCost = buckets.some(function (bucket) { return (bucket.cost || 0) > 0; });
 
-    // 堆叠柱状：每模型一根柱（值 = 该桶该模型三 token 之和），固定色
+    // 堆叠柱状：每模型一根柱（值 = 该桶该模型三 token 之和），同图去重配色
+    var colorMap = assignColors(models);
     var datasets = models.map(function (modelKey) {
       return {
         type: 'bar',
         label: modelKey,
-        backgroundColor: colorFor(modelKey),
+        backgroundColor: colorMap[modelKey],
         stack: 'tokens',
         data: buckets.map(function (bucket) {
           var byModel = bucket.byModel && bucket.byModel[modelKey];
@@ -178,6 +211,7 @@ Description: 用量统计页：顶部三卡片（总 prompt/cached/completion）
           tooltip: {
             callbacks: {
               label: function (item) {
+                if (item.parsed.y === 0 && item.dataset.label !== '总量') return null;
                 return ' ' + item.dataset.label + '：' + formatNumber(item.parsed.y) + ' tokens';
               },
               // 该桶各模型明细与 cost（cost 恒 0 时不显示费用行）
@@ -189,11 +223,13 @@ Description: 用量统计页：顶部三卡片（总 prompt/cached/completion）
                 models.forEach(function (modelKey) {
                   var byModel = bucket.byModel && bucket.byModel[modelKey];
                   if (!byModel) return;
+                  if (tokensOf(byModel) === 0) return;
                   var line = modelKey + '：' + formatNumber(tokensOf(byModel)) + ' tokens';
                   if (hasCost) line += '，$' + (byModel.cost || 0).toFixed(4);
                   lines.push(line);
                 });
                 if (hasCost) lines.push('桶费用合计：$' + (bucket.cost || 0).toFixed(4));
+                if (lines.length === 0) return ['该桶无明细'];
                 return lines;
               }
             }

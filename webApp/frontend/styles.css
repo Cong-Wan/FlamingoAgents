@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.7
-Date: 2026-08-11
+Version: 1.8
+Date: 2026-08-12
 Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅色侧栏 + 浅色主区）。
              v1.1 迭代一：侧栏浅色系并清理硬编码深色；侧栏收缩/悬浮展开按钮；设置页整页表单（tab 条/全宽字段/模型折叠卡片/固定保存栏）；用量页费用卡与图表区。
              v1.2 迭代二（方案 §4）：聊天页双栏（chat-center + 右侧 filePanel 文件树）；composer 改纵向（chip 区 + 输入行 + 两行状态栏）；
@@ -11,6 +11,7 @@ Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅�
              v1.5（fixPlan Phase5）：工具 running 态呼吸动画--.status-running 状态丸 pulse + .tool-card-running 卡边框呼吸，让「执行中」更醒目。
              v1.6 取消文件预览字符截断限制，移除 .preview-truncated 样式。
              v1.7 markdown 代码块改为浅色背景（.gray-block + 浅边框），避免深色 pre 在浅色主区里很突允。
+             v1.8 聊天页 topbar 底边模型输出穿梭灯条（.stream-indicator + streamShuttle 动画）。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -138,6 +139,7 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
   height: 52px; flex-shrink: 0; display: flex; align-items: center; gap: 12px;
   padding: 0 24px; border-bottom: 1px solid var(--border);
 }
+#chatPage .topbar { position: relative; }
 .topbar-title { font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .topbar-model {
   font-size: 12px; color: var(--text-dim);
@@ -149,6 +151,16 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
   width: 30px; height: 30px; font-size: 15px; color: var(--text-dim);
 }
 .file-panel-toggle:hover { background: var(--gray-block); }
+.stream-indicator {
+  position: absolute; left: 0; bottom: 0; height: 3px; width: 30%; border-radius: 3px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: streamShuttle 1.2s ease-in-out infinite;
+}
+@keyframes streamShuttle {
+  0% { transform: translateX(0); }
+  50% { transform: translateX(233%); }
+  100% { transform: translateX(0); }
+}
 
 /* 迭代二：聊天页双栏布局 */
 .page-chat { flex-direction: row; }
@@ -225,6 +237,22 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
   display: inline-block; font-size: 12px; color: var(--warn);
   border: 1px solid var(--warn); border-radius: 999px; padding: 1px 8px; margin-top: 8px;
 }
+
+/* 重试提示块（modelUxImprovePlan T9）：模型重试中，warn 色呼吸 */
+.msg-retry-notice {
+  display: inline-block; font-size: 12px; color: var(--warn);
+  border: 1px solid var(--warn); border-radius: 999px; padding: 2px 10px; margin-top: 8px;
+  animation: retryPulse 1.4s ease-in-out infinite;
+}
+@keyframes retryPulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
+
+/* 模型错误内联块（modelUxImprovePlan T10）：挂该条消息下方，替代顶部弹窗 */
+.msg-error-block {
+  margin-top: 8px; padding: 8px 12px; border-radius: 8px;
+  background: #fff2f2; color: var(--danger); font-size: 13px;
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+}
+.msg-error-close { background: none; border: none; color: var(--danger); font-size: 14px; cursor: pointer; }
 
 /* markdown 正文 */
 .markdown-content > :first-child { margin-top: 0; }

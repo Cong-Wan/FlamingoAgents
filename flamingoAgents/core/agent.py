@@ -1,12 +1,13 @@
 '''
 Author: wilbur
-Version: 1.12
-Date: 2026-08-11
-Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. v1.10 adds the event-stream API (docs/streamOutputPlan.md §6, v2.3 定稿): runUserMessageStream/continueConfirmationStream generators yield 7 event types with real-time text/reasoning deltas; terminal events (completed/confirmationRequired/error) are yielded only after the session lock is released; legacy sync APIs runUserMessage/continueConfirmation are kept as thin wrappers that drain the stream, map terminal events back to runResult, and accept optional onDelta/onReasoning callbacks. v1.11 调整 maxModelSteps 默认值 8 -> 32。v1.12（streamingLatencyFixPlan Phase3/D2）：driveToolBatch 改为「可执行前缀批量 Start」——从 startIndex 起连续可执行（未知或免确认）的工具先全部 yield toolCallStart，再串行 exec + toolCallEnd；遇需确认工具不发 Start，直接 setPending + confirmationRequired 终态（契约 §6.2 红线不变）。
+Version: 1.14
+Date: 2026-08-13
+Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. v1.10 adds the event-stream API (docs/streamOutputPlan.md §6, v2.3 定稿): runUserMessageStream/continueConfirmationStream generators yield 7 event types with real-time text/reasoning deltas; terminal events (completed/confirmationRequired/error) are yielded only after the session lock is released; legacy sync APIs runUserMessage/continueConfirmation are kept as thin wrappers that drain the stream, map terminal events back to runResult, and accept optional onDelta/onReasoning callbacks. v1.11 调整 maxModelSteps 默认值 8 -> 32。v1.12（streamingLatencyFixPlan Phase3/D2）：driveToolBatch 改为「可执行前缀批量 Start」——从 startIndex 起连续可执行（未知或免确认）的工具先全部 yield toolCallStart，再串行 exec + toolCallEnd；遇需确认工具不发 Start，直接 setPending + confirmationRequired 终态（契约 §6.2 红线不变）。v1.13 模型调用重试：连接建立期(chunkSeen=False)可重试错误 3 次指数退避，分片可中断，retryNotice 通知前端。v1.14 maxModelSteps 支持 None/<=0 表示不限制模型循环步数。
 '''
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Iterator
@@ -22,6 +23,7 @@ from flamingoAgents.core.types import (
     pendingConfirm,
     reasoningChunk,
     reasoningDeltaEvent,
+    retryNoticeEvent,
     runResult,
     terminalEventTypes,
     textChunk,
@@ -38,6 +40,11 @@ from flamingoAgents.tools.toolRegistry import toolRegistry
 from flamingoAgents.tools.toolRuntime import executeToolCall as executeCallableToolCall
 from flamingoAgents.tools.toolSchema import buildModelTools
 
+MODEL_RETRY_MAX_ATTEMPTS = 3        # 最多重试 3 次（即最多 4 次尝试）
+MODEL_RETRY_BACKOFF_BASE_SECONDS = 1.0
+MODEL_RETRY_BACKOFF_MAX_SECONDS = 8.0
+MODEL_RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
+
 
 class agent:
     def __init__(
@@ -48,7 +55,7 @@ class agent:
         logDir: Path,
         systemPrompt: str,
         debugConsole=None,
-        maxModelSteps: int = 32,
+        maxModelSteps: int | None = None,
     ):
         self.modelAdapter = modelAdapter
         self.toolRegistry = toolRegistry(toolDefinitions, debugConsole=debugConsole)
@@ -56,6 +63,7 @@ class agent:
         self.logDir = logDir
         self.systemPrompt = systemPrompt
         self.debugConsole = debugConsole
+        # None 或 <=0：不限制模型循环步数；>0：硬上限
         self.maxModelSteps = maxModelSteps
         self.conversations: dict[str, conversation] = {}
         self.sessionLocks: dict[str, RLock] = {}
@@ -153,29 +161,76 @@ class agent:
 
     def driveModelLoop(self, sessionId: str) -> Iterator:
         # 调用前提：已持有会话锁。承载原 continueModelLoop 逻辑。
+        # maxModelSteps 为 None 或 <=0 时不限制步数。
         currentConversation = self.getConversation(sessionId)
-        for stepIndex in range(self.maxModelSteps):
+        stepIndex = 0
+        while True:
+            if self.maxModelSteps is not None and self.maxModelSteps > 0 and stepIndex >= self.maxModelSteps:
+                yield errorEvent(
+                    message=f'模型循环超过最大步数：{self.maxModelSteps}',
+                    errorType='maxStepsExceeded',
+                )
+                return
             modelTools = buildModelTools(self.toolRegistry.list())
             if self.debugConsole:
                 self.debugConsole.debug(
                     f'agent 模型循环 step={stepIndex + 1} sessionId={sessionId} '
                     f'messages={len(currentConversation.messages)} tools={len(modelTools)}'
                 )
-            try:
-                completion = None
-                for chunk in self.modelAdapter.completeStream(currentConversation.messages, modelTools):
-                    if isinstance(chunk, textChunk):
-                        yield textDeltaEvent(text=chunk.text)
-                    elif isinstance(chunk, reasoningChunk):
-                        yield reasoningDeltaEvent(text=chunk.text)
-                    elif isinstance(chunk, finalChunk):
-                        completion = chunk.completion
-                if completion is None:
-                    raise RuntimeError('模型流式响应缺少最终结果。')
-            except Exception as error:
-                self.logModelError(currentConversation, error)
-                yield errorEvent(message=f'模型调用失败：{error}', errorType=type(error).__name__)
-                return
+            completion = None
+            for attempt in range(MODEL_RETRY_MAX_ATTEMPTS + 1):
+                chunkSeen = False
+                try:
+                    for chunk in self.modelAdapter.completeStream(currentConversation.messages, modelTools):
+                        if isinstance(chunk, textChunk):
+                            chunkSeen = True
+                            yield textDeltaEvent(text=chunk.text)
+                        elif isinstance(chunk, reasoningChunk):
+                            chunkSeen = True
+                            yield reasoningDeltaEvent(text=chunk.text)
+                        elif isinstance(chunk, finalChunk):
+                            chunkSeen = True
+                            completion = chunk.completion
+                    if completion is None:
+                        raise RuntimeError('模型流式响应缺少最终结果。')
+                    break
+                except Exception as error:
+                    self.logModelError(currentConversation, error)
+                    statusCode = getattr(error, 'statusCode', None)
+                    hasStatusAttr = hasattr(error, 'statusCode')
+                    isRetryable = hasStatusAttr and (
+                        statusCode in MODEL_RETRYABLE_STATUS_CODES or statusCode is None
+                    )
+                    if chunkSeen or not isRetryable or attempt >= MODEL_RETRY_MAX_ATTEMPTS:
+                        yield errorEvent(
+                            message=f'模型调用失败（已重试{attempt}次）：{error}',
+                            errorType=type(error).__name__,
+                        )
+                        return
+                    backoff = min(
+                        MODEL_RETRY_BACKOFF_MAX_SECONDS,
+                        MODEL_RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt),
+                    )
+                    retryAfterSeconds = getattr(error, 'retryAfterSeconds', None)
+                    if retryAfterSeconds is not None:
+                        backoff = max(backoff, float(retryAfterSeconds))
+                    yield retryNoticeEvent(
+                        message=str(error),
+                        attempt=attempt + 1,
+                        retryAfterMs=int(backoff * 1000),
+                        status='waiting',
+                    )
+                    remaining = backoff
+                    while remaining > 0:
+                        sliceSeconds = min(0.1, remaining)
+                        time.sleep(sliceSeconds)
+                        remaining -= sliceSeconds
+                        yield retryNoticeEvent(
+                            message=str(error),
+                            attempt=attempt + 1,
+                            retryAfterMs=int(remaining * 1000),
+                            status='waiting',
+                        )
 
             responsePayload = getattr(completion, 'responsePayload', None)
             assistantMessage = completion.message
@@ -192,11 +247,7 @@ class agent:
             terminated = yield from self.driveToolBatch(sessionId, assistantMessage.toolCalls, 0)
             if terminated:
                 return
-
-        yield errorEvent(
-            message=f'模型循环超过最大步数：{self.maxModelSteps}',
-            errorType='maxStepsExceeded',
-        )
+            stepIndex += 1
 
     def driveToolBatch(self, sessionId: str, toolCalls: list[toolCall], startIndex: int) -> Iterator:
         # 调用前提：已持有会话锁。返回 True 表示已产出终态事件（confirmationRequired）。

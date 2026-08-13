@@ -1,8 +1,8 @@
 # 流式输出（Streaming）方案设计
 
 > Author: wilbur
-> Version: 2.4
-> Date: 2026-08-08
+> Version: 2.5
+> Date: 2026-08-12
 > 目的：为 `flamingoAgents` 的 LLM 请求增加流式输出能力。
 > v1.1：按 `docs/codeReview/260725_streamOutputPlan.md` 审核报告修订 12 处。
 > v1.2：落档用户已拍板决策——思维链也要流式（独立 `onReasoning` 回调）；保留 `modelConfig.stream = False` 回退开关。
@@ -11,6 +11,7 @@
 > v2.2：按 `docs/codeReview/260725_streamOutputPlanV2_1.md` 二次审核修订——前置校验锁位置修正（pending 检查保留在锁内，复用 terminalEvent 机制）、流式 API 的 sessionId 改为必填、清理 §3 与选定结论矛盾的残留表述。
 > v2.3：三项待拍板问题全部按建议确认（1A 中断+新流 / 2A 旧 API 保留为包装 / 3A 7 种事件），方案定稿，进入实现。
 > v2.4：chatUiStreamingFixPlan 实施补记（§6.7）——事件集无新增（仍 7 事件）；UI 侧 live 按模型 step 拆块呈现；reasoning 落库 assistantMessage.reasoning（仅展示，不回灌模型）。
+> v2.5：模型调用重试——§6.2 事件集新增第 8 种非终态 `retryNoticeEvent`（连接建立期失败退避通知；进泵内存 history 不落 jsonl；中途断流不重试）。
 
 ---
 
@@ -221,7 +222,7 @@ for event in flamingo.runUserMessageStream(prompt, sessionId='test111'):
 | `reasoningChunk` | `text: str` | 一段思维链增量（`delta.reasoning_content`） |
 | `finalChunk` | `completion: modelCompletion` | 本轮结束，携带拼好的完整结果与合成 payload |
 
-**agent 层事件**（7 个独立 dataclass，`isinstance` 判别，与 types.py 现有风格一致）：
+**agent 层事件**（8 个独立 dataclass，`isinstance` 判别，与 types.py 现有风格一致）：
 
 | 事件类型 | 载荷字段 | 触发时机 |
 |---|---|---|
@@ -229,6 +230,7 @@ for event in flamingo.runUserMessageStream(prompt, sessionId='test111'):
 | `reasoningDeltaEvent` | `text: str` | 适配器每产出 `reasoningChunk` |
 | `toolCallStartEvent` | `toolCall: toolCall`、`preview: str` | 某个 toolCall 进入实际执行路径时（免确认工具、已批准工具；未知工具的合成失败结果也发，见配对不变式） |
 | `toolCallEndEvent` | `toolResult: toolResult` | 工具执行完毕（含 isError、未知工具、被拒绝） |
+| `retryNoticeEvent` | `message: str`、`attempt: int`、`retryAfterMs: int`、`status: str` | **非终态**。模型调用连接建立期（chunkSeen=False）失败重试通知；attempt 为第几次重试，retryAfterMs 为下次重试倒计时毫秒，status=waiting 为退避心跳；进泵内存 history（attach 可回放）但不落 jsonl；中途断流不重试，直接 error 终态 |
 | `confirmationRequiredEvent` | `confirmationId`、`reason`、`commandPreview`、`toolCall` | 工具需用户确认，**终态事件，锁释放后 yield，流到此终止** |
 | `completedEvent` | `message: str` | 模型给出最终正文回复，**终态事件，锁释放后 yield** |
 | `errorEvent` | `message: str`、`errorType: str` | 前置校验失败/模型调用失败/超步数等，**终态事件，锁释放后 yield** |
