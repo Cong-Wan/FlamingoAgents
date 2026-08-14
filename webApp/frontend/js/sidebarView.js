@@ -1,12 +1,14 @@
 /*
 Author: wilbur
-Version: 1.2
-Date: 2026-08-13
+Version: 1.4
+Date: 2026-08-14
 Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新建会话弹窗、重命名/删除、底部入口高亮。
              v1.1 迭代一：新建弹窗探建交互（契约 §3.3/§3.4 先探后建 + allowCreate 内联确认）；
              侧栏完全隐藏/悬浮展开（localStorage sidebarCollapsed）。
              v1.2（composerFocusShortcutPlan F2 改方案 A）：openModal 经 window.sidebarView 暴露，
              供 Cmd/Ctrl+K 快捷键直达「新建会话」弹窗（含 workDir 探建确认）。
+             v1.3 新建会话模型下拉去掉「默认」占位项，直接列出该 provider 的 modelId。
+             v1.4 新建会话弹窗支持快捷键：Enter = 创建，Esc = 取消。
 */
 (function () {
   'use strict';
@@ -160,15 +162,11 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
     var providerId = providerSelect.value;
     var provider = cachedModelConfig && cachedModelConfig.providers
       ? cachedModelConfig.providers[providerId] : null;
-    var defaultOption = document.createElement('option');
-    defaultOption.value = '';
-    defaultOption.textContent = '默认（该 provider 首个模型）';
-    modelSelect.appendChild(defaultOption);
     if (provider && Array.isArray(provider.models)) {
       provider.models.forEach(function (model) {
         var option = document.createElement('option');
         option.value = model.id;
-        option.textContent = model.id + (model.name ? '（' + model.name + '）' : '');
+        option.textContent = model.id;
         modelSelect.appendChild(option);
       });
     }
@@ -317,4 +315,16 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
   modalEl.addEventListener('click', function (event) {
     if (event.target === modalEl) closeModal();
   });
+  // 快捷键：Enter = 创建 / Esc = 取消（挂 document，只判断弹窗可见，不受焦点位置影响）
+  document.addEventListener('keydown', function (event) {
+    if (modalEl.classList.contains('hidden')) return; // 弹窗未打开时不处理
+    if (event.key === 'Enter' && event.target.tagName !== 'TEXTAREA') {
+      event.preventDefault();
+      onCreate();
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      closeModal();
+    }
+  });
+
 })();
