@@ -1,12 +1,14 @@
 /*
 Author: wilbur
-Version: 1.2
-Date: 2026-08-13
+Version: 1.4
+Date: 2026-08-14
 Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册表（/model 切换当前会话模型、/new 同目录新开会话），
              capture 阶段键盘拦截（§4.3，先于 chatView 的 Enter→send）；不命中指令按普通文本发送。
              另暴露 window.toast 轻提示（供 fileMention/fileExplorer 复用）。
              v1.1：修复 IME 组合态按 Enter 误执行指令（/new 执行后残留 new）——组合中放行让输入法先提交候选词，提交后再按 Enter 才执行。
              v1.2：方向键切换 /model 列表高亮时，用面板自身 scrollTop 把当前项拉进 260px 视口，不带动外层滚动。
+             v1.3：页面加载/登录后拉一次技能列表常驻；/skill:名 并入同一套前缀过滤；选中后异步回填正文（会话守卫、不改 runItem）。
+             v1.4：code review 修订——skill 项前缀过滤对 name 做 toLowerCase（白名单允许大写）；fillSkill 回填前检查输入框仍为空，防慢网覆盖草稿。
 */
 (function () {
   'use strict';
@@ -180,10 +182,46 @@ Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册
   }
 
   // 指令注册表（方案 §4.4）：后续加指令只需在这里追加 { name, desc, run }
+  // skill 项不进本表，走页面加载/登录后常驻的 cachedSkills。
   var commandRegistry = [
     { name: '/model', desc: '切换当前会话模型', run: openModelPicker },
     { name: '/new', desc: '在当前目录新开一个会话', run: newSessionHere }
   ];
+
+  var cachedSkills = [];
+
+  function refreshSkillCache() {
+    if (!window.appStore.token) {
+      cachedSkills = [];
+      return;
+    }
+    window.api.getSkills().then(function (data) {
+      cachedSkills = (data && data.skills) || [];
+    }).catch(function () {
+      cachedSkills = [];
+    });
+  }
+
+  function fillSkill(name) {
+    var sid = window.appStore.currentSessionId;
+    window.api.getSkillBody(name).then(function (result) {
+      if (window.appStore.currentSessionId !== sid) {
+        window.toast('会话已切换，已丢弃技能正文');
+        return;
+      }
+      if (composerInput.value.trim() !== '') {
+        window.toast('输入框已有内容，已丢弃技能正文');
+        return;
+      }
+      var body = (result && result.body) || '';
+      composerInput.value = body + '\n\n';
+      composerInput.selectionStart = composerInput.selectionEnd = composerInput.value.length;
+      composerInput.focus();
+      composerInput.dispatchEvent(new Event('input'));
+    }).catch(function (error) {
+      window.toast('加载技能失败：' + (error.message || '未知错误'));
+    });
+  }
 
   /* ---------- 触发与键盘 ---------- */
 
@@ -196,6 +234,16 @@ Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册
         .map(function (command) {
           return { label: command.name, desc: command.desc, run: command.run };
         });
+      cachedSkills.forEach(function (skill) {
+        var label = '/skill:' + skill.name;
+        if (label.slice(1).toLowerCase().indexOf(keyword) === 0) {
+          items.push({
+            label: label,
+            desc: skill.description,
+            run: function () { fillSkill(skill.name); }
+          });
+        }
+      });
       if (items.length > 0) {
         activeIndex = Math.min(activeIndex, items.length - 1);
         renderPanel();
@@ -234,4 +282,11 @@ Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册
   window.slashCommand = {
     isOpen: function () { return panelOpen; }
   };
+
+  var originalSetToken = window.appStore.setToken;
+  window.appStore.setToken = function (token) {
+    originalSetToken.call(this, token);
+    refreshSkillCache();
+  };
+  if (window.appStore.token) refreshSkillCache();
 })();

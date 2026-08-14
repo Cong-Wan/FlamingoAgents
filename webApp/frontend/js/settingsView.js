@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.5
-Date: 2026-08-13
+Version: 1.6
+Date: 2026-08-14
 Description: 模型配置编辑页：整页表单化（§11.3）——顶部 provider tab 条 + 全宽纵向字段 + 模型折叠卡片 +
              底部固定保存/重置栏。内存工作副本：open 时 GET 一次，tab 切换不重拉（脏数据 confirm 提示），
              重置 = 放弃修改重拉，保存 = 工作副本全量 PUT（契约 §2.4/§3.11/§3.12）。
@@ -10,6 +10,7 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
              v1.3：新增 provider 改名时仅刷新 tab，避免每输入一个字符重建表单并导致 providerId 输入框失焦。
              v1.4：新增 provider 的名称默认为空；模型表单隐藏 reasoning/thinking.type，仅保留思考强度选择。
              v1.5：上传 models.json 导入：设置页面板选择文件，预览/应用走 POST /api/models/importPi + mergePiImport 合进工作副本。
+             v1.6：技能区从本页抽出为与模型配置平级的独立「技能」页（skillsView），本页不再渲染技能。
 */
 (function () {
   'use strict';

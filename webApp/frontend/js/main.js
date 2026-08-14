@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.4
-Date: 2026-08-13
-Description: 启动引导 + 登录门 + hash 路由（#/chat、#/chat/{id}、#/settings/models、#/usage）。
+Version: 1.5
+Date: 2026-08-14
+Description: 启动引导 + 登录门 + hash 路由（#/chat、#/chat/{id}、#/settings/models、#/settings/skills、#/usage）。
              v1.1（composerFocusShortcutPlan T2）：全局快捷键 Cmd+N（mac）/ Ctrl+N（win）新建应用窗口
              （浏览器保留键拦不住时走原生行为；登录门态/弹层打开时不响应）。
              v1.2：快捷键 N → K（Cmd+K / Ctrl+K）——N 是浏览器保留键普通标签页拦不到，
@@ -11,6 +11,7 @@ Description: 启动引导 + 登录门 + hash 路由（#/chat、#/chat/{id}、#/s
              用户反馈新建窗口无 workDir 确认流程，真正诉求是快速新建会话；调 sidebarView.openNewSessionModal()。
              v1.4（F2 discoverability）：启动时按平台渲染「新建会话」按钮的快捷键提示
              （navigator.platform 判 mac 显 ⌘K，其余显 Ctrl+K；含 kbd 文本与 title 悬停）。
+             v1.5：新增与模型配置平级的「技能」只读页路由 #/settings/skills（skillsView）。
 */
 (function () {
   'use strict';
@@ -23,6 +24,7 @@ Description: 启动引导 + 登录门 + hash 路由（#/chat、#/chat/{id}、#/s
 
   var chatPageEl = document.getElementById('chatPage');
   var settingsPageEl = document.getElementById('settingsPage');
+  var skillsPageEl = document.getElementById('skillsPage');
   var usagePageEl = document.getElementById('usagePage');
 
   /* ---------- 登录门 ---------- */
@@ -67,7 +69,7 @@ Description: 启动引导 + 登录门 + hash 路由（#/chat、#/chat/{id}、#/s
   /* ---------- hash 路由 ---------- */
 
   function showPage(pageEl) {
-    [chatPageEl, settingsPageEl, usagePageEl].forEach(function (el) {
+    [chatPageEl, settingsPageEl, skillsPageEl, usagePageEl].forEach(function (el) {
       el.classList.toggle('hidden', el !== pageEl);
     });
   }
@@ -95,6 +97,9 @@ Description: 启动引导 + 登录门 + hash 路由（#/chat、#/chat/{id}、#/s
     if (hash === '#/settings/models') {
       showPage(settingsPageEl);
       await window.settingsView.open();
+    } else if (hash === '#/settings/skills') {
+      showPage(skillsPageEl);
+      window.skillsView.open();
     } else if (hash === '#/usage') {
       showPage(usagePageEl);
       await window.usageView.open();

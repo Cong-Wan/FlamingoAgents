@@ -1,9 +1,9 @@
 # FlamingoAgents
 
 > Author: wilbur
-> Version: 1.0
-> Date: 2026-08-07
-> Description: 项目自述——开发初心、现状能力、架构、快速开始与路线图。
+> Version: 1.1
+> Date: 2026-08-14
+> Description: 项目自述——开发初心、现状能力、架构、快速开始与路线图。v1.1 现状能力与目录结构补 skill。
 
 **一个为多 Agent 协同作业而生的本地 Agent 系统**：分别接入不同 Coding Plan 的模型，让多个 Agent 并发作业，突破单个 Coding Plan 的并发限制。
 
@@ -28,6 +28,7 @@ FlamingoAgents 的思路：
 - **会话持久化与恢复**：jsonl 原子日志，进程重启后自动 resume（含 system prompt 前缀恢复，provider 缓存可命中）；
 - **用量统计**：每会话累计 prompt/cached/completion tokens；
 - **多 provider 模型配置**：`config/models.yaml` 集中管理多家 Coding Plan，`createAgent(providerId=..., modelId=...)` 按需装配，支持 thinking/reasoningEffort/stream 等模型能力声明。
+- **Skill**：只读加载 `config/skills/<name>/SKILL.md`，新建 agent 时把 name/description/location 注入 system prompt（位于「当前时间」之前）；resume 不重注。**入口文件名必须是大写 `SKILL.md`**（对齐 Agent Skills 规范）；小写 `skill.md` 不会被加载。
 
 ### `webApp/` —— Web 程序（单用户、局域网）
 
@@ -77,7 +78,7 @@ flamingoAgents/      # 纯库：core（事件流 Agent）/ models（适配器）
 webApp/
   backend/           # FastAPI：SSE 桥接、会话索引、用量 SQLite、模型配置读写
   frontend/          # 原生 HTML/CSS/JS（vendor: marked + DOMPurify + Chart.js）
-config/              # models.yaml（多 provider 密钥配置）/ tools.yaml / systemPrompt.md
+config/              # models.yaml（多 provider 密钥配置）/ tools.yaml / systemPrompt.md / skills/
 docs/                # 全部方案与契约文档（见下）
 webData/             # 运行数据（gitignore）：会话索引、集中 jsonl 日志、usage.db
 ```
@@ -102,4 +103,4 @@ webData/             # 运行数据（gitignore）：会话索引、集中 jsonl
 
 ## License
 
-私有项目，暂未开源。
+MIT

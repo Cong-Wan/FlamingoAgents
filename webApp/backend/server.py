@@ -1,6 +1,6 @@
 '''
 Author: wilbur
-Version: 1.8
+Version: 1.9
 Date: 2026-08-14
 Description: FastAPI 应用与全部路由：认证依赖、统一异常映射（库 RuntimeError → 400 透传中文消息）、sessionId 入口校验、SSE 对话流、静态文件容忍空目录挂载。
             v1.1 随包改名调整 import（webApp.backend.*）；静态目录由 static/ 改为 webApp/frontend/，projectRoot 随目录加深改为 parents[2]。
@@ -14,6 +14,7 @@ Description: FastAPI 应用与全部路由：认证依赖、统一异常映射�
             新增 POST /api/chat/attach（404=无活跃流；SSE 首帧 streamResume + 回放 + 实时）；sseResponse 走订阅队列。
             v1.7 上传 models.json 导入：新增 POST /api/models/importPi（只收 rawText，纯转换不读盘不写盘）。
             v1.8（stopResponsivenessPlan §4.1.A）：chatStream 宽容闸——旧泵已 stopping 且会话锁空闲时 wait(2) 后重试 startStream，超时/锁占用仍 409。
+            v1.9 新增 GET /api/skills 与 GET /api/skills/{name}（只读，鉴权，name 白名单 400 / 未知 404 / 越界 400）。
 '''
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from flamingoAgents.models.modelConfig import loadModelConfigFromYaml
 
-from webApp.backend import agentManager, fileBrowser, historyView, modelConfigStore, sessionStore, usageStore
+from webApp.backend import agentManager, fileBrowser, historyView, modelConfigStore, sessionStore, skillStore, usageStore
 from webApp.backend.piModelsImport import convertPiDocument
 from webApp.backend.auth import authDependency, checkToken
 from webApp.backend.sseCodec import sseGen
@@ -41,6 +42,7 @@ projectRoot = Path(__file__).resolve().parents[2]
 staticDir = Path(__file__).resolve().parents[1] / 'frontend'
 
 sessionIdPattern = re.compile(r'[A-Za-z0-9_-]+')
+skillNamePattern = re.compile(r'[A-Za-z0-9_-]+')
 sseHeaders = {'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
 
 app = FastAPI(title='FlamingoAgents Web')
@@ -401,6 +403,21 @@ def putModels(body: dict = Body(...)):
     modelConfigStore.writeModelsConfig(body)
     agentManager.invalidateAllAgents()
     return {'ok': True}
+
+
+@authedApi.get('/skills')
+def getSkills():
+    return skillStore.listSkills()
+
+
+@authedApi.get('/skills/{name}')
+def getSkillBody(name: str):
+    if not skillNamePattern.fullmatch(name):
+        raise HTTPException(status_code=400, detail='skill 名非法。')
+    try:
+        return skillStore.getSkillBody(name)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error))
 
 
 @authedApi.post('/models/importPi')

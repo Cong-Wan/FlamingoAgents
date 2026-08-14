@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.9
-> Date: 2026-08-13
+> Version: 1.10
+> Date: 2026-08-14
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 8 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -16,6 +16,7 @@
 > v1.7：多窗口并行（multiWindowStreamingPlan）——新增 §4.5 attach 回放式重连端点；§4.3 事件集新增 `streamResume`（attach 专属首帧）与 `errorType: "stopped"`（跨窗口停止广播）；§4.4 stop 语义补 stopped 终态广播；§5 状态机重进会话改 attach 续播；§6 移除「无 SSE 重连」声明。
 > v1.8：模型调用重试——§4.3 事件集新增非终态 `retryNotice`（连接建立期失败退避通知；进泵内存 history 可 attach 回放，不落 jsonl；中途断流不重试）。
 > v1.9：上传 pi models.json 导入——新增 §3.18 POST /api/models/importPi（只收 rawText；不读盘不写盘；响应 providers 含上传文件明文 apiKey，鉴权内有意为之）。
+> v1.10：Skill 能力——新增 §3.19 GET /api/skills、§3.20 GET /api/skills/{name}（只读、鉴权；slash `/skill:名` 选中后把正文填进输入框，不自动发送）。
 
 ---
 
@@ -454,6 +455,67 @@
 - 顶层不是对象 / 无 `providers` 对象：`models.json 必须是包含 providers 对象的 JSON。`
 
 无副作用：不读不写 `models.yaml`、不读 `~/.pi/**`、不动 agent 缓存。
+
+### 3.19 GET /api/skills —— 技能列表（只读）
+
+鉴权：与其它 `/api/*` 相同。无请求体、无查询参数。每次现扫 `config/skills/`（一层子目录 + 大写 `SKILL.md`），不缓存。
+
+200：
+
+```json
+{
+  "skills": [
+    {
+      "name": "mygit",
+      "description": "在 git 仓库里按规范提交",
+      "filePath": "/abs/path/config/skills/mygit/SKILL.md",
+      "baseDir": "/abs/path/config/skills/mygit",
+      "disabled": false
+    }
+  ]
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `name` | frontmatter `name`，缺省为文件夹名；仅 `^[A-Za-z0-9_-]+$`，库加载时已过滤非法名 |
+| `description` | frontmatter 描述（空白整条跳过，不出现在本列表） |
+| `filePath` | `SKILL.md` 的**服务器绝对路径** |
+| `baseDir` | 该 skill 所在文件夹的服务器绝对路径（正文内相对路径的解析基准） |
+| `disabled` | frontmatter `disable` 为 YAML bool `true` 时为 `true`：不注入新建会话的 system prompt，但 `/skill:` 仍可拉正文 |
+
+- 目录不存在或没有任何合法 skill → `{ "skills": [] }`；
+- **入口文件名必须是大写 `SKILL.md`**（对齐 Agent Skills 规范）：小写 `skill.md` 不会被加载；
+- **只读**：不提供 PUT/POST/DELETE；磁盘改文件后下次请求即可见；
+- `disabled: true` 的 skill **仍出现在本列表**（设置页标「不进 prompt」）。
+
+### 3.20 GET /api/skills/{name} —— 技能正文（只读）
+
+鉴权：与其它 `/api/*` 相同。路径参数 `name` 必须整段匹配 `^[A-Za-z0-9_-]+$`。
+
+查找口径：对 `loadSkills` 结果按 `name` **精确匹配**，再读其 `filePath`；不拼接 `skillsDir/name/SKILL.md`。读盘前 `Path.resolve().is_relative_to(defaultSkillsDir)` 拘禁。
+
+200：
+
+```json
+{
+  "name": "mygit",
+  "baseDir": "/abs/path/config/skills/mygit",
+  "body": "# 使用说明\n..."
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `name` | 命中的 skill 名 |
+| `baseDir` | 所在文件夹绝对路径 |
+| `body` | 剥掉 YAML frontmatter（首个 `---...---` 块）后的 markdown 正文 |
+
+- `disabled: true` 的 skill **同样返回正文**（slash `/skill:` 要用）；
+- 400：`name` 含非法字符（如 `.` / 中文 / 空格）→ `skill 名非法。`；路径越出 `config/skills/` → 统一 RuntimeError 映射 `skill 路径越界：{name}`；
+- 404：白名单内但加载结果无此名 → `技能不存在：{name}`。
+
+前端 slash 行为（非本接口语义，仅对照）：输入 `/skill:<名>` 选中后把 `body + "\n\n"` 填进输入框，光标置尾，**不自动发送**；用户补参数后再回车。
 
 ## 4. SSE 流式接口
 

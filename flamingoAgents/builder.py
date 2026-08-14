@@ -1,8 +1,9 @@
 '''
 Author: wilbur
-Version: 1.4
-Date: 2026-08-05
+Version: 1.5
+Date: 2026-08-14
 Description: Pure-library assembly factory: resolves paths, loads model config/auth, system prompt, and schema-driven tools, then returns a ready-to-use agent. v1.4 lets callers inject the system prompt as a string (systemPrompt), control the current-time suffix (appendCurrentTime), and whitelist built-in tools by name (toolNames) per docs/initAgentCustomizationPlan.md.
+            v1.5 新建 agent 时在「当前时间」之前注入 config/skills 的 <available_skills> 块；skillsDir='' 禁用 / None 用默认目录 / 路径覆盖。
 '''
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from flamingoAgents.core.agent import agent
 from flamingoAgents.models.chatCompletions import chatCompletionsAdapter
 from flamingoAgents.models.modelAuth import createModelAuth
 from flamingoAgents.models.modelConfig import loadModelConfig
+from flamingoAgents.skills import defaultSkillsDir, formatSkillsXml, loadSkills
 from flamingoAgents.tools.builtinTools import createBuiltinTools
 from flamingoAgents.tools.toolConfig import loadToolSettings
 from flamingoAgents.utils.debug import debugConsole
@@ -35,6 +37,7 @@ def createAgent(
     toolNames: list[str] | None = None,
     providerId: str = '101',
     modelId: str | None = None,
+    skillsDir: str | Path | None = None,
 ) -> agent:
     workDirPath = Path(workDir).resolve()
     printer = debugConsole(debug)
@@ -73,6 +76,15 @@ def createAgent(
         if not resolvedSystemPromptPath.exists():
             raise RuntimeError(f'系统提示词文件不存在：{resolvedSystemPromptPath}')
         systemPromptText = resolvedSystemPromptPath.read_text(encoding='utf-8')
+    if skillsDir == '':
+        skills = []
+    elif skillsDir is None:
+        skills = loadSkills(defaultSkillsDir, debugConsole=printer)
+    else:
+        skills = loadSkills(Path(skillsDir), debugConsole=printer)
+    skillsBlock = formatSkillsXml(skills)
+    if skillsBlock:
+        systemPromptText = systemPromptText.rstrip() + '\n' + skillsBlock
     if appendCurrentTime:
         currentTimeText = datetime.now().astimezone().isoformat(timespec='seconds')
         systemPromptText = (
