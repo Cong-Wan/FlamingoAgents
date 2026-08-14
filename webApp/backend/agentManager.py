@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.5
-Date: 2026-08-11
+Version: 1.6
+Date: 2026-08-14
 Description: sessionId → agent 实例缓存（懒建、模型配置变更后置失效标记惰性重建）、活跃流登记（同会话并发 409）、停止标志与泵线程结构。
             v1.1 随包改名调整 import（webApp.backend.*）。
             v1.2 迭代一（方案 §11.4）：泵线程流开始快照 usageTotal、终态算 delta 先写 usageStore.usageTurns（后回写 sessions 索引，原有回写不变）。
@@ -10,6 +10,8 @@ Description: sessionId → agent 实例缓存（懒建、模型配置变更后�
             v1.5 多窗口并行（multiWindowStreamingPlan §4.1）：streamPump 广播化——单队列改「事件 history + 多订阅者队列」（subLock 内回放/广播/关闭，不丢不重）；
             startStream 增加 meta（baseCount/userMessage，attach 首帧用）；新增 getActivePump/subscribe/unsubscribe/compactDeltas；
             stop 分支补广播 stopped 终态（其他订阅窗口静默收尾，不再误报连接中断）。
+            v1.6（stopResponsivenessPlan L2）：requestStop 改主动收尾（interrupt + 广播 stopped + 幂等 usage + 注销 + 关订阅）；
+            doneEvent/usageRecorded/historyOverflowed；_broadcast 拦截已终态事件；history 2000 截尾。
 '''
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ managerLock = threading.RLock()
 agentCache: dict[str, object] = {}
 staleSessionIds: set[str] = set()
 activeStreams: dict[str, 'streamPump'] = {}
+HISTORY_MAX_EVENTS = 2000
 
 
 def getAgent(sessionId: str):
@@ -134,7 +137,7 @@ def requestStop(sessionId: str) -> bool:
 class streamPump:
     # 泵线程 + 广播结构（multiWindowStreamingPlan §4.1）：事件 history + 多订阅者队列。
     # subscribe/_broadcast/结束置 closed 均在 subLock 内 → 回放与实时无缝衔接，不丢不重；
-    # stop 只置标志位，库生成器由泵线程自己 close（跨线程 close 会抛 ValueError）。
+    # v1.6：requestStop 主动收尾（不再只置标志等泵消费），doneEvent 供 chatStream 宽容闸等待。
     def __init__(self, sessionId: str, agentInstance, stream, meta: dict | None = None):
         self.sessionId = sessionId
         self.agent = agentInstance
@@ -145,13 +148,42 @@ class streamPump:
         self.subscribers: list[queue.Queue] = []
         self.closed = False
         self.stopFlag = threading.Event()
+        self.doneEvent = threading.Event()
+        self.usageRecorded = False
+        self.historyOverflowed = False
+        self.startUsage = self._currentUsage()
         self.thread = threading.Thread(target=self._pump, daemon=True)
 
     def start(self) -> None:
         self.thread.start()
 
     def requestStop(self) -> None:
+        # 主动收尾（stopResponsivenessPlan L2）：幂等早退 → 置标志 → 叫醒库内阻塞
+        # → 记 usage → 注销泵 → 同锁广播 stopped + 关订阅 + 置 doneEvent（竞态红线）。
+        # doneEvent 必须在 unregister 之后置位，否则宽容闸 wait 成功后 startStream 仍撞旧泵。
+        if self.doneEvent.is_set():
+            return
         self.stopFlag.set()
+        try:
+            self.agent.interruptActiveStreams(self.sessionId)
+        except Exception:
+            pass
+        self._recordUsage()
+        unregisterStream(self.sessionId)
+        self._sealStopped()
+
+    def _sealStopped(self) -> None:
+        # 同锁写入 stopped + 关订阅 + 置 doneEvent，保证 stopped 是 history 尾事件。
+        with self.subLock:
+            if self.doneEvent.is_set():
+                return
+            event = errorEvent(message='已停止。', errorType='stopped')
+            self.history.append(event)
+            self._trimHistoryIfNeeded()
+            for subscriber in self.subscribers:
+                subscriber.put(event)
+            self._closeSubscribersLocked()
+            self.doneEvent.set()
 
     def subscribe(self) -> queue.Queue:
         # 新订阅者：先回放 history（压缩连续 delta），泵已关则直接补哨兵，否则登记跟实时。
@@ -171,20 +203,52 @@ class streamPump:
             if subscriber in self.subscribers:
                 self.subscribers.remove(subscriber)
 
+    def _trimHistoryIfNeeded(self) -> None:
+        # 超长丢最旧 delta 段（保留终态尾部），stopped 必须仍是 history 最后一个事件。
+        while len(self.history) > HISTORY_MAX_EVENTS:
+            startIndex = 0
+            while startIndex < len(self.history) and not isinstance(
+                self.history[startIndex], (textDeltaEvent, reasoningDeltaEvent)
+            ):
+                startIndex += 1
+            if startIndex >= len(self.history):
+                return
+            endIndex = startIndex
+            while endIndex < len(self.history) and isinstance(
+                self.history[endIndex], (textDeltaEvent, reasoningDeltaEvent)
+            ):
+                endIndex += 1
+            del self.history[startIndex:endIndex]
+            self.historyOverflowed = True
+
     def _broadcast(self, event) -> None:
         with self.subLock:
+            if self.doneEvent.is_set():
+                return
             self.history.append(event)
+            self._trimHistoryIfNeeded()
             for subscriber in self.subscribers:
                 subscriber.put(event)
 
+    def _closeSubscribersLocked(self) -> None:
+        # 调用方必须已持有 subLock。closed + 各订阅队列放哨兵。
+        self.closed = True
+        for subscriber in self.subscribers:
+            subscriber.put(None)
+
+    def _closeSubscribers(self) -> None:
+        # subLock 内关订阅并置 doneEvent（竞态红线：哨兵与 doneEvent 同临界区）。
+        with self.subLock:
+            if self.doneEvent.is_set():
+                return
+            self._closeSubscribersLocked()
+            self.doneEvent.set()
+
     def _pump(self) -> None:
-        startUsage = self._currentUsage()
         try:
             for event in self.stream:
                 if self.stopFlag.is_set():
-                    # stop 必须广播终态（multiWindowStreamingPlan 审核修复）：否则其他订阅窗口
-                    # onStreamClosed 命中 !terminalSeen 误报「连接中断」；前端按 errorType='stopped' 静默收尾。
-                    self._broadcast(errorEvent(message='已停止。', errorType='stopped'))
+                    # requestStop 已广播 stopped；此处只跳出，避免泵再追加事件。
                     break
                 self._broadcast(event)
                 if isinstance(event, terminalEventTypes):
@@ -193,12 +257,14 @@ class streamPump:
             self._broadcast(errorEvent(message=str(error), errorType=type(error).__name__))
         finally:
             self.stream.close()
-            self._recordUsage(startUsage)
-            unregisterStream(self.sessionId)
-            with self.subLock:
-                self.closed = True
-                for subscriber in self.subscribers:
-                    subscriber.put(None)  # 哨兵：通知各 SSE 生成器结束
+            self._recordUsage()
+            if self.stopFlag.is_set():
+                # 中断路径由 requestStop 负责广播 stopped / 关订阅 / 置 doneEvent，
+                # 避免泵先关连接导致其他窗口收不到 stopped（G3）。
+                return
+            if not self.doneEvent.is_set():
+                unregisterStream(self.sessionId)
+                self._closeSubscribers()
 
     def _currentUsage(self) -> dict:
         # 从已缓存 conversation 读 usageTotal（禁止 getConversation()，避免为未发消息会话落 jsonl 的副作用）。
@@ -209,10 +275,15 @@ class streamPump:
         usage = currentConversation.usageTotal
         return {key: int(usage.get(key, 0) or 0) for key in ('promptTokens', 'cachedTokens', 'completionTokens')}
 
-    def _recordUsage(self, startUsage: dict) -> None:
+    def _recordUsage(self) -> None:
         # 回写时机在泵线程结束（审核 L4）：客户端早断时泵仍跑到终态，回写值才完整。
         # 会话可能尚未建 conversation（如 pendingConfirmationExists 直通错误），无则跳过。
         # 顺序（方案 §11.4）：先写 usageTurns（账单，delta 任一项 >0 才写），后回写 sessions 索引（回写失败不丢账）。
+        # v1.6 幂等：requestStop 与泵 finally 都可能调用，首行守卫消除双记。
+        if self.usageRecorded:
+            return
+        self.usageRecorded = True
+        startUsage = self.startUsage
         with self.agent.sessionLocksGuard:
             currentConversation = self.agent.conversations.get(self.sessionId)
         if currentConversation is None:

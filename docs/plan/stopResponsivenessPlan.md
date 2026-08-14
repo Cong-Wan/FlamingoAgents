@@ -1,7 +1,7 @@
 # 停止响应速度修复方案（stopResponsivenessPlan）
 
 - 日期：2026-08-13
-- 状态：v2.1（两轮外部审核：v1 的 8 项 H/M/L 全部修正；v2 复审残留 2M+2L 本版补丁完毕）
+- 状态：v2.2（三轮外部审核通过；v2.1 后将「工具执行可中断」并入——验收发现 function call 期间 stop 仍卡，根因是工具 subprocess.run 无 HTTP 读/无退避循环，L3 的 socket shutdown 叫不醒它）
 - 范围：`webApp/frontend/js/chatView.js`、`webApp/backend/agentManager.py`、`flamingoAgents/core/agent.py`、`flamingoAgents/models/chatCompletions.py`、`flamingoAgents/core/types.py`
 
 ## 1. 问题现象
@@ -14,7 +14,7 @@
 
 1. **后端（主因）**：`streamPump._pump` 只在「库生成器 yield 出下一个事件」之后才检查 `stopFlag`。而库生成器 `driveModelLoop` 此时正阻塞在 `chatCompletionsAdapter.iterSseData` 的 `read1(4096)` 上，等模型下一个 SSE chunk。慢模型、长思考（reasoning 半天不出字）、或出错重试退避（0.1s 睡眠片、最长 8s/片）时，下一个事件可能数秒~数十秒不到，stopFlag 就数秒~数十秒不被消费。
 2. **前端（体验放大器）**：`stop()` 把 `stream.phase` 置为 `'stopping'` 后**故意不复位**（"等连接关闭后由 onStreamClosed 回空闲态"），而连接关闭依赖泵线程走到 `finally` 发哨兵 → 必须等后端。两层叠加 = 用户感知的"等半天"。
-3. 次要阻塞面：工具执行中（bash 子进程最长 300s、askSubAgent）同样无法被 stop 打断，只能等工具返回后的下一个事件。
+3. 次要阻塞面：工具执行中（bash 子进程最长 300s、askSubAgent）同样无法被 stop 打断——`subprocess.run` 阻塞等子进程退出，无 HTTP 读（socket shutdown 叫不醒）、无退避循环（interruptEvent 检查不到），只能等工具返回后的下一个事件。**验收实测：function call 期间点停止仍卡数秒~数分钟。**
 
 附注：`urlopen(timeout=60)` 的 socket 读超时兜底了"连接不死"，但对秒级体验无帮助。
 
@@ -29,14 +29,14 @@
   极端乱序（stop 在途即发送）撞 409 时同样由前端静默重试兜底，再败才报错。
 - G5：正常（未停止）路径行为零变化：终态仍是「先回写 usage 后关连接」、assistant 完整消息正常落盘、usage 账单不重不漏。
 - G6：后端停止收尾 ≤1s：HTTP 连接被强制断开、会话锁即时释放（允许发新消息）、泵注销。
+- G7：工具（bash/askSubAgent）执行中点停止，≤0.2s 打断子进程并退出（分片 poll + terminate）；前端输入框同样 ≤1s 可用（L1 不等后端）。
 
 ### 非目标（明确不做）
 
-- 不打断正在执行的工具子进程（bash/askSubAgent 在飞不可杀；前端已可输入，后端待工具返回后一拍收尾）。后续迭代再议。
-- 停止轮的 prompt token 计费：停止时 provider 的 usage chunk 未收到，`usageTotal` 无本轮数据，**停止轮不计费**（与现状一致，不劣化）。原 G6"停止轮 prompt 用量计入账单"经审核确认不可达，已降口径。
+- 停止轮的 prompt token 计费：停止时 provider 的 usage chunk 未收到，`usageTotal` 无本轮数据，**停止轮不计费**（与现状一致，不劣化）。
 - 不改 SSE 协议帧格式、不动 attach/回放协议（仅消费侧忽略行为变化）。
 - 不引入 asyncio；保持 urllib 同步客户端。
-- `modelAuth.py` 不涉及（初版方案误列入范围，实际无任何改动）。
+- `modelAuth.py` 不涉及。
 
 ## 4. 方案设计（三层，逐层可独立生效、可独立回退）
 
@@ -146,13 +146,23 @@ response.fp.raw._sock.shutdown(socket.SHUT_RDWR)   # 0.0s 返回；read1 立即�
    - **「缺最终结果」分流（审核 L 级修复）**：`if completion is None` 分支先查 `self.interruptEvent.is_set()`，置位则 `return`（视为中断而非 `RuntimeError('模型流式响应缺少最终结果')`）。
    - 重试退避 0.1s 睡眠片循环：每片末尾 `if self.interruptEvent.is_set(): return`（G2，≤0.2s 打断）。
 
+### L3.5 工具执行可中断（v2.2 新增，验收驱动）
+
+function call 期间 stop 卡的根因：工具走 `subprocess.run`（无 HTTP 读、无退避循环），L3 两个叫醒机制都够不着。修复：
+
+1. `core/types.py` 的 `toolContext` 新增可选字段 `interruptEvent: threading.Event | None = None`。
+2. `agent.executeToolCall` 构造 `toolContext` 时传入当前会话的 `interruptEvent`（`self.getInterruptEvent(sessionId)`——executeToolCall 需加 sessionId 形参，调用点 driveToolBatch/driveConfirmation 均有 sessionId 可传）。
+3. `builtinTools.py` 的 `bashTool`/`askSubAgentTool`：`subprocess.run` 改为 `Popen` + 0.1s 分片 `poll()` 轮询，每片查 `context.interruptEvent.is_set()`，置位则 `process.terminate()`（0.5s 后未退再 `kill()`）并 `raise modelInterruptedError('用户已停止')`。超时/输出截断等既有语义不变。
+4. `agent.driveToolBatch` 的工具执行循环与 `toolRuntime.executeToolCall`：`except Exception` 前加 `except modelInterruptedError: raise` 直通（不能落进「工具执行异常 → toolResult(isError=True)」分支，否则中断会被当成工具失败发给模型）。
+5. 中断后工具卡片状态：前端 L1 abort 后视图定格「已中断」，running 卡片不再更新（与现状 stop 一致）。
+
 ### 覆盖矩阵
 
 | 停止时泵卡在 | 修复层 | 表现 |
 |---|---|---|
 | 等 LLM 下一个 chunk（read1） | L3 shutdown 唤醒 → 生成器 return → 锁释放；L2 已即时收尾 | 输入框 L1 即开；后端 ≤1s 清场（G1/G6） |
 | 重试退避 sleep 片 | L3 片内检查 interruptEvent | ≤0.2s 退出（G2） |
-| 工具子进程执行中 | L1 前端立即可输入；后端等工具返回后一拍收尾；宽容闸检测到锁占用 → 409 → 前端静默重试 | UI 即时；会话短暂 409 可重试（非目标） |
+| 工具子进程执行中（bash/askSubAgent） | L3.5 Popen 分片 poll + terminate；L1 前端立即可输入 | ≤0.2s 打断（G7） |
 | 另一窗口观看中 | L2 requestStop 立即广播 stopped + 哨兵 | B 窗口 ≤RTT 静默收尾（G3） |
 
 ## 5. 不变式与副作用清单（逐条核实结论）
@@ -177,8 +187,9 @@ response.fp.raw._sock.shutdown(socket.SHUT_RDWR)   # 0.0s 返回；read1 立即�
 5. `agentManager.py`：新增 doneEvent/usageRecorded/historyOverflowed 字段；`_recordUsage` 幂等首行；`_broadcast` subLock 内 doneEvent 拦截；`_closeSubscribers` 抽函数复用；`requestStop` 主动收尾序列；history 2000 截尾。→ 验证：起服务 + 慢模型配置实测 G1/G2/G3/G6；双窗口实测 G3。
 6. `server.py`：chatStream 宽容闸（409 前：旧泵 stopFlag 已置 + `lock.acquire(blocking=False)` 探测**成功后立即 release** → `doneEvent.wait(2)` 续走登记；**超时 → 409 原文案**；锁占用 → 409 原文案）。→ 验证：停止后 100ms 内发新消息不撞 409；**放行路径执行后再次 `lock.acquire(blocking=False)` 仍可成功（证明探测未泄漏持锁）**；工具在飞场景撞 409 有友好文案；wait(2) 超时场景返回 409 且前端重试后成功。
 7. `chatView.js`：stop() 改 fire-and-forget + abort（保持 stopping 至 onStreamClosed）；send() 409 静默重试一次。→ 验证：浏览器实测 G1；乱序连点实测 G4。
-8. 走查 §5 全部不变式（评审清单化逐条打勾）。→ 验证：checklist 全勾。
-9. 版本收尾（文件头 Version +1、Description 记录变更）：
+8. **L3.5 工具可中断**：`core/types.py` toolContext 加 interruptEvent 可选字段；`agent.executeToolCall` 加 sessionId 形参透传 interruptEvent；`builtinTools.py` bashTool/askSubAgentTool 改 Popen 分片 poll + interrupt 时 terminate/kill + raise modelInterruptedError；`toolRuntime.py` 与 `agent.driveToolBatch` 工具执行循环加 modelInterruptedError 直通。→ 验证：起服务，让模型调 bash（sleep 30），执行中点停止，断言 ≤0.2s 打断、子进程被 terminate、会话可立即发新消息（G7）。
+9. 走查 §5 全部不变式（评审清单化逐条打勾）。→ 验证：checklist 全勾。
+10. 版本收尾（文件头 Version +1、Description 记录变更）：
    - `core/types.py` 1.5 → 1.6
    - `models/chatCompletions.py` 1.14 → 1.15
    - `core/agent.py` 1.14 → 1.15
@@ -186,6 +197,8 @@ response.fp.raw._sock.shutdown(socket.SHUT_RDWR)   # 0.0s 返回；read1 立即�
    - `webApp/backend/agentManager.py` 1.5 → 1.6
    - `webApp/backend/server.py` 1.7 → 1.8
    - `webApp/frontend/js/chatView.js` **1.11 → 1.12**（复审修正：文件头实测已是 1.11，初版与 v2 均基于过时读数）
+   - `flamingoAgents/tools/builtinTools.py` 1.1 → 1.2
+   - `flamingoAgents/tools/toolRuntime.py` 1.1 → 1.2
    - （`modelAuth.py` 不改，从范围移除——审核 L 修正）
    - 备注：`core/ports.py` 文件头 Description 需同步记录 `completeStream` 新增 `stopEvent` 可选参。
 

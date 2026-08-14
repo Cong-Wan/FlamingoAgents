@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.16
-Date: 2026-08-13
-Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. v1.10 adds the event-stream API (docs/streamOutputPlan.md §6, v2.3 定稿): runUserMessageStream/continueConfirmationStream generators yield 7 event types with real-time text/reasoning deltas; terminal events (completed/confirmationRequired/error) are yielded only after the session lock is released; legacy sync APIs runUserMessage/continueConfirmation are kept as thin wrappers that drain the stream, map terminal events back to runResult, and accept optional onDelta/onReasoning callbacks. v1.11 调整 maxModelSteps 默认值 8 -> 32。v1.12（streamingLatencyFixPlan Phase3/D2）：driveToolBatch 改为「可执行前缀批量 Start」——从 startIndex 起连续可执行（未知或免确认）的工具先全部 yield toolCallStart，再串行 exec + toolCallEnd；遇需确认工具不发 Start，直接 setPending + confirmationRequired 终态（契约 §6.2 红线不变）。v1.13 模型调用重试：连接建立期(chunkSeen=False)可重试错误 3 次指数退避，分片可中断，retryNotice 通知前端。v1.14 maxModelSteps 支持 None/<=0 表示不限制模型循环步数。v1.15（stopResponsivenessPlan L3）：interruptEvent + interruptActiveStreams 薄封装；driveModelLoop 透传 stopEvent、except modelInterruptedError 直通 return、completion is None 先查中断、退避片末尾检查。v1.16 中断事件改按会话存储（interruptEvents dict + getInterruptEvent），修复验收发现的「一会在飞 + 他会话新流 clear 误杀在飞中断」竞态。
+Version: 1.17
+Date: 2026-08-14
+Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. v1.10 adds the event-stream API (docs/streamOutputPlan.md §6, v2.3 定稿): runUserMessageStream/continueConfirmationStream generators yield 7 event types with real-time text/reasoning deltas; terminal events (completed/confirmationRequired/error) are yielded only after the session lock is released; legacy sync APIs runUserMessage/continueConfirmation are kept as thin wrappers that drain the stream, map terminal events back to runResult, and accept optional onDelta/onReasoning callbacks. v1.11 调整 maxModelSteps 默认值 8 -> 32。v1.12（streamingLatencyFixPlan Phase3/D2）：driveToolBatch 改为「可执行前缀批量 Start」——从 startIndex 起连续可执行（未知或免确认）的工具先全部 yield toolCallStart，再串行 exec + toolCallEnd；遇需确认工具不发 Start，直接 setPending + confirmationRequired 终态（契约 §6.2 红线不变）。v1.13 模型调用重试：连接建立期(chunkSeen=False)可重试错误 3 次指数退避，分片可中断，retryNotice 通知前端。v1.14 maxModelSteps 支持 None/<=0 表示不限制模型循环步数。v1.15（stopResponsivenessPlan L3）：interruptEvent + interruptActiveStreams 薄封装；driveModelLoop 透传 stopEvent、except modelInterruptedError 直通 return、completion is None 先查中断、退避片末尾检查。v1.16 中断事件改按会话存储（interruptEvents dict + getInterruptEvent），修复验收发现的「一会在飞 + 他会话新流 clear 误杀在飞中断」竞态。v1.17（stopResponsivenessPlan L3.5）：executeToolCall 加 sessionId 形参，toolContext 透传 interruptEvent；driveToolBatch 捕获 modelInterruptedError 直通 return。
 '''
 
 from __future__ import annotations
@@ -168,7 +168,10 @@ class agent:
             definition = self.toolRegistry.get(currentCall.toolName)
             preview = self.buildToolPreview(definition, currentCall) if definition else str(currentCall.arguments)
             yield toolCallStartEvent(toolCall=currentCall, preview=preview)
-            result = self.executeToolCall(currentCall)
+            try:
+                result = self.executeToolCall(currentCall, sessionId)
+            except modelInterruptedError:
+                return
         else:
             # 拒绝路径只发 End（配对不变式例外，§6.2）。
             result = self.buildBlockedToolResult(currentCall, pending.reason)
@@ -305,7 +308,10 @@ class agent:
                 yield toolCallStartEvent(toolCall=call, preview=preview)
             # 3) 前缀串行 exec + End；jsonl 仍只按执行顺序写 toolResult，落盘语义不变
             for call, definition in prefix:
-                result = self.makeUnknownToolResult(call) if definition is None else self.executeToolCall(call)
+                try:
+                    result = self.makeUnknownToolResult(call) if definition is None else self.executeToolCall(call, sessionId)
+                except modelInterruptedError:
+                    return True
                 currentConversation.addToolResult(result)
                 yield toolCallEndEvent(toolResult=result)
             index += len(prefix)
@@ -409,11 +415,16 @@ class agent:
             if self.debugConsole:
                 self.debugConsole.debug(f'流式回调异常已忽略 error={type(error).__name__}: {error}')
 
-    def executeToolCall(self, call: toolCall) -> toolResult:
+    def executeToolCall(self, call: toolCall, sessionId: str | None = None) -> toolResult:
         definition = self.toolRegistry.get(call.toolName)
         if definition is None:
             return self.makeUnknownToolResult(call)
-        context = toolContext(workDir=self.workDir, debugConsole=self.debugConsole)
+        interruptEvent = self.getInterruptEvent(sessionId) if sessionId else None
+        context = toolContext(
+            workDir=self.workDir,
+            debugConsole=self.debugConsole,
+            interruptEvent=interruptEvent,
+        )
         return executeCallableToolCall(definition, call, context)
 
     def buildToolPreview(self, definition: toolDefinition, call: toolCall) -> str:

@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.6
+Version: 1.7
 Date: 2026-08-13
-Description: Provides executable handlers (execute/preview) for built-in tools and a name-keyed registry mapping them to schema-driven tool definitions. Schemas and permissions come from config/tools.yaml. v1.4 adds askSubAgent: wraps sdkEntry.py as a sub-agent function call (JSON stdout parsed into toolOutput). v1.5: askSubAgent omits --system when not provided so the sub-agent falls back to the default config/systemPrompt.md. v1.6: askSubAgent timeout is a passthrough argument (default 600s, max 3600s) instead of a hardcoded 600s.
+Description: Provides executable handlers (execute/preview) for built-in tools and a name-keyed registry mapping them to schema-driven tool definitions. Schemas and permissions come from config/tools.yaml. v1.4 adds askSubAgent: wraps sdkEntry.py as a sub-agent function call (JSON stdout parsed into toolOutput). v1.5: askSubAgent omits --system when not provided so the sub-agent falls back to the default config/systemPrompt.md. v1.6: askSubAgent timeout is a passthrough argument (default 600s, max 3600s) instead of a hardcoded 600s. v1.7（stopResponsivenessPlan L3.5）：新增 _runWithInterrupt——interruptEvent 非 None 时 subprocess 改 Popen 分片 poll，中断即 terminate/kill 并 raise modelInterruptedError，bash/askSubAgent 均接入。
 '''
 
 from __future__ import annotations
@@ -11,10 +11,11 @@ import difflib
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
-from flamingoAgents.core.types import toolContext, toolOutput
+from flamingoAgents.core.types import modelInterruptedError, toolContext, toolOutput
 from flamingoAgents.tools.toolConfig import toolSchemaSpec
 from flamingoAgents.tools.toolDefinition import defineTool, toolDefinition, toolExecuteFunction, toolPreviewFunction
 
@@ -155,6 +156,65 @@ def previewBashTool(arguments: dict[str, Any]) -> str:
     return str(arguments.get('command', ''))
 
 
+def _runWithInterrupt(command: list[str], context: toolContext, timeout: int) -> subprocess.CompletedProcess:
+    # stopResponsivenessPlan L3.5：interruptEvent 非 None 时改 Popen 分片 poll，
+    # 置位即 terminate（0.5s 未退再 kill）并 raise modelInterruptedError；超时语义与 subprocess.run 一致。
+    if context.interruptEvent is None:
+        return subprocess.run(
+            command,
+            cwd=str(context.workDir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    process = subprocess.Popen(
+        command,
+        cwd=str(context.workDir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,   # 独立进程组：terminate/kill 用 killpg 杀整组（含 bash 的子进程 sleep 等）
+    )
+    deadline = time.monotonic() + timeout
+    while process.poll() is None:
+        if context.interruptEvent.is_set():
+            _killProcessGroup(process)
+            raise modelInterruptedError('用户已停止')
+        if time.monotonic() > deadline:
+            _killProcessGroup(process)
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
+        time.sleep(0.1)
+    stdout, stderr = process.communicate()
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def _killProcessGroup(process: subprocess.Popen) -> None:
+    # 优先杀进程组（start_new_session=True 时 pgid=pid）；退化杀单进程。
+    try:
+        import os
+        import signal
+        os.killpg(process.pid, signal.SIGTERM)
+    except Exception:
+        process.terminate()
+    try:
+        process.wait(0.5)
+    except subprocess.TimeoutExpired:
+        try:
+            import os
+            import signal
+            os.killpg(process.pid, signal.SIGKILL)
+        except Exception:
+            process.kill()
+        process.wait()
+    # 兜底 reap：bash 被杀后其子进程（sleep 等）可能已成孤儿，wait 防僵尸
+    try:
+        process.wait(timeout=0.1)
+    except Exception:
+        pass
+
+
 def bashTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:
     command = arguments.get('command')
     if not isinstance(command, str) or not command.strip():
@@ -175,14 +235,7 @@ def bashTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:
         return text[:maxOutput] + '\n<truncated>', True
 
     try:
-        completedProcess = subprocess.run(
-            ['bash', '-lc', command],
-            cwd=str(context.workDir),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        completedProcess = _runWithInterrupt(['bash', '-lc', command], context, timeout)
         stdoutText, stdoutTruncated = clip(completedProcess.stdout)
         stderrText, stderrTruncated = clip(completedProcess.stderr)
         if context.debugConsole:
@@ -282,14 +335,7 @@ def askSubAgentTool(arguments: dict[str, Any], context: toolContext) -> toolOutp
     if context.debugConsole:
         context.debugConsole.debug(f'子代理开始 model={model} workDir={workDir} tools={tools or "<none>"} timeout={timeout}')
     try:
-        completedProcess = subprocess.run(
-            command,
-            cwd=str(context.workDir),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        completedProcess = _runWithInterrupt(command, context, timeout)
     except subprocess.TimeoutExpired:
         if context.debugConsole:
             context.debugConsole.debug(f'子代理超时 model={model} timeout={timeout}')

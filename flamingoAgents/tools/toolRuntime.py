@@ -1,15 +1,16 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-07-08
+Version: 1.2
+Date: 2026-08-14
 Description: Executes callable tool definitions through shared argument validation and toolResult wrapping.
+             v1.2（stopResponsivenessPlan L3.5）：modelInterruptedError 直通，不包装成 toolResult 错误。
 '''
 
 from __future__ import annotations
 
 from typing import Any
 
-from flamingoAgents.core.types import toolCall, toolContext, toolResult
+from flamingoAgents.core.types import modelInterruptedError, toolCall, toolContext, toolResult
 from flamingoAgents.tools.toolDefinition import toolDefinition
 
 
@@ -54,6 +55,8 @@ def executeToolCall(definition: toolDefinition, call: toolCall, context: toolCon
         if context.debugConsole:
             context.debugConsole.debug(f'执行工具调用完成 tool={definition.name} callId={call.id} isError={result.isError}')
         return result
+    except modelInterruptedError:
+        raise
     except Exception as error:
         return toolResult(
             toolCallId=call.id,

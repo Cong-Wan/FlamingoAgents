@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.12
-Date: 2026-08-13
+Version: 1.13
+Date: 2026-08-14
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
@@ -33,6 +33,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              （attach 落空/失败、composer 恢复可用后）；顺带修复 open() 裸 focus 打在 attaching 禁用输入框上的既有竞态。
              v1.12（grok 复核建议项）：focusComposerIfReady 守卫 +1——#app 隐藏（登录门态）不 focus，
              堵「completed → goIdle 启用输入框 → 401 跳登录门 → onStreamClosed 补 focus」窄窗口抢登录框焦点。
+             v1.13（stopResponsivenessPlan L1）：stop() 改 fire-and-forget + 立即 abort（保持 stopping 至 onStreamClosed）；
+             send() 的 onStreamFailed 对 409「活跃流」静默重试一次。
 */
 (function () {
   'use strict';
@@ -917,8 +919,25 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     focusComposerIfReady(); // 主收口：终态/中断/跨窗口 stopped 后的连接关闭（v1.10）
   }
 
-  function onStreamFailed(error) {
+  var lastUserSend = null; // { text, attachments }：409 静默重试用，避免 composer 已清空导致 send() 空转
+
+  function onStreamFailed(error, meta) {
     // REST 预检失败（400/404/409，未开流）：回空闲态；待确认场景可重进会话经 GET pending 自愈
+    // G4：send 撞 409「活跃流」时 goIdle 后静默重试一次（仅当无新流抢占；confirm 不走此分支）。
+    meta = meta || {};
+    if (meta.fromSend && !meta.isRetry && error && error.status === 409 && String(error.message || '').indexOf('活跃流') !== -1) {
+      var failedStream = window.appStore.stream;
+      if (failedStream && failedStream.currentStep && failedStream.currentStep.live && failedStream.currentStep.live.rowEl) {
+        failedStream.currentStep.live.rowEl.remove();
+      }
+      goIdle();
+      if (window.appStore.stream === null && lastUserSend) {
+        var retryPayload = lastUserSend;
+        setTimeout(function () { send({ retry: true, payload: retryPayload }); }, 600);
+        return;
+      }
+    }
+    lastUserSend = null;
     showError(error.message);
     goIdle();
     focusComposerIfReady(); // 预检失败不经 onStreamClosed，单独补 focus（v1.10）
@@ -935,19 +954,29 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
   /* ---------- 发消息 / 确认 / 停止 ---------- */
 
-  async function send() {
+  async function send(options) {
     var sessionId = window.appStore.currentSessionId;
     var stream = window.appStore.stream;
     if (!sessionId || stream) return;
     stickToBottom = true;
-    var text = composerInput.value.trim();
-    var attachments = window.fileMention.getAttachments();
-    if (!text && attachments.length === 0) return; // D8：纯附件可发
-
-    composerInput.value = '';
-    autoResize();
-    appendUserMessage(text, attachments);
-    window.fileMention.clearChips();
+    options = options || {};
+    var isRetry = !!options.retry && options.payload;
+    var text;
+    var attachments;
+    if (isRetry) {
+      if (window.appStore.stream !== null) return;
+      text = options.payload.text;
+      attachments = options.payload.attachments || [];
+    } else {
+      text = composerInput.value.trim();
+      attachments = window.fileMention.getAttachments();
+      if (!text && attachments.length === 0) return; // D8：纯附件可发
+      composerInput.value = '';
+      autoResize();
+      appendUserMessage(text, attachments);
+      window.fileMention.clearChips();
+      lastUserSend = { text: text, attachments: attachments };
+    }
 
     var step = createStep();
     window.appStore.stream = {
@@ -964,7 +993,9 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     if (attachments.length > 0) body.attachments = attachments;
     var handle = window.sse.streamPost('/api/chat/stream', body, onStreamEvent);
     window.appStore.stream.abort = handle.abort;
-    handle.done.then(onStreamClosed).catch(onStreamFailed);
+    handle.done.then(onStreamClosed).catch(function (error) {
+      onStreamFailed(error, { fromSend: true, isRetry: isRetry });
+    });
   }
 
   function confirm(approved) {
@@ -1001,10 +1032,10 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     if (stream.currentStep) flushLivePaint(stream.currentStep); // 进 stopping 前 buffer 强制上屏（D4 清单 3）
     markInterrupted(); // 立即停渲染 + 半截消息加「已中断」标记
     updateComposer();
-    try {
-      await window.api.stopChat(sessionId);
-    } catch (ignore) { /* stopped:false 幂等不报错；网络错误等连接关闭后自复位 */ }
-    // 等连接关闭后由 onStreamClosed 回空闲态
+    // fire-and-forget：先发出 stop POST，再同步 abort 本窗口 SSE；保持 stopping 到 onStreamClosed。
+    var stopDone = window.api.stopChat(sessionId).catch(function () { return null; });
+    if (stream.abort) stream.abort();
+    await stopDone;
   }
 
   /* ---------- 会话装载 ---------- */

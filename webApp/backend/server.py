@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.7
-Date: 2026-08-13
+Version: 1.8
+Date: 2026-08-14
 Description: FastAPI 应用与全部路由：认证依赖、统一异常映射（库 RuntimeError → 400 透传中文消息）、sessionId 入口校验、SSE 对话流、静态文件容忍空目录挂载。
             v1.1 随包改名调整 import（webApp.backend.*）；静态目录由 static/ 改为 webApp/frontend/，projectRoot 随目录加深改为 parents[2]。
             v1.2 迭代一（契约 v1.2 §3.3/§3.4/§3.10）：新增 probeWorkDir 与 usage/series 端点；create 会话 workDir 改必填 + allowCreate，
@@ -13,6 +13,7 @@ Description: FastAPI 应用与全部路由：认证依赖、统一异常映射�
             v1.6 多窗口并行（multiWindowStreamingPlan §4.3）：chatStream/chatConfirm 启动泵前采样 baseCount 并传 meta；
             新增 POST /api/chat/attach（404=无活跃流；SSE 首帧 streamResume + 回放 + 实时）；sseResponse 走订阅队列。
             v1.7 上传 models.json 导入：新增 POST /api/models/importPi（只收 rawText，纯转换不读盘不写盘）。
+            v1.8（stopResponsivenessPlan §4.1.A）：chatStream 宽容闸——旧泵已 stopping 且会话锁空闲时 wait(2) 后重试 startStream，超时/锁占用仍 409。
 '''
 
 from __future__ import annotations
@@ -438,12 +439,21 @@ def chatStream(body: dict = Body(...)):
     stream = agentInstance.runUserMessageStream(cleanMessage, sessionId)
     # baseCount 水位线（multiWindowStreamingPlan §4.3）：生成器惰性，appendUserMessage 在泵线程首次迭代才发生，采样必然先于写盘。
     baseCount = len(historyView.loadMessages(sessionId))
-    pump = agentManager.startStream(
-        sessionId, agentInstance, stream,
-        meta={'baseCount': baseCount, 'userMessage': cleanMessage},
-    )
+    streamMeta = {'baseCount': baseCount, 'userMessage': cleanMessage}
+    pump = agentManager.startStream(sessionId, agentInstance, stream, meta=streamMeta)
     if pump is None:
-        raise HTTPException(status_code=409, detail='该会话已有活跃流，请稍后再试。')
+        # 宽容闸（stopResponsivenessPlan §4.1.A）：旧泵已 stopping 且会话锁空闲，
+        # 说明收尾只差泵 finally 的毫秒级簿记 → wait(2) 后重试一次 startStream。
+        # 探测成功必须立即 release，只作空闲性读数，绝不持锁出临界区。
+        oldPump = agentManager.getActivePump(sessionId)
+        if oldPump is not None and oldPump.stopFlag.is_set():
+            sessionLock = agentInstance.getSessionLock(sessionId)
+            if sessionLock.acquire(blocking=False):
+                sessionLock.release()
+                if oldPump.doneEvent.wait(2):
+                    pump = agentManager.startStream(sessionId, agentInstance, stream, meta=streamMeta)
+        if pump is None:
+            raise HTTPException(status_code=409, detail='该会话已有活跃流，请稍后再试。')
     # 首条用户消息发出后标题自动改为前 20 字；发消息刷新 updatedAt（契约 §2.1）。
     # 纯附件发送（D8）时标题取第一个附件名，同样截断前 20 字（评审 L3）。
     titleSource = message.strip()
