@@ -1,6 +1,6 @@
 /*
 Author: wilbur
-Version: 1.12
+Version: 1.13
 Date: 2026-08-14
 Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅色侧栏 + 浅色主区）。
              v1.1 迭代一：侧栏浅色系并清理硬编码深色；侧栏收缩/悬浮展开按钮；设置页整页表单（tab 条/全宽字段/模型折叠卡片/固定保存栏）；用量页费用卡与图表区。
@@ -16,6 +16,7 @@ Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅�
              v1.10 topbar 穿梭灯条周期 1.2s → 3s，减慢跑马灯频率。
              v1.11（composerFocusShortcutPlan F2 discoverability）：新建会话按钮内 .kbd-hint 快捷键提示样式（右浮动 kbd 胶囊）。
              v1.12 设置页只读技能卡片（.skills-section / .skill-card）。
+             v1.13 工具结果折叠预览改为卡内可滚动，保留「展开全部」按钮。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -334,7 +335,10 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
   font-size: 12px; white-space: pre-wrap; word-break: break-all;
   font-family: "SF Mono", Menlo, Consolas, monospace;
 }
-.tool-pre.collapsed { max-height: 120px; overflow: hidden; position: relative; }
+.tool-pre.collapsed {
+  max-height: 120px; overflow-y: auto; position: relative;
+  overscroll-behavior: contain;
+}
 .tool-expand-btn {
   background: none; border: none; color: var(--accent); font-size: 12px; padding: 4px 0 0;
 }
