@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.10
-Date: 2026-08-08
-Description: Maintains per-session conversation state (messages, session lock, pending confirmation). Messages are appended as atomic log events (systemMessage/userMessage/assistantMessage/toolResult); in-memory list is kept for the next model request. v1.6 adds session resume: replay the JSONL log into messages, track dangling/queued tool-call state, and accumulate a session usage total. v1.7 accumulates live-turn usage in appendAssistantMessage so usageTotal covers post-resume turns too. v1.8 restores the logged systemMessage on resume (instead of re-injecting the current one) so the resumed prefix matches the original and provider prompt cache stays hit. v1.9 tracks lastTurnTokens (last call's prompt+completion tokens, rebuilt on resume) for the web status bar's context-window estimate (docs/webAppIteration2Plan.md §3.6). v1.10（fixPlan Phase2）：appendAssistantMessage 从 responsePayload 顶层读取 reasoning（非空才写 event['reasoning']）；_resumeFromLog 不把 reasoning 注入 chatMessage.content（D2 红线：reasoning 不得进入发往模型的 messages）。
+Version: 1.11
+Date: 2026-08-17
+Description: Maintains per-session conversation state (messages, session lock, pending confirmation). Messages are appended as atomic log events (systemMessage/userMessage/assistantMessage/toolResult); in-memory list is kept for the next model request. v1.6 adds session resume: replay the JSONL log into messages, track dangling/queued tool-call state, and accumulate a session usage total. v1.7 accumulates live-turn usage in appendAssistantMessage so usageTotal covers post-resume turns too. v1.8 restores the logged systemMessage on resume (instead of re-injecting the current one) so the resumed prefix matches the original and provider prompt cache stays hit. v1.9 tracks lastTurnTokens (last call's prompt+completion tokens, rebuilt on resume) for the web status bar's context-window estimate (docs/webAppIteration2Plan.md §3.6). v1.10（fixPlan Phase2）：appendAssistantMessage 从 responsePayload 顶层读取 reasoning（非空才写 event['reasoning']）；_resumeFromLog 不把 reasoning 注入 chatMessage.content（D2 红线：reasoning 不得进入发往模型的 messages）。v1.11（toolCallTranscriptClosureFixPlan）：resume 识别 stopRequested 事件；日志尾部 dangling 不再待重跑，统一持久化 cancellation toolResult（userStopped/crashRecovered）；删除 dangling/queuedUserMessage 死代码。
 '''
 
 from __future__ import annotations
@@ -24,8 +24,7 @@ class conversation:
         self.debugConsole = debugConsole
         self.usageTotal: dict[str, int] = {'promptTokens': 0, 'cachedTokens': 0, 'completionTokens': 0}
         self.lastTurnTokens: int = 0  # 最近一次调用的 prompt+completion（下一请求上下文规模估计）
-        self.danglingToolCalls: list[toolCall] = []
-        self.queuedUserMessage: str | None = None
+        self._stopRequestedLogged: bool = False
         if resume:
             # system（含创建时注入的时间戳）也从日志恢复，保证 resume 前缀与上次完全一致、缓存可命中。
             self._resumeFromLog()
@@ -43,19 +42,6 @@ class conversation:
         self.pending = None
         return pending
 
-    def takeDanglingToolCalls(self) -> list[toolCall]:
-        calls = self.danglingToolCalls
-        self.danglingToolCalls = []
-        return calls
-
-    def setQueuedUserMessage(self, message: str) -> None:
-        self.queuedUserMessage = message
-
-    def takeQueuedUserMessage(self) -> str | None:
-        message = self.queuedUserMessage
-        self.queuedUserMessage = None
-        return message
-
     def _resumeFromLog(self) -> None:
         events = self.logger.readEvents()
         openCallIds: list[str] = []
@@ -67,6 +53,9 @@ class conversation:
                     self.messages.append(chatMessage(role='system', content=event.get('content', '')))
                 continue
             if eventType == 'modelError':
+                continue
+            if eventType == 'stopRequested':
+                self._stopRequestedLogged = True
                 continue
             if eventType == 'userMessage':
                 self._closeOrphanToolCalls(openCallIds)
@@ -90,11 +79,31 @@ class conversation:
                         toolCallId=callId,
                         name=event.get('toolName'),
                     ))
-        self.danglingToolCalls = self._collectDanglingCalls(openCallIds)
+        if openCallIds:
+            reason = 'userStopped' if self._stopRequestedLogged else 'crashRecovered'
+            content = (
+                '该工具调用因用户停止未完成；停止前可能已产生文件或命令副作用。'
+                if reason == 'userStopped'
+                else '会话恢复时发现该工具调用未完成；为避免重复副作用未重新执行，停止前可能已产生文件或命令副作用。'
+            )
+            remaining = set(openCallIds)
+            danglingCalls: list[toolCall] = []
+            for message in reversed(self.messages):
+                if message.role == 'assistant' and message.toolCalls:
+                    danglingCalls = [tc for tc in message.toolCalls if tc.id in remaining]
+                    break
+            for call in danglingCalls:
+                self.addToolResult(toolResult(
+                    toolCallId=call.id,
+                    toolName=call.toolName,
+                    isError=True,
+                    content=content,
+                    details={'cancelled': True, 'reason': reason},
+                ))
         if self.debugConsole:
             self.debugConsole.debug(
                 f'resume 重放完成 sessionId={self.sessionId} events={len(events)} '
-                f'messages={len(self.messages)} dangling={len(self.danglingToolCalls)} usage={self.usageTotal}'
+                f'messages={len(self.messages)} unclosed={len(openCallIds)} usage={self.usageTotal}'
             )
 
     def _accumulateUsage(self, usage: dict | None) -> None:
@@ -118,16 +127,6 @@ class conversation:
                 toolCallId=callId,
                 name=None,
             ))
-
-    def _collectDanglingCalls(self, openCallIds: list[str]) -> list[toolCall]:
-        # 从尾部向前找最近一条带 toolCalls 的 assistant，收集仍未闭合的 tool_calls（批次部分执行后挂起时尾部是 toolResult 而非 assistant）。
-        if not openCallIds:
-            return []
-        remaining = set(openCallIds)
-        for message in reversed(self.messages):
-            if message.role == 'assistant' and message.toolCalls:
-                return [tc for tc in message.toolCalls if tc.id in remaining]
-        return []
 
     def appendSystemMessage(self, content: str) -> None:
         if self.debugConsole:
