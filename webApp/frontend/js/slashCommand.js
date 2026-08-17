@@ -1,6 +1,6 @@
 /*
 Author: wilbur
-Version: 1.4
+Version: 1.5
 Date: 2026-08-14
 Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册表（/model 切换当前会话模型、/new 同目录新开会话），
              capture 阶段键盘拦截（§4.3，先于 chatView 的 Enter→send）；不命中指令按普通文本发送。
@@ -9,12 +9,15 @@ Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册
              v1.2：方向键切换 /model 列表高亮时，用面板自身 scrollTop 把当前项拉进 260px 视口，不带动外层滚动。
              v1.3：页面加载/登录后拉一次技能列表常驻；/skill:名 并入同一套前缀过滤；选中后异步回填正文（会话守卫、不改 runItem）。
              v1.4：code review 修订——skill 项前缀过滤对 name 做 toLowerCase（白名单允许大写）；fillSkill 回填前检查输入框仍为空，防慢网覆盖草稿。
+             v1.5：导出 reloadSkills；fillSkill 改为 pinSkillChip（#attachmentChips 蓝色 chip，不再灌 textarea）；window.skillChip {get,clear,pin}。
 */
 (function () {
   'use strict';
 
   var composerInput = document.getElementById('composerInput');
   var panelEl = document.getElementById('slashPanel');
+  var chipsEl = document.getElementById('attachmentChips');
+  var pinnedSkill = null; // { name }：当前钉住的 /skill: chip，与 fileMention 状态互不持有
 
   var panelOpen = false;
   var items = [];        // 当前面板条目 [{ label, desc, run }]
@@ -202,26 +205,48 @@ Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册
     });
   }
 
-  function fillSkill(name) {
-    var sid = window.appStore.currentSessionId;
-    window.api.getSkillBody(name).then(function (result) {
-      if (window.appStore.currentSessionId !== sid) {
-        window.toast('会话已切换，已丢弃技能正文');
-        return;
-      }
-      if (composerInput.value.trim() !== '') {
-        window.toast('输入框已有内容，已丢弃技能正文');
-        return;
-      }
-      var body = (result && result.body) || '';
-      composerInput.value = body + '\n\n';
-      composerInput.selectionStart = composerInput.selectionEnd = composerInput.value.length;
-      composerInput.focus();
-      composerInput.dispatchEvent(new Event('input'));
-    }).catch(function (error) {
-      window.toast('加载技能失败：' + (error.message || '未知错误'));
-    });
+  function hasAttachmentChips() {
+    return !!chipsEl.querySelector('.attachment-chip');
   }
+
+  function renderSkillChip() {
+    var existing = chipsEl.querySelectorAll('.skill-chip');
+    for (var i = 0; i < existing.length; i++) existing[i].parentNode.removeChild(existing[i]);
+    if (!pinnedSkill) {
+      chipsEl.classList.toggle('hidden', !hasAttachmentChips());
+      return;
+    }
+    var el = document.createElement('span');
+    el.className = 'skill-chip';
+    var label = document.createElement('span');
+    label.textContent = '/skill:' + pinnedSkill.name;
+    var remove = document.createElement('button');
+    remove.className = 'attachment-chip-remove';
+    remove.textContent = '✕';
+    remove.title = '移除';
+    remove.addEventListener('click', function () {
+      pinnedSkill = null;
+      renderSkillChip();
+    });
+    el.appendChild(label);
+    el.appendChild(remove);
+    chipsEl.appendChild(el);
+    chipsEl.classList.remove('hidden');
+  }
+
+  function pinSkillChip(name) {
+    pinnedSkill = { name: name };
+    renderSkillChip();
+  }
+
+  window.skillChip = {
+    get: function () { return pinnedSkill ? { name: pinnedSkill.name } : null; },
+    clear: function () {
+      pinnedSkill = null;
+      renderSkillChip();
+    },
+    pin: pinSkillChip
+  };
 
   /* ---------- 触发与键盘 ---------- */
 
@@ -240,7 +265,7 @@ Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册
           items.push({
             label: label,
             desc: skill.description,
-            run: function () { fillSkill(skill.name); }
+            run: function () { pinSkillChip(skill.name); }
           });
         }
       });
@@ -280,7 +305,8 @@ Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册
   }, true);
 
   window.slashCommand = {
-    isOpen: function () { return panelOpen; }
+    isOpen: function () { return panelOpen; },
+    reloadSkills: refreshSkillCache
   };
 
   var originalSetToken = window.appStore.setToken;

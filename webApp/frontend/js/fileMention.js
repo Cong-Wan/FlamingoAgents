@@ -1,11 +1,15 @@
 /*
 Author: wilbur
-Version: 1.1
-Date: 2026-08-11
+Version: 1.3
+Date: 2026-08-14
 Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须为行首/空白（防 user@example.com 误触发），
              目录下钻、文件名过滤、attachable:false 置灰；选中文件生成 chip（输入框上方），发送时随 attachments 提交。
              键盘拦截与 slashCommand 同约（capture 阶段，§4.3）。
              v1.1：修复 IME 组合态按 Enter 误选中条目——组合中放行让输入法先提交候选词（同 slashCommand v1.1）。
+             v1.2：renderChips 只重建 .attachment-chip，保留 .skill-chip；hidden 同时看附件数与 skill chip。
+             v1.3（fileMentionFixPlan）：①↑↓ 移动高亮后面板滚动跟随（补抄 slashCommand scrollActiveIntoView）；
+             ②文件夹可选为附件——目录行尾加「选中」按钮（stopPropagation 防冒泡下钻），键盘 Enter=选中/Tab=下钻；
+             chip 带 type（📄/📁 区分），getAttachments 返回 { path, type }。
 */
 (function () {
   'use strict';
@@ -20,7 +24,7 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
   var currentPath = '';    // 面板当前所在目录（相对 workDir）
   var triggerStart = -1;   // textarea 中触发 @ 的字符下标
   var dirCache = {};       // path → entries（会话内缓存，切会话清空）
-  var chips = [];          // [{ path }]
+  var chips = [];          // [{ path, type }]
 
   /* ---------- 面板 ---------- */
 
@@ -46,6 +50,18 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
         desc.textContent = '超过 512KB';
         row.appendChild(desc);
       }
+      if (item.type === 'dir') {
+        // 目录行尾「选中」按钮：stopPropagation 防冒泡触发行自身的下钻（评审 P1）
+        var pickDir = document.createElement('span');
+        pickDir.className = 'command-desc mention-pick-dir';
+        pickDir.textContent = '选中';
+        pickDir.addEventListener('mousedown', function (event) {
+          event.stopPropagation();
+          event.preventDefault();
+          pickItem(item, true);
+        });
+        row.appendChild(pickDir);
+      }
       row.addEventListener('mousedown', function (event) {
         event.preventDefault();
         pickItem(item);
@@ -54,6 +70,20 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
     });
     panelEl.classList.remove('hidden');
     panelOpen = true;
+    scrollActiveIntoView();
+  }
+
+  // 只改面板自身的 scrollTop，避免 scrollIntoView 沿祖先链带动整页（同 slashCommand）
+  function scrollActiveIntoView() {
+    var active = panelEl.querySelector('.command-item.active');
+    if (!active) return;
+    var panelRect = panelEl.getBoundingClientRect();
+    var itemRect = active.getBoundingClientRect();
+    if (itemRect.top < panelRect.top) {
+      panelEl.scrollTop -= panelRect.top - itemRect.top;
+    } else if (itemRect.bottom > panelRect.bottom) {
+      panelEl.scrollTop += itemRect.bottom - panelRect.bottom;
+    }
   }
 
   function closePanel() {
@@ -113,8 +143,9 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
     composerInput.selectionStart = composerInput.selectionEnd = triggerStart;
   }
 
-  function pickItem(item) {
-    if (item.type === 'dir') {
+  // pickDir：目录的两种行为——false=下钻（默认，点击行/Tab），true=选中为附件（行尾按钮/Enter）
+  function pickItem(item, pickDir) {
+    if (item.type === 'dir' && !pickDir) {
       clearTriggerText();
       triggerStart = composerInput.selectionStart;
       openLevel(item.path, '');
@@ -122,7 +153,7 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
     }
     if (item.attachable === false) return; // 置灰文件不可选
     clearTriggerText();
-    addChip(item.path);
+    addChip(item.path, item.type);
     closePanel();
     composerInput.focus();
   }
@@ -130,13 +161,13 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
   /* ---------- chips ---------- */
 
   function renderChips() {
-    chipsEl.innerHTML = '';
-    chipsEl.classList.toggle('hidden', chips.length === 0);
+    var old = chipsEl.querySelectorAll('.attachment-chip');
+    for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
     chips.forEach(function (chip, index) {
       var el = document.createElement('span');
       el.className = 'attachment-chip';
       var label = document.createElement('span');
-      label.textContent = '📄 ' + chip.path;
+      label.textContent = (chip.type === 'dir' ? '📁 ' : '📄 ') + chip.path;
       label.title = chip.path;
       var remove = document.createElement('button');
       remove.className = 'attachment-chip-remove';
@@ -148,11 +179,14 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
       });
       el.appendChild(label);
       el.appendChild(remove);
-      chipsEl.appendChild(el);
+      var skillChip = chipsEl.querySelector('.skill-chip');
+      if (skillChip) chipsEl.insertBefore(el, skillChip);
+      else chipsEl.appendChild(el);
     });
+    chipsEl.classList.toggle('hidden', chips.length === 0 && !chipsEl.querySelector('.skill-chip'));
   }
 
-  function addChip(path) {
+  function addChip(path, type) {
     for (var i = 0; i < chips.length; i++) {
       if (chips[i].path === path) return; // 去重
     }
@@ -160,7 +194,7 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
       if (window.toast) window.toast('附件最多 8 个');
       return;
     }
-    chips.push({ path: path });
+    chips.push({ path: path, type: type === 'dir' ? 'dir' : 'file' });
     renderChips();
   }
 
@@ -215,8 +249,8 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
     } else if (event.key === 'ArrowDown') {
       activeIndex = (activeIndex + 1) % items.length;
       renderPanel();
-    } else if (items[activeIndex]) { // Enter / Tab
-      pickItem(items[activeIndex]);
+    } else if (items[activeIndex]) { // Enter=选中当前项（目录即选中文件夹）；Tab=下钻（对文件=选中）
+      pickItem(items[activeIndex], event.key === 'Enter');
     }
   }, true);
 
@@ -224,7 +258,7 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
     isOpen: function () { return panelOpen; },
     hasChips: function () { return chips.length > 0; },
     getAttachments: function () {
-      return chips.map(function (chip) { return { path: chip.path }; });
+      return chips.map(function (chip) { return { path: chip.path, type: chip.type }; });
     },
     clearChips: function () {
       chips = [];

@@ -1,6 +1,6 @@
 /*
 Author: wilbur
-Version: 1.13
+Version: 1.14
 Date: 2026-08-14
 Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅色侧栏 + 浅色主区）。
              v1.1 迭代一：侧栏浅色系并清理硬编码深色；侧栏收缩/悬浮展开按钮；设置页整页表单（tab 条/全宽字段/模型折叠卡片/固定保存栏）；用量页费用卡与图表区。
@@ -17,6 +17,7 @@ Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅�
              v1.11（composerFocusShortcutPlan F2 discoverability）：新建会话按钮内 .kbd-hint 快捷键提示样式（右浮动 kbd 胶囊）。
              v1.12 设置页只读技能卡片（.skills-section / .skill-card）。
              v1.13 工具结果折叠预览改为卡内可滚动，保留「展开全部」按钮。
+             v1.14 技能编辑弹层、编辑按钮、/skill: chip 与补全项 label/desc 限长。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -373,8 +374,8 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
 }
 .command-item.active { background: var(--bubble-user); }
 .command-item.disabled { opacity: .45; cursor: not-allowed; }
-.command-label { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.command-desc { color: var(--text-dim); font-size: 12px; margin-left: auto; flex-shrink: 0; }
+.command-label { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
+.command-desc { color: var(--text-dim); font-size: 12px; margin-left: auto; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .command-crumb {
   padding: 5px 10px; font-size: 12px; color: var(--text-dim);
   border-bottom: 1px solid var(--border); margin-bottom: 2px;
@@ -394,6 +395,11 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
 .attachment-chip-remove:hover { color: var(--danger); }
 .attachment-chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .attachment-chip.static { background: #fff; }
+.skill-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: #eaf0fe; border: 1px solid var(--accent); border-radius: 999px;
+  padding: 3px 10px; font-size: 12px; font-weight: 700; color: var(--accent);
+}
 
 /* 迭代二：历史消息中的附件折叠块 */
 .attachment-block {
@@ -517,6 +523,12 @@ img.chat-empty-logo { width: 72px; height: 72px; border-radius: 50%; object-fit:
   background: var(--gray-block); border-radius: 999px; padding: 2px 8px;
 }
 .skill-card-badge-off { color: var(--text-dim); }
+.skill-card-edit-btn { padding: 2px 10px; font-size: 12px; flex-shrink: 0; }
+.modal.skill-edit-modal { width: min(860px, 96vw); }
+.skill-edit-body-input {
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  min-height: 320px; resize: vertical; line-height: 1.55;
+}
 .skill-card-desc { font-size: 13px; color: var(--text); margin-bottom: 6px; white-space: pre-wrap; }
 .skill-card-path {
   font-size: 12px; color: var(--text-dim); word-break: break-all;

@@ -1,6 +1,6 @@
 <!--
 Author: wilbur
-Version: 1.7
+Version: 1.8
 Date: 2026-08-14
 Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局骨架：侧栏 + 主区 + 弹层 + 登录门）。
              v1.1 迭代一：新建弹窗加探建内联确认区；侧栏浅色化 + 收缩/悬浮展开按钮；设置页改 tab + 整页表单 + 固定保存栏；用量页加费用卡与 Chart.js 图表区。
@@ -10,6 +10,7 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
              v1.4 上传 models.json 导入：设置页加「从 pi 导入」按钮与可隐藏面板（文件选择 / 三开关 / 预览 / 应用 / 取消 / 报告）。
              v1.5（composerFocusShortcutPlan F2  discoverability）：「新建会话」按钮加 ⌘K kbd 快捷键提示 + title 悬停提示（⌘K / Ctrl+K）。
              v1.7 技能区从模型配置页抽出，改为与其平级的独立「技能」页 #skillsPage + 侧栏入口 #/settings/skills。
+             v1.8 技能页 notice 改为可编辑说明；新增 #skillEditModal 结构化编辑弹层；composer placeholder 补充 /skill:名 引用技能。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -74,7 +75,7 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
             <div class="composer-row">
               <div class="composer-input-wrap">
                 <textarea id="composerInput" class="composer-input" rows="1"
-                          placeholder="输入消息，Enter 发送，Shift+Enter 换行；/ 指令，@ 引用文件" disabled></textarea>
+                          placeholder="输入消息，Enter 发送，Shift+Enter 换行；/ 指令，/skill:名 引用技能，@ 引用文件" disabled></textarea>
                 <div id="slashPanel" class="command-panel hidden"></div>
                 <div id="mentionPanel" class="command-panel hidden"></div>
               </div>
@@ -128,11 +129,11 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
         </footer>
       </section>
 
-      <!-- 技能页（与模型配置平级，只读） -->
+      <!-- 技能页（与模型配置平级，可编辑） -->
       <section id="skillsPage" class="page hidden">
         <header class="topbar"><span class="topbar-title">技能</span></header>
         <div class="page-body">
-          <div class="settings-notice">只读展示 <code>config/skills/</code> 下的技能（每个技能一个文件夹 + 一个 <code>SKILL.md</code>）。「是否进 prompt」指<strong>下次新建会话</strong>会注入；已打开的旧会话 resume 不受影响。修改技能请直接编辑磁盘文件。</div>
+          <div class="settings-notice">展示并编辑 <code>config/skills/</code> 下的技能（每个技能一个文件夹 + 一个 <code>SKILL.md</code>）。保存后下次新建会话生效；改名会同步重命名技能文件夹（附属文件随文件夹迁移）。</div>
           <div id="skillsList" class="skills-list"></div>
         </div>
       </section>
@@ -207,6 +208,27 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
       <div class="modal-actions">
         <button id="confirmReject" class="btn btn-danger">拒绝</button>
         <button id="confirmApprove" class="btn btn-primary">批准</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 技能编辑弹层 -->
+  <div id="skillEditModal" class="modal-mask hidden">
+    <div class="modal skill-edit-modal">
+      <h2 class="modal-title">编辑技能</h2>
+      <label class="form-label">名称</label>
+      <input id="skillEditName" class="form-input" type="text" placeholder="字母/数字/下划线/短横线">
+      <div class="field-hint">字母/数字/下划线/短横线；与文件夹同名，改名即重命名文件夹</div>
+      <label class="form-label">描述</label>
+      <input id="skillEditDescription" class="form-input" type="text" placeholder="单行描述">
+      <div class="field-hint">单行；勿含英文冒号+空格，建议用中文标点</div>
+      <label class="form-label"><input id="skillEditEnabled" type="checkbox"> 注入 prompt（下次新建会话生效）</label>
+      <label class="form-label">正文</label>
+      <textarea id="skillEditBody" class="form-input skill-edit-body-input"></textarea>
+      <div id="skillEditError" class="field-error hidden"></div>
+      <div class="modal-actions">
+        <button id="skillEditCancel" class="btn" type="button">取消</button>
+        <button id="skillEditSave" class="btn btn-primary" type="button">保存</button>
       </div>
     </div>
   </div>
