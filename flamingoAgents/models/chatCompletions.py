@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.15
-Date: 2026-08-13
-Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden). v1.11（fixPlan Phase2）：流式累积 reasoningParts 并在流结束时写入顶层 responsePayload['reasoning']（非空才写，不入 messagePayload）；complete() 非流式出口归一化 choices[0].message.reasoning_content -> 顶层 reasoning，保持 choices[0].message 与非流式同构（reasoning 不得进入发往模型的 messages，D2 红线）。v1.12（streamingLatencyFixPlan Phase1/T1.1）：iterSseData 改优先 read1(4096)（getattr fallback read），修复 chunked SSE 上 read(amt) 阻塞凑批导致的「长时间真空后一次性喷出」。v1.13：默认 User-Agent 为 OpenAI/JS 6.26.0，避免 urllib 自动带上 Python-urllib/x.y；models.yaml 自定义 headers 仍可覆盖。v1.14 modelRequestError 新增 retryAfterSeconds（解析 429 Retry-After 头，秒/HTTP-date）。v1.15（stopResponsivenessPlan L3）：activeResponses 登记 + interruptActiveStreams shutdown 唤醒；completeStream/consumeSseStream/iterSseData 透传 stopEvent，三路径（IncompleteRead/空字节/OSError）统一 raise modelInterruptedError；interrupt 时给 response 打 _flamingoInterrupted 标记，覆盖「先 shutdown 后 set stopEvent」竞态。
+Version: 1.16
+Date: 2026-08-17
+Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden). v1.11（fixPlan Phase2）：流式累积 reasoningParts 并在流结束时写入顶层 responsePayload['reasoning']（非空才写，不入 messagePayload）；complete() 非流式出口归一化 choices[0].message.reasoning_content -> 顶层 reasoning，保持 choices[0].message 与非流式同构（reasoning 不得进入发往模型的 messages，D2 红线）。v1.12（streamingLatencyFixPlan Phase1/T1.1）：iterSseData 改优先 read1(4096)（getattr fallback read），修复 chunked SSE 上 read(amt) 阻塞凑批导致的「长时间真空后一次性喷出」。v1.13：默认 User-Agent 为 OpenAI/JS 6.26.0，避免 urllib 自动带上 Python-urllib/x.y；models.yaml 自定义 headers 仍可覆盖。v1.14 modelRequestError 新增 retryAfterSeconds（解析 429 Retry-After 头，秒/HTTP-date）。v1.15（stopResponsivenessPlan L3）：activeResponses 登记 + interruptActiveStreams shutdown 唤醒；completeStream/consumeSseStream/iterSseData 透传 stopEvent，三路径（IncompleteRead/空字节/OSError）统一 raise modelInterruptedError；interrupt 时给 response 打 _flamingoInterrupted 标记，覆盖「先 shutdown 后 set stopEvent」竞态。v1.16（emptyAssistantRequestFixPlan）：convertMessage 对无 toolCalls 且 content 空/空白的 assistant 在 wire 上改发 '.'，避免 provider 400 assistant must not be empty；不写回 chatMessage/jsonl，不读 reasoning。
 '''
 
 from __future__ import annotations
@@ -334,9 +334,13 @@ class chatCompletionsAdapter:
                 'tool_call_id': message.toolCallId,
                 'content': message.content,
             }
+        content = message.content
+        # 仅请求构造：无 toolCalls 的空 assistant 发 '.'，避免 provider 400；不写回 message。
+        if message.role == 'assistant' and not message.toolCalls and not (content or '').strip():
+            content = '.'
         converted: dict[str, Any] = {
             'role': message.role,
-            'content': message.content,
+            'content': content,
         }
         if message.role == 'assistant' and message.toolCalls:
             converted['tool_calls'] = [
