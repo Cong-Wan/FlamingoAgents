@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.4
-Date: 2026-08-14
+Version: 1.5
+Date: 2026-08-17
 Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新建会话弹窗、重命名/删除、底部入口高亮。
              v1.1 迭代一：新建弹窗探建交互（契约 §3.3/§3.4 先探后建 + allowCreate 内联确认）；
              侧栏完全隐藏/悬浮展开（localStorage sidebarCollapsed）。
@@ -9,6 +9,9 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
              供 Cmd/Ctrl+K 快捷键直达「新建会话」弹窗（含 workDir 探建确认）。
              v1.3 新建会话模型下拉去掉「默认」占位项，直接列出该 provider 的 modelId。
              v1.4 新建会话弹窗支持快捷键：Enter = 创建，Esc = 取消。
+             v1.5（workDirPickerPlan §2.2）：workDir 输入框 VSCode 式目录补全--splitWorkDirInput/joinWorkDir 纯函数、防抖 200ms + 请求序号丢过期响应、
+             mousedown 回填下钻、改写现有 document keydown（IME 放行 + suggestVisible 闸门 + Tab/-> 仅末尾 + Enter 有高亮回填/无高亮创建 + Esc 先关下拉）、
+             setWorkDirValue 显式回填（.value 赋值不触发 input）、closeModal 清下拉与防抖。
 */
 (function () {
   'use strict';
@@ -27,6 +30,133 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
 
   var cachedModelConfig = null; // 新建弹窗的 provider/model 下拉数据源（GET /api/models）
   var pendingCreatePath = null; // probe 确认的 resolvedPath（确认创建时提交它，而非用户原始输入）
+
+  // ---------- workDir 补全（workDirPickerPlan §2.2） ----------
+
+  var suggestEl = document.getElementById('workDirSuggest');
+  var suggestItems = [];      // 当前展示的目录名（前缀过滤后）
+  var suggestIndex = 0;       // 高亮下标，渲染后默认 0
+  var suggestSeq = 0;         // 请求序号：丢弃过期响应
+  var suggestTimer = null;    // 防抖 200ms
+  var suggestBrowsePath = ''; // 当前列表对应的浏览目录（回填拼接用）
+
+  function splitWorkDirInput(raw) {
+    // 目录部分与前缀切分（评审问题 1/7）：空目录部分归一为 '/'；~user 无斜杠时整段交后端 expanduser，不当根目录前缀。
+    var value = String(raw || '');
+    if (value === '' || value === '/') return { browsePath: '/', prefix: '' };
+    if (value === '~' || value === '~/') return { browsePath: '~', prefix: '' };
+    var slash = value.lastIndexOf('/');
+    if (slash < 0) {
+      if (value.charAt(0) === '~') return { browsePath: value, prefix: '' };
+      return { browsePath: '/', prefix: value };
+    }
+    var browsePath = value.slice(0, slash);
+    var prefix = value.slice(slash + 1);
+    if (browsePath === '') browsePath = '/';
+    return { browsePath: browsePath, prefix: prefix };
+  }
+
+  function joinWorkDir(browsePath, name) {
+    // 回填拼接（复审 A）：browsePath 不含尾斜杠，统一拼 '/'；'/' 时拼 '/name/'，避免丢中间 '/' 或退化相对路径。
+    var base = browsePath === '/' ? '' : browsePath;
+    return base + '/' + name + '/';
+  }
+
+  function suggestVisible() {
+    return !suggestEl.classList.contains('hidden') && suggestItems.length > 0;
+  }
+
+  function hideSuggest() {
+    suggestEl.classList.add('hidden');
+    suggestEl.innerHTML = '';
+    suggestItems = [];
+    suggestIndex = 0;
+  }
+
+  function renderSuggest() {
+    suggestEl.innerHTML = '';
+    suggestItems.forEach(function (name, index) {
+      var item = document.createElement('div');
+      item.className = 'workdir-suggest-item' + (index === suggestIndex ? ' active' : '');
+      var icon = document.createElement('span');
+      icon.textContent = '📁';
+      item.appendChild(icon);
+      var label = document.createElement('span');
+      label.textContent = name;
+      item.appendChild(label);
+      // mousedown + preventDefault：避免 input 的 blur 先于 click 拆掉下拉导致点不中（评审问题 4）
+      item.addEventListener('mousedown', function (event) {
+        event.preventDefault();
+        applySuggest(name);
+      });
+      item.addEventListener('mousemove', function () {
+        if (suggestIndex !== index) { suggestIndex = index; updateSuggestActive(); }
+      });
+      suggestEl.appendChild(item);
+    });
+    suggestEl.classList.remove('hidden');
+  }
+
+  function updateSuggestActive() {
+    var rows = suggestEl.children;
+    for (var i = 0; i < rows.length; i++) {
+      rows[i].classList.toggle('active', i === suggestIndex);
+    }
+  }
+
+  function moveSuggestHighlight(delta) {
+    if (!suggestVisible()) return;
+    var count = suggestItems.length;
+    suggestIndex = (suggestIndex + delta + count) % count;
+    updateSuggestActive();
+    var active = suggestEl.children[suggestIndex];
+    if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+  }
+
+  function applySuggest(name) {
+    setWorkDirValue(joinWorkDir(suggestBrowsePath, name));
+  }
+
+  async function fetchSuggest() {
+    var value = workDirInput.value;
+    if (!value.trim()) { hideSuggest(); return; } // 空输入不发请求
+    var parts = splitWorkDirInput(value);
+    var seq = ++suggestSeq;
+    try {
+      var data = await window.api.listFsDir(parts.browsePath);
+      if (seq !== suggestSeq) return; // 过期响应丢弃
+      var lower = parts.prefix.toLowerCase();
+      var names = (data.entries || []).map(function (entry) { return entry.name; })
+        .filter(function (name) { return !lower || name.toLowerCase().indexOf(lower) === 0; });
+      if (names.length === 0) { hideSuggest(); return; }
+      suggestBrowsePath = parts.browsePath;
+      suggestItems = names;
+      suggestIndex = 0;
+      renderSuggest();
+    } catch (ignore) {
+      if (seq === suggestSeq) hideSuggest(); // 浏览失败隐藏下拉，不打断输入；错误交给 probe 红字
+    }
+  }
+
+  function scheduleSuggest() {
+    if (suggestTimer) clearTimeout(suggestTimer);
+    suggestTimer = setTimeout(function () {
+      suggestTimer = null;
+      fetchSuggest();
+    }, 200);
+  }
+
+  function setWorkDirValue(next) {
+    // 显式回填（评审问题 4）：.value 赋值不触发 input 事件，必须手动收反馈 + 触发补全。
+    workDirInput.value = next;
+    hideProbeFeedback();
+    scheduleSuggest();
+  }
+
+  function isCaretAtEnd() {
+    return workDirInput.selectionStart === workDirInput.value.length
+      && workDirInput.selectionEnd === workDirInput.value.length;
+  }
 
   /* ---------- 侧栏完全隐藏/悬浮展开（§11.2，状态存 localStorage） ---------- */
 
@@ -186,6 +316,7 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
   async function openModal() {
     errorEl.classList.add('hidden');
     hideProbeFeedback();
+    hideSuggest();
     workDirInput.value = '';
     createButton.disabled = false;
     try {
@@ -198,14 +329,18 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
     // 预填 defaultWorkDir（契约 §3.4 空 workDir 会 400，以 '/' 占位调 probe 仅取 defaultWorkDir）
     try {
       var probe = await window.api.probeWorkDir('/');
-      if (probe.defaultWorkDir) workDirInput.value = probe.defaultWorkDir;
+      if (probe.defaultWorkDir) setWorkDirValue(probe.defaultWorkDir); // 显式函数：赋值+收反馈+触发补全（评审问题 4）
     } catch (ignore) { /* 预填失败不阻塞弹窗 */ }
     modalEl.classList.remove('hidden');
+    workDirInput.focus(); // 打开即触发 focus 下的补全链路（cursor 置尾）
   }
 
   function closeModal() {
     modalEl.classList.add('hidden');
     hideProbeFeedback();
+    hideSuggest();
+    suggestSeq++; // 弹窗关后丢弃在途响应，防 200ms 后又把下拉画出来
+    if (suggestTimer) { clearTimeout(suggestTimer); suggestTimer = null; }
   }
 
   // 提交 create（契约 §3.3 非幂等 L4：按钮禁用至响应返回）；400 错误在弹窗内展示
@@ -310,14 +445,37 @@ Description: 侧栏视图：会话列表（今天/昨天/更早分组）、新�
   confirmCreateButton.addEventListener('click', function () {
     if (pendingCreatePath) submitCreate(pendingCreatePath, true); // 确认创建 → allowCreate:true
   });
-  workDirInput.addEventListener('input', hideProbeFeedback); // 改动路径后收起确认区/红字
+  workDirInput.addEventListener('input', function () {
+    hideProbeFeedback(); // 改动路径后收起确认区/红字
+    scheduleSuggest();   // 用户手输触发补全
+  });
   providerSelect.addEventListener('change', fillModelOptions);
   modalEl.addEventListener('click', function (event) {
     if (event.target === modalEl) closeModal();
   });
-  // 快捷键：Enter = 创建 / Esc = 取消（挂 document，只判断弹窗可见，不受焦点位置影响）
+  // 快捷键：改写原有监听（评审问题 3：禁止平行再挂），先服务下拉再走弹窗原逻辑；IME 放行。
   document.addEventListener('keydown', function (event) {
     if (modalEl.classList.contains('hidden')) return; // 弹窗未打开时不处理
+    if (event.isComposing || event.keyCode === 229) return; // 中文输入法回车上屏不当作创建/选中
+    if (suggestVisible()) {
+      if (event.key === 'ArrowDown') { event.preventDefault(); moveSuggestHighlight(1); return; }
+      if (event.key === 'ArrowUp') { event.preventDefault(); moveSuggestHighlight(-1); return; }
+      if (event.key === 'Tab' || (event.key === 'ArrowRight' && isCaretAtEnd())) {
+        event.preventDefault();
+        applySuggest(suggestItems[suggestIndex]);
+        return;
+      }
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        applySuggest(suggestItems[suggestIndex]); // 下拉可见有高亮 -> 只回填不创建
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        hideSuggest(); // 先关下拉，不关弹窗
+        return;
+      }
+    }
     if (event.key === 'Enter' && event.target.tagName !== 'TEXTAREA') {
       event.preventDefault();
       onCreate();

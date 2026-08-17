@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.10
-Date: 2026-08-14
+Version: 1.11
+Date: 2026-08-17
 Description: FastAPI 应用与全部路由：认证依赖、统一异常映射（库 RuntimeError → 400 透传中文消息）、sessionId 入口校验、SSE 对话流、静态文件容忍空目录挂载。
             v1.1 随包改名调整 import（webApp.backend.*）；静态目录由 static/ 改为 webApp/frontend/，projectRoot 随目录加深改为 parents[2]。
             v1.2 迭代一（契约 v1.2 §3.3/§3.4/§3.10）：新增 probeWorkDir 与 usage/series 端点；create 会话 workDir 改必填 + allowCreate，
@@ -16,6 +16,10 @@ Description: FastAPI 应用与全部路由：认证依赖、统一异常映射�
             v1.8（stopResponsivenessPlan §4.1.A）：chatStream 宽容闸——旧泵已 stopping 且会话锁空闲时 wait(2) 后重试 startStream，超时/锁占用仍 409。
             v1.9 新增 GET /api/skills 与 GET /api/skills/{name}（只读，鉴权，name 白名单 400 / 未知 404 / 越界 400）。
             v1.10 GET /api/skills/{name} 改调 getSkillForEdit（响应扩 description/disabled）；新增 PUT /api/skills/{name} 编辑保存。
+            v1.11（workDirPickerPlan §2.1/§2.3）：新增 POST /api/fs/listDir（workDir 补全，调 fileBrowser.listAbsDirs）；
+            probeWorkDir/createSession 放开多级目录创建--新增 nearestWritableAncestor（遇最近存在节点是文件/不可写目录返 None，禁止跨过），
+            mkdir(parents=True, exist_ok=True) + FileNotFoundError/PermissionError/泛化 OSError 兜底 + mkdir 后 is_dir/可读写双保险
+            （parents 后 FileExistsError 可能是中间级被文件占，不再一律视为成功）。
 '''
 
 from __future__ import annotations
@@ -123,6 +127,37 @@ def listSessions():
     return {'sessions': sessionStore.listSessions()}
 
 
+def nearestWritableAncestor(path: Path) -> Path | None:
+    # 多级创建判定（workDirPickerPlan §2.3 合同，probe/create 共用）：
+    # 1. 不考虑 path 自身，从 path.parent 往上走；
+    # 2. 遇到第一个 exists() 的节点：仅当 is_dir() 且 access(W_OK|X_OK) 才返回它；否则返回 None
+    #    （存在但是文件 / 不可写目录都是 None，禁止跨过去继续往上找--否则 mkdir(parents=True) 无法穿过文件，先探后建被破坏）；
+    # 3. 走到根仍没有 -> None。
+    current = path.parent
+    while True:
+        try:
+            if current.exists():
+                if current.is_dir() and os.access(current, os.W_OK | os.X_OK):
+                    return current
+                return None
+        except OSError:
+            return None
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+@authedApi.post('/fs/listDir')
+def fsListDir(body: dict = Body(...)):
+    # workDir 补全（workDirPickerPlan §2.1）：服务器绝对路径列目录；路由只做入参校验与异常映射，scandir 逻辑在 fileBrowser.listAbsDirs。
+    pathRaw = body.get('path') if isinstance(body, dict) else None
+    if not isinstance(pathRaw, str) or not pathRaw.strip():
+        raise HTTPException(status_code=400, detail='path 必须是非空字符串。')
+    result = fileBrowser.listAbsDirs(pathRaw.strip())  # RuntimeError -> 统一异常映射 400 透传，返回 { path, entries, truncated }
+    return result
+
+
 @authedApi.post('/sessions/probeWorkDir')
 def probeWorkDir(body: dict = Body(...)):
     # 无副作用探测（契约 §3.4）：前端「先探后建」，判定只用 creatable/willCreate 两个布尔。
@@ -130,10 +165,8 @@ def probeWorkDir(body: dict = Body(...)):
     if not isinstance(workDirRaw, str) or not workDirRaw.strip():
         raise HTTPException(status_code=400, detail='workDir 必须是非空字符串。')
     workPath = Path(workDirRaw).expanduser().resolve()
-    parentPath = workPath.parent
     result = {
         'resolvedPath': str(workPath),
-        'parentPath': str(parentPath),
         'defaultWorkDir': str(projectRoot),
     }
     if workPath.is_dir():
@@ -148,14 +181,15 @@ def probeWorkDir(body: dict = Body(...)):
     elif workPath.exists():
         result.update(exists=False, writable=False, creatable=False, willCreate=False,
                       message=f'路径已存在且不是目录：{workPath}')
-    elif not parentPath.is_dir():
-        result.update(exists=False, writable=False, creatable=False, willCreate=True,
-                      message=f'父目录不存在：{parentPath}')
-    elif not os.access(parentPath, os.W_OK | os.X_OK):
-        result.update(exists=False, writable=False, creatable=False, willCreate=True,
-                      message=f'无权限在 {parentPath} 下创建目录')
     else:
-        result.update(exists=False, writable=True, creatable=True, willCreate=True, message='目录不存在，可创建。')
+        # 多级创建判定（workDirPickerPlan §2.3）：最近存在祖先是可写目录即可建（不再要求父目录已存在）。
+        ancestor = nearestWritableAncestor(workPath)
+        if ancestor is not None:
+            result.update(exists=False, writable=True, creatable=True, willCreate=True,
+                          message=f'目录不存在，将创建：{workPath}')
+        else:
+            result.update(exists=False, writable=False, creatable=False, willCreate=True,
+                          message=f'无法创建：{workPath}（最近存在的祖先不是可写目录）')
     return result
 
 
@@ -189,17 +223,22 @@ def createSession(body: dict = Body(...)):
     else:
         if not allowCreate:
             raise HTTPException(status_code=400, detail=f'workDir 不存在：{workPath}')
-        parentPath = workPath.parent
-        if not parentPath.is_dir():
-            raise HTTPException(status_code=400, detail=f'父目录不存在：{parentPath}')
-        if not os.access(parentPath, os.W_OK | os.X_OK):
-            raise HTTPException(status_code=400, detail=f'无权限在 {parentPath} 下创建目录')
+        # 多级创建（workDirPickerPlan §2.3）：不再要求父目录已存在，最近存在祖先是可写目录即可；
+        # parents=True 后 FileExistsError 可能是中间级被文件占，不能一律视为成功，mkdir 后双保险复验。
+        if nearestWritableAncestor(workPath) is None:
+            raise HTTPException(status_code=400, detail=f'无法创建：{workPath}（最近存在的祖先不是可写目录）')
         try:
-            workPath.mkdir()  # 只建最后一级（不带 parents，方案 §11.0）
-        except FileExistsError:
-            pass  # TOCTOU 兜底：被抢建视为成功
+            workPath.mkdir(parents=True, exist_ok=True)
+        except FileNotFoundError:
+            raise HTTPException(status_code=400, detail=f'祖先目录已被删除，请重试：{workPath}')
+        except PermissionError:
+            raise HTTPException(status_code=400, detail=f'无权限创建目录：{workPath}')
         except OSError as error:
             raise HTTPException(status_code=400, detail=f'创建目录失败：{error}')
+        if not workPath.is_dir():
+            raise HTTPException(status_code=400, detail=f'路径已存在且不是目录：{workPath}')
+        if not os.access(workPath, os.R_OK | os.W_OK | os.X_OK):
+            raise HTTPException(status_code=400, detail=f'目录不可读写：{workPath}')
     return sessionStore.createSession(str(workPath.resolve()), providerId, resolved.config.model)
 
 

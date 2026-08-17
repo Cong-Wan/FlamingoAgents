@@ -1,6 +1,6 @@
 /*
 Author: wilbur
-Version: 1.15
+Version: 1.16
 Date: 2026-08-17
 Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅色侧栏 + 浅色主区）。
              v1.1 迭代一：侧栏浅色系并清理硬编码深色；侧栏收缩/悬浮展开按钮；设置页整页表单（tab 条/全宽字段/模型折叠卡片/固定保存栏）；用量页费用卡与图表区。
@@ -19,6 +19,7 @@ Description: FlamingoAgents Web 前端样式（Kimi 官网桌面版风格：浅�
              v1.13 工具结果折叠预览改为卡内可滚动，保留「展开全部」按钮。
              v1.14 技能编辑弹层、编辑按钮、/skill: chip 与补全项 label/desc 限长。
              v1.15（markdownRenderUnifyPlan D2=B）：补齐 .markdown-content 被全局 reset 清掉的标题/段落/列表/链接/图片/hr。
+             v1.16（workDirPickerPlan §2.2）：workDir 补全下拉样式 .workdir-field/.workdir-suggest（参照 .command-panel：#fff 背景、--border、--bubble-user 高亮）。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -509,6 +510,20 @@ img.chat-empty-logo { width: 72px; height: 72px; border-radius: 50%; object-fit:
   display: flex; flex-direction: column; gap: 10px; align-items: flex-start;
 }
 .workdir-create-confirm code { word-break: break-all; }
+
+/* workDir 补全下拉（workDirPickerPlan §2.2，参照 .command-panel） */
+.workdir-field { position: relative; }
+.workdir-suggest {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 60;
+  background: #fff; border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.12);
+  max-height: 220px; overflow-y: auto; padding: 4px;
+}
+.workdir-suggest-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px; border-radius: 7px; cursor: pointer; font-size: 13px;
+}
+.workdir-suggest-item.active { background: var(--bubble-user); }
 
 .confirm-row { display: flex; gap: 10px; margin-bottom: 10px; font-size: 14px; }
 .confirm-label { width: 64px; flex-shrink: 0; color: var(--text-dim); font-size: 13px; padding-top: 2px; }

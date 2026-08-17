@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.10
-> Date: 2026-08-14
+> Version: 1.11
+> Date: 2026-08-17
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 8 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -17,6 +17,7 @@
 > v1.8：模型调用重试——§4.3 事件集新增非终态 `retryNotice`（连接建立期失败退避通知；进泵内存 history 可 attach 回放，不落 jsonl；中途断流不重试）。
 > v1.9：上传 pi models.json 导入——新增 §3.18 POST /api/models/importPi（只收 rawText；不读盘不写盘；响应 providers 含上传文件明文 apiKey，鉴权内有意为之）。
 > v1.10：Skill 能力——新增 §3.19 GET /api/skills、§3.20 GET /api/skills/{name}（只读、鉴权；slash `/skill:名` 选中后把正文填进输入框，不自动发送）。
+> v1.11：workDirPickerPlan——新增 §3.21 POST /api/fs/listDir（服务器绝对路径列目录，供新建会话 workDir 补全）；§3.3/§3.4 放开多级目录创建（`mkdir(parents=True)` + `nearestWritableAncestor`），probe 响应去掉 `parentPath`。
 
 ---
 
@@ -220,9 +221,9 @@
 { "workDir": "/abs/path", "providerId": "volcano", "modelId": "可缺省", "allowCreate": false }
 ```
 
-- `workDir` **必填**（v1.2 变更，原为可缺省）：必须是非空字符串；
+- `workDir` **必填**（v1.2 变更，原为可缺省）：必须是非空字符串；支持 `~` / `~user` 前缀（`Path.expanduser()`，入库前再 `resolve()`）；
 - 目录已存在：必须是目录且当前进程可读写进入（`R_OK|W_OK|X_OK`），否则 400；
-- 目录不存在：`allowCreate=false`（缺省）→ 400 `workDir 不存在：…`；`allowCreate=true` → 校验**上一级父目录**存在且可写（`W_OK|X_OK`）后 `mkdir` **只建最后一级**（不带 parents），父目录不存在 → 400 `父目录不存在：…`，父目录不可写 → 400 `无权限在 … 下创建目录`；
+- 目录不存在：`allowCreate=false`（缺省）→ 400 `workDir 不存在：…`；`allowCreate=true` → 沿父链找**最近存在的祖先**（`nearestWritableAncestor`：从 `path.parent` 往上，遇到第一个 `exists()` 的节点必须是可写目录，否则失败——**禁止跨过文件继续往上找**），然后 `mkdir(parents=True, exist_ok=True)`。mkdir 后双保险：`is_dir()` + `R_OK|W_OK|X_OK`，否则 400。祖先不可写 / 最近存在节点是文件 → 400 `无法创建：…（最近存在的祖先不是可写目录）`；祖先被并发删除 → 400 `祖先目录已被删除，请重试：…`；其它 `OSError`（含中间级是文件的 `NotADirectoryError`）→ 400 `创建目录失败：…`。**v1.11 变更**：不再要求上一级父目录已存在，也不再「只建最后一级」；`FileExistsError` 不再一律视为成功（`parents=True` 后该异常也可能表示中间级被文件占）。
 - `providerId` 必填，必须在 models.yaml 中存在，否则 400；`modelId` 可缺省（= provider 首个模型）；指定但不存在 → 400；
 - **校验实现路径（审核 M4）**：Web 层调库 `loadModelConfigFromYaml(providerId, modelId)` 做预检（仅解析 yaml，无网络开销，不建 agent），`RuntimeError` 消息透传为 400。**不得依赖库的默认回退**：yaml 缺失时库会静默回退环境变量配置（providerId 被忽略），故 yaml 缺失时本接口一律 400 `config/models.yaml 不存在。`（审核 M3）；
 - 200：创建好的 session 对象（§2.1）。此时**不创建 agent 实例、不写 jsonl**（惰性：首发消息时才建）；
@@ -230,7 +231,7 @@
 
 ### 3.4 POST /api/sessions/probeWorkDir —— 探测 workDir（v1.2 新增，前端「先探后建」）
 
-请求：`{ "workDir": "/abs/path" }`（必填非空，否则 400）
+请求：`{ "workDir": "/abs/path" }`（必填非空，否则 400；支持 `~` / `~user`，响应 `resolvedPath` 为 `expanduser().resolve()` 后的绝对路径）
 
 - 200：
 
@@ -241,22 +242,20 @@
   "writable": true,
   "creatable": true,
   "willCreate": true,
-  "parentPath": "/home/xx/project",
   "defaultWorkDir": "/Users/wilbur/project/FlamingoAgents",
-  "message": "目录不存在，可创建。"
+  "message": "目录不存在，将创建：/home/xx/project/aaaa"
 }
 ```
 
-**字段语义（审核修订，前端判定只用 `creatable`/`willCreate` 两个布尔）**：`exists`=路径已存在且是目录；`writable`=（exists 时）目录本身可读写进入 /（不存在时）父目录可写；`creatable`=**可以建会话**（exists&&writable，或 !exists&&willCreate&&父目录可写）；`willCreate`=建会话时是否需要新建目录；`defaultWorkDir`=项目根路径（新建弹窗预填用，审核高 2）。
+**字段语义（前端判定只用 `creatable`/`willCreate` 两个布尔）**：`exists`=路径已存在且是目录；`writable`=（exists 时）目录本身可读写进入 /（不存在时）最近存在祖先可写；`creatable`=**可以建会话**（exists&&writable，或 !exists&&willCreate&&最近祖先可写）；`willCreate`=建会话时是否需要新建目录；`defaultWorkDir`=项目根路径（新建弹窗预填用）。**v1.11 变更**：响应不再返回 `parentPath`（前端未消费）；多级判定改用 `nearestWritableAncestor`，不再要求上一级父目录已存在。
 
 | 情形 | exists | writable | creatable | willCreate | message |
 |---|---|---|---|---|---|
 | 存在且可读写进入 | true | true | true | false | `目录可用。` |
 | 存在但权限不足 | true | false | false | false | `目录不可读写：…` |
 | 存在但不是目录 | false | false | false | false | `路径已存在且不是目录：…` |
-| 不存在，父目录可写 | false | true | true | true | `目录不存在，可创建。` |
-| 不存在，父目录不存在 | false | false | false | true | `父目录不存在：…` |
-| 不存在，父目录不可写 | false | false | false | true | `无权限在 … 下创建目录` |
+| 不存在，最近祖先是可写目录 | false | true | true | true | `目录不存在，将创建：…` |
+| 不存在，最近存在节点是文件 / 不可写目录 / 无祖先 | false | false | false | true | `无法创建：…（最近存在的祖先不是可写目录）` |
 
 - 本接口**无副作用**（不创建目录、不写索引）；仅探测。前端据此决定直接提交 / 弹创建确认 / 红字拦截。
 
@@ -516,6 +515,37 @@
 - 404：白名单内但加载结果无此名 → `技能不存在：{name}`。
 
 前端 slash 行为（非本接口语义，仅对照）：输入 `/skill:<名>` 选中后把 `body + "\n\n"` 填进输入框，光标置尾，**不自动发送**；用户补参数后再回车。
+
+### 3.21 POST /api/fs/listDir —— 服务器绝对路径列目录（v1.11 新增，新建会话 workDir 补全）
+
+鉴权：与其它 `/api/*` 相同。**不能复用** §3.16 `GET /api/sessions/{id}/files`——那个端点被拘禁在已有会话的 workDir 内；本端点在新建会话时使用，浏览范围是服务器文件系统。
+
+请求：
+
+```json
+{ "path": "/Users/wilbur/proj" }
+```
+
+- `path` 必填非空字符串，否则 400 `path 必须是非空字符串。`；支持 `~` / `~user`（`Path.expanduser()`）。
+- 实现：`fileBrowser.listAbsDirs`（**不走** `resolveInside` 拘禁）。
+- 仅返回**目录**条目（符号链接指向目录时 `is_dir(follow_symlinks=True)` 计入）；**写死过滤** `name` 以 `.` 开头的条目（第一版不加 `showHidden` 开关）。
+- 单条 `stat` 失败（坏符号链接/竞态删除）跳过，不拖垮整层。
+- 截断顺序（刻意与 §3.16 不同）：scandir 全量 → 只留目录 → 丢掉 dot → 按 `name.lower()` 全量排序 → 再截 500，超出 `truncated: true`。§3.16 是 scandir 物理序数到 500 就 break，按前缀匹配的补全会因此丢项。
+
+200：
+
+```json
+{
+  "path": "/Users/wilbur/proj",
+  "entries": [ { "name": "FlamingoAgents", "type": "dir" } ],
+  "truncated": false
+}
+```
+
+- 不返回 `parent` 字段（前端无「上一级」条目）。
+- 400：目标不存在 → `目录不存在：…`；存在但不是目录 → `不是目录：…`；不可读 → `目录不存在或不可读：…`（`RuntimeError` 走统一异常映射）。
+- 无副作用（只读）。
+- **信任边界** = 持有登录 token 的本机用户。只返回目录名，不含文件内容/文件列表。多用户或对外网暴露时必须加根路径白名单，且应同时收紧 §3.3 的 workDir——单收紧本端点没有意义。
 
 ## 4. SSE 流式接口
 

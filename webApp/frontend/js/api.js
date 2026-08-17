@@ -1,13 +1,14 @@
 /*
 Author: wilbur
-Version: 1.5
-Date: 2026-08-14
+Version: 1.6
+Date: 2026-08-17
 Description: fetch 封装：自动带 Bearer token；任意请求 401 → 清 token → 登录门（契约 §1.1/§3.1/§5）。
              v1.1 迭代一：新增 probeWorkDir（§3.4）与 getUsageSeries（§3.10）。
              v1.2 迭代二（方案 §4.9）：新增 getSessionStatus / updateSessionModel / listFiles / getFileContent。
              v1.3 上传 models.json 导入：新增 importPiModels → POST /api/models/importPi { rawText }。
              v1.4 新增 getSkills / getSkillBody（§3.19/§3.20，技能只读列表/正文，技能页与 /skill: 共用）。
              v1.5 新增 saveSkill → PUT /api/skills/{name}（技能页结构化编辑保存）。
+             v1.6（workDirPickerPlan §2.1）：新增 listFsDir -> POST /api/fs/listDir（新建会话 workDir 补全，服务器绝对路径列目录）。
 */
 (function () {
   'use strict';
@@ -75,6 +76,9 @@ Description: fetch 封装：自动带 Bearer token；任意请求 401 → 清 to
     getSessions: function () { return request('/api/sessions'); },
     probeWorkDir: function (workDir) {
       return request('/api/sessions/probeWorkDir', { method: 'POST', body: { workDir: workDir } });
+    },
+    listFsDir: function (path) {
+      return request('/api/fs/listDir', { method: 'POST', body: { path: path } });
     },
     createSession: function (params) { return request('/api/sessions', { method: 'POST', body: params }); },
     renameSession: function (sessionId, title) {
