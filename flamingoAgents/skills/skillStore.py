@@ -1,11 +1,12 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-08-14
+Version: 1.4
+Date: 2026-08-17
 Description: 只读扫描 config/skills/<name>/SKILL.md（大写，对齐 Agent Skills 规范），解析 frontmatter，生成注入 system prompt 的 XML 片段。
             v1.1：loadSkills 新增可选 debugConsole 参数（门控 debug 输出，不再无条件 print）。
             v1.2：目录只有大写 SKILL.md 时补 debug 提示（Linux 大小写敏感会静默加载不到）；删除残留 datetime import。
             v1.3：入口文件名由小写 skill.md 改为大写 SKILL.md（用户决定，对齐官方规范）；只对 skill.md 补 debug 提示。
+            v1.4：formatSkillsXml 指引改 if/else——已注入 <injected_skill> 则禁 read location，否则 read；if/else 各管各的相对路径解析根（dir 属性 vs location 所在目录）。
 '''
 
 from __future__ import annotations
@@ -124,7 +125,11 @@ def formatSkillsXml(skills) -> str:
         '',
         '## 可用技能',
         '',
-        '以下技能提供特定任务的专门指令。当任务与某个技能的描述匹配时，用 read 工具读取其 location 指向的文件，按其中步骤执行；技能内相对路径相对该文件所在目录解析。',
+        '以下技能提供特定任务的专门指令。当任务与某个技能的描述匹配时：',
+        '- 若上下文中已有该技能的 <injected_skill> 正文块，直接按其内容执行，禁止再 read 其 location；',
+        '  块内相对路径相对该标签的 dir 属性解析；',
+        '- 否则用 read 读取其 location，按其中步骤执行；',
+        '  技能内相对路径相对 location 所在目录解析。',
         '',
         '<available_skills>',
     ]

@@ -1,6 +1,6 @@
 /*
 Author: wilbur
-Version: 1.17
+Version: 1.18
 Date: 2026-08-17
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
@@ -42,6 +42,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              挂载两处：handleStreamError stopped 分支（其他窗口收后端广播）+ stop()（本窗口点停止，abort 后收不到 stopped 广播）。
              v1.17（markdownRenderUnifyPlan）：删本地 renderMarkdown / 全局 setOptions，改调 window.renderMarkdown；
              live 帧 highlight:false，历史与 renderFinal 四处终态 highlight:true（completed / 跨窗口 stopped / 内联 error / 本窗口 stop）。
+             v1.18（skillInjectionDuplicationFixPlan）：/skill: wireText 加 <injected_skill> 定界包裹 + 强禁止句，防模型重复 read；
+             新增 userBubbleText 折叠历史/attach 的注入块全文，气泡保持 /skill:名 + 补充文字。
 */
 (function () {
   'use strict';
@@ -337,6 +339,14 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     return details;
   }
 
+  var INJECTED_SKILL_RE = /^\/skill:([A-Za-z0-9_-]+) [^\n]*\n\n<injected_skill name="\1" dir="[^"]*">\n[\s\S]*?\n<\/injected_skill>(?:\n\n([\s\S]*))?$/;
+
+  function userBubbleText(content) {
+    var match = INJECTED_SKILL_RE.exec(content);
+    if (!match) return content;
+    return '/skill:' + match[1] + (match[2] ? '\n' + match[2] : '');
+  }
+
   // sentAttachments：本次发送的 chip 列表（仅显示路径）；为空则按历史消息解析 attachment 块
   function appendUserMessage(content, sentAttachments) {
     var row = document.createElement('div');
@@ -356,6 +366,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       });
       bubble.appendChild(chipRow);
     } else {
+      content = userBubbleText(content);  // 先折注入块
       ATTACHMENT_RE.lastIndex = 0;
       var last = 0;
       var match;
@@ -1021,7 +1032,17 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
           return;
         }
         var bodyText = (skillResult && skillResult.body) || '';
-        wireText = bodyText ? (userText ? bodyText + '\n\n' + userText : bodyText) : userText;
+        var baseDir = ((skillResult && skillResult.baseDir) || '').replace(/"/g, '&quot;');
+        var skillBlock = bodyText
+          ? '<injected_skill name="' + chip.name + '" dir="' + baseDir + '">\n' + bodyText + '\n</injected_skill>'
+          : '';
+        wireText = skillBlock
+          ? ('/skill:' + chip.name
+            + ' 的完整指令已作为 <injected_skill> 注入本消息；'
+            + '禁止再调用 read 读取该技能的 location 或 SKILL.md，直接按 <injected_skill> 内步骤执行：\n\n'
+            + skillBlock
+            + (userText ? '\n\n' + userText : ''))
+          : userText;
         displayText = '/skill:' + chip.name + (userText ? '\n' + userText : '');
       }
       if (!wireText && attachments.length === 0) {
