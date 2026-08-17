@@ -1,11 +1,12 @@
 /*
 Author: wilbur
-Version: 1.1
-Date: 2026-08-07
+Version: 1.2
+Date: 2026-08-17
 Description: 右侧文件浏览器（迭代二方案 §4.7/D6）：懒加载目录树（每层缓存、刷新清缓存）、折叠状态存 localStorage；
              文件预览弹层——代码 highlight.js 高亮（getLanguage 预判降级纯文本、输出过 DOMPurify）、
              .md marked 渲染（渲染/源码切换）、行号列；Esc 经 modalStack 只关栈顶。
              v1.1 取消 PREVIEW_CHAR_LIMIT 预览截断限制，完整渲染文件内容。
+             v1.2（markdownRenderUnifyPlan）：渲染模式改调 window.renderMarkdown（breaks:false, highlight:true）；源码模式不动。
 */
 (function () {
   'use strict';
@@ -196,8 +197,7 @@ Description: 右侧文件浏览器（迭代二方案 §4.7/D6）：懒加载目�
   function buildMarkdownView(content) {
     var el = document.createElement('div');
     el.className = 'markdown-content preview-markdown';
-    var html = window.marked ? window.marked.parse(content) : '';
-    el.innerHTML = window.DOMPurify ? window.DOMPurify.sanitize(html) : '';
+    window.renderMarkdown(el, content || '', { breaks: false, highlight: true });
     return el;
   }
 

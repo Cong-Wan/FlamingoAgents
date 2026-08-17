@@ -1,7 +1,7 @@
 <!--
 Author: wilbur
-Version: 1.8
-Date: 2026-08-14
+Version: 1.9
+Date: 2026-08-17
 Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局骨架：侧栏 + 主区 + 弹层 + 登录门）。
              v1.1 迭代一：新建弹窗加探建内联确认区；侧栏浅色化 + 收缩/悬浮展开按钮；设置页改 tab + 整页表单 + 固定保存栏；用量页加费用卡与 Chart.js 图表区。
              v1.2 迭代二（方案 webAppIteration2Plan §4）：favicon 与 flamingo2 头像；聊天页改双栏（chat-center + 右侧文件树 filePanel）；
@@ -11,6 +11,7 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
              v1.5（composerFocusShortcutPlan F2  discoverability）：「新建会话」按钮加 ⌘K kbd 快捷键提示 + title 悬停提示（⌘K / Ctrl+K）。
              v1.7 技能区从模型配置页抽出，改为与其平级的独立「技能」页 #skillsPage + 侧栏入口 #/settings/skills。
              v1.8 技能页 notice 改为可编辑说明；新增 #skillEditModal 结构化编辑弹层；composer placeholder 补充 /skill:名 引用技能。
+             v1.9（markdownRenderUnifyPlan）：接入 js/markdown.js（marked → DOMPurify → highlight 之后、fileExplorer/chatView 之前）。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -249,6 +250,7 @@ Description: FlamingoAgents Web 前端入口页（原生 HTML，Kimi 式布局�
   <script src="/static/vendor/dompurify.min.js"></script>
   <script src="/static/vendor/highlight.min.js"></script>
   <script src="/static/vendor/chart.umd.min.js"></script>
+  <script src="/static/js/markdown.js"></script>
   <script src="/static/js/store.js"></script>
   <script src="/static/js/api.js"></script>
   <script src="/static/js/sse.js"></script>

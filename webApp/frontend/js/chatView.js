@@ -1,6 +1,6 @@
 /*
 Author: wilbur
-Version: 1.16
+Version: 1.17
 Date: 2026-08-17
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
@@ -40,6 +40,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              v1.16（toolCardStopUiFixPlan）：stopped 时新增 settleRunningCardsOnStop——泵在 stopFlag 后置位吞掉 toolCallEnd，
              把仍 running 的卡片定格为失败态（文案锚定后端 closeUnfinishedToolCalls userStopped），不再永远「执行中」。
              挂载两处：handleStreamError stopped 分支（其他窗口收后端广播）+ stop()（本窗口点停止，abort 后收不到 stopped 广播）。
+             v1.17（markdownRenderUnifyPlan）：删本地 renderMarkdown / 全局 setOptions，改调 window.renderMarkdown；
+             live 帧 highlight:false，历史与 renderFinal 四处终态 highlight:true（completed / 跨窗口 stopped / 内联 error / 本窗口 stop）。
 */
 (function () {
   'use strict';
@@ -72,17 +74,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     dangling: { label: '中断未完成', cls: 'status-dangling' }
   };
 
-  if (window.marked) {
-    window.marked.setOptions({ gfm: true, breaks: true });
-  }
-
   /* ---------- 基础渲染工具 ---------- */
-
-  // XSS 红线：不可信文本必须 marked → DOMPurify 后才允许 innerHTML
-  function renderMarkdown(el, text) {
-    var html = window.marked ? window.marked.parse(text || '') : '';
-    el.innerHTML = window.DOMPurify ? window.DOMPurify.sanitize(html) : '';
-  }
 
   function scrollToBottom() {
     messageListEl.scrollTop = messageListEl.scrollHeight;
@@ -469,8 +461,14 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       step.live.thinkingContentEl.textContent = step.reasoningBuf;
     }
     if (step.textBuf) {
-      renderMarkdown(step.live.contentEl, step.textBuf);
+      window.renderMarkdown(step.live.contentEl, step.textBuf, { breaks: true, highlight: false });
     }
+  }
+
+  // 终态高亮：只重渲 contentEl，不碰 bodyEl 上的 thinking / 工具卡 / retry / interrupted / inline error
+  function renderFinal(step) {
+    if (!step || !step.live || !step.live.contentEl || !step.textBuf) return;
+    window.renderMarkdown(step.live.contentEl, step.textBuf, { breaks: true, highlight: true });
   }
 
   // delta 只进 buffer，每帧最多一次 DOM 写；scroll 合入 paint 回调末尾
@@ -612,7 +610,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       shell.body.appendChild(thinking.el);
     }
     shell.body.appendChild(contentEl);
-    renderMarkdown(contentEl, msg.content || '');
+    window.renderMarkdown(contentEl, msg.content || '', { breaks: true, highlight: true });
 
     (msg.toolCalls || []).forEach(function (toolCall) {
       var result = toolResults[toolCall.id];
@@ -805,6 +803,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         if (stream.currentStep) {
           clearRetryNotice(stream.currentStep);
           flushAndCollapseThinking(stream.currentStep); // 终态入口强制 flush（D4 清单 2）
+          renderFinal(stream.currentStep);
         }
         goIdle();
         window.sidebarView.refresh().then(function () { window.chatView.syncTopbar(); });
@@ -826,6 +825,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     if (data.errorType === 'stopped') {
       // 其他窗口点了停止（后端广播的 stopped 终态，multiWindowStreamingPlan §5.3）：半截消息加「已中断」，静默回空闲
       settleRunningCardsOnStop(); // 定格残留 running 卡片（泵已吞 toolCallEnd，审核根因）
+      var stoppedStream = window.appStore.stream;
+      if (stoppedStream && stoppedStream.currentStep) renderFinal(stoppedStream.currentStep);
       markInterrupted();
       goIdle();
       return;
@@ -858,6 +859,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       && stream && stream.currentStep && stream.currentStep.live && stream.currentStep.live.bodyEl;
     if (canInline) {
       appendInlineErrorBlock(stream.currentStep.live.bodyEl, data.message || '模型调用失败');
+      renderFinal(stream.currentStep);
     } else {
       showError(data.message || '模型调用失败');
     }
@@ -1083,7 +1085,10 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var stream = window.appStore.stream;
     if (!sessionId || !stream || stream.phase !== 'streaming') return;
     stream.phase = 'stopping';
-    if (stream.currentStep) flushLivePaint(stream.currentStep); // 进 stopping 前 buffer 强制上屏（D4 清单 3）
+    if (stream.currentStep) {
+      flushLivePaint(stream.currentStep); // 进 stopping 前 buffer 强制上屏（D4 清单 3）
+      renderFinal(stream.currentStep);
+    }
     markInterrupted(); // 立即停渲染 + 半截消息加「已中断」标记
     settleRunningCardsOnStop(); // 本窗口点停止：定格残留 running 卡片（本窗口 abort 后收不到后端 stopped 广播，走不到 handleStreamError）
     updateComposer();
