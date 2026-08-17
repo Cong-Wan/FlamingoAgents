@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.13
-Date: 2026-08-14
+Version: 1.16
+Date: 2026-08-17
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
@@ -35,6 +35,11 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              堵「completed → goIdle 启用输入框 → 401 跳登录门 → onStreamClosed 补 focus」窄窗口抢登录框焦点。
              v1.13（stopResponsivenessPlan L1）：stop() 改 fire-and-forget + 立即 abort（保持 stopping 至 onStreamClosed）；
              send() 的 onStreamFailed 对 409「活跃流」静默重试一次。
+             v1.14 /skill: chip 发送：同步定界后取正文拼 wireText，气泡只显示 /skill:名+补充；open/showEmpty 清 skillChip。
+             v1.15（fileMentionFixPlan）：气泡 chip 按 attachment.type 出图标（📄 文件 / 📁 目录）。
+             v1.16（toolCardStopUiFixPlan）：stopped 时新增 settleRunningCardsOnStop——泵在 stopFlag 后置位吞掉 toolCallEnd，
+             把仍 running 的卡片定格为失败态（文案锚定后端 closeUnfinishedToolCalls userStopped），不再永远「执行中」。
+             挂载两处：handleStreamError stopped 分支（其他窗口收后端广播）+ stop()（本窗口点停止，abort 后收不到 stopped 广播）。
 */
 (function () {
   'use strict';
@@ -300,6 +305,19 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     return 'done';
   }
 
+  // 停止收尾（toolCardStopUiFixPlan）：stopped 时泵已吞掉 toolCallEnd，把仍 running 的卡片定格为失败态
+  function settleRunningCardsOnStop() {
+    Object.keys(toolCards).forEach(function (id) {
+      var card = toolCards[id];
+      if (card.status !== 'running') return;
+      setCardStatus(card, 'error');
+      card.resultSection.classList.remove('hidden');
+      // 文案锚点：与 flamingoAgents/core/agent.py closeUnfinishedToolCalls contents['userStopped'] 保持一致，改文案需同步
+      setCollapsibleText(card.resultPre, '该工具调用因用户停止未完成；停止前可能已产生文件或命令副作用。', card.resultSection);
+    });
+    maybeScrollToBottom();
+  }
+
   /* ---------- 消息块 ---------- */
 
   // 附件块标记（与后端 fileBrowser.buildAttachmentMessage 约定一致；path 字符集校验防手输伪造，评审 M5）
@@ -340,7 +358,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       sentAttachments.forEach(function (attachment) {
         var chip = document.createElement('span');
         chip.className = 'attachment-chip static';
-        chip.textContent = '📄 ' + attachment.path;
+        chip.textContent = (attachment.type === 'dir' ? '📁 ' : '📄 ') + attachment.path;
         chip.title = attachment.path;
         chipRow.appendChild(chip);
       });
@@ -807,6 +825,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var sessionId = window.appStore.currentSessionId;
     if (data.errorType === 'stopped') {
       // 其他窗口点了停止（后端广播的 stopped 终态，multiWindowStreamingPlan §5.3）：半截消息加「已中断」，静默回空闲
+      settleRunningCardsOnStop(); // 定格残留 running 卡片（泵已吞 toolCallEnd，审核根因）
       markInterrupted();
       goIdle();
       return;
@@ -968,14 +987,49 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       text = options.payload.text;
       attachments = options.payload.attachments || [];
     } else {
-      text = composerInput.value.trim();
+      if (sendButton.disabled) return; // await 期间挡双击/连按 Enter
+      var chip = window.skillChip && window.skillChip.get();
+      var userText = composerInput.value.trim();
       attachments = window.fileMention.getAttachments();
-      if (!text && attachments.length === 0) return; // D8：纯附件可发
+      if (!chip && !userText && attachments.length === 0) return; // D8：纯附件可发；chip 单独也可发
+      if (chip) window.skillChip.clear(); // 同步定界：先摘 chip，防双击重复取
       composerInput.value = '';
       autoResize();
-      appendUserMessage(text, attachments);
+      sendButton.disabled = true; // await 期间 stream 仍 null，靠这个挡第二次进入
+      var wireText = userText;
+      var displayText = userText;
+      if (chip) {
+        var skillResult;
+        try {
+          skillResult = await window.api.getSkillBody(chip.name);
+        } catch (error) {
+          window.skillChip.pin(chip.name);
+          composerInput.value = userText;
+          autoResize();
+          sendButton.disabled = false;
+          if (window.toast) window.toast('加载技能失败：' + ((error && error.message) || '未知错误'));
+          return;
+        }
+        if (sessionId !== window.appStore.currentSessionId || window.appStore.stream) {
+          window.skillChip.pin(chip.name);
+          composerInput.value = userText;
+          autoResize();
+          sendButton.disabled = false;
+          if (window.toast) window.toast('会话已切换，未发送');
+          return;
+        }
+        var bodyText = (skillResult && skillResult.body) || '';
+        wireText = bodyText ? (userText ? bodyText + '\n\n' + userText : bodyText) : userText;
+        displayText = '/skill:' + chip.name + (userText ? '\n' + userText : '');
+      }
+      if (!wireText && attachments.length === 0) {
+        sendButton.disabled = false;
+        return;
+      }
+      appendUserMessage(displayText, attachments);
       window.fileMention.clearChips();
-      lastUserSend = { text: text, attachments: attachments };
+      lastUserSend = { text: wireText, attachments: attachments };
+      text = wireText;
     }
 
     var step = createStep();
@@ -1031,6 +1085,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     stream.phase = 'stopping';
     if (stream.currentStep) flushLivePaint(stream.currentStep); // 进 stopping 前 buffer 强制上屏（D4 清单 3）
     markInterrupted(); // 立即停渲染 + 半截消息加「已中断」标记
+    settleRunningCardsOnStop(); // 本窗口点停止：定格残留 running 卡片（本窗口 abort 后收不到后端 stopped 广播，走不到 handleStreamError）
     updateComposer();
     // fire-and-forget：先发出 stop POST，再同步 abort 本窗口 SSE；保持 stopping 到 onStreamClosed。
     var stopDone = window.api.stopChat(sessionId).catch(function () { return null; });
@@ -1144,6 +1199,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       window.chatView.syncTopbar();
       updateComposer();
       window.fileMention.resetForSession();
+      if (window.skillChip) window.skillChip.clear();
       window.fileExplorer.open();
       try {
         await reloadSession(sessionId);
@@ -1172,6 +1228,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       window.statusBar.hide();
       window.fileExplorer.hide();
       window.fileMention.resetForSession();
+      if (window.skillChip) window.skillChip.clear();
       updateComposer();
     },
 
