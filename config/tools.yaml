@@ -87,6 +87,7 @@ tools:
           type: regex
           patterns:
             - '(^|[;&|]\s*)rm\s+(-[A-Za-z]*\s+)*[^\n;&|]+'
+            - '(^|[;&|]\s*)git\s+rm\s+(-[A-Za-z-]*\s+)*(?:-r|--recursive)[^\n;&|]*'
             - '(^|[;&|]\s*)rmdir\s+[^\n;&|]+'
             - '(^|[;&|]\s*)unlink\s+[^\n;&|]+'
             - '(^|[;&|]\s*)find\s+[^\n;&|]*\s-delete(\s|$)'
@@ -101,7 +102,7 @@ tools:
       properties:
         model:
           type: string
-          description: provider/model，如 kimi/k3
+          description: provider/model，如 volcano/glm-5.3
         prompt:
           type: string
           description: 交给子代理的用户任务描述
