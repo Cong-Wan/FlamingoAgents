@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.6
-Date: 2026-08-14
+Version: 1.7
+Date: 2026-08-19
 Description: sessionId → agent 实例缓存（懒建、模型配置变更后置失效标记惰性重建）、活跃流登记（同会话并发 409）、停止标志与泵线程结构。
             v1.1 随包改名调整 import（webApp.backend.*）。
             v1.2 迭代一（方案 §11.4）：泵线程流开始快照 usageTotal、终态算 delta 先写 usageStore.usageTurns（后回写 sessions 索引，原有回写不变）。
@@ -12,18 +12,20 @@ Description: sessionId → agent 实例缓存（懒建、模型配置变更后�
             stop 分支补广播 stopped 终态（其他订阅窗口静默收尾，不再误报连接中断）。
             v1.6（stopResponsivenessPlan L2）：requestStop 改主动收尾（interrupt + 广播 stopped + 幂等 usage + 注销 + 关订阅）；
             doneEvent/usageRecorded/historyOverflowed；_broadcast 拦截已终态事件；history 2000 截尾。
+            v1.7 logDir 按会话 workDir 注入 ~/.flamingo/logs/webData/<workDir路径>/，不再用扁平 sessionLogsDir。
 '''
 
 from __future__ import annotations
 
 import queue
 import threading
+from pathlib import Path
 
 from flamingoAgents import createAgent
 from flamingoAgents.core.types import errorEvent, reasoningDeltaEvent, terminalEventTypes, textDeltaEvent
+from flamingoAgents.utils.logPaths import ensureSessionLogDir
 
 from webApp.backend import sessionStore, usageStore
-from webApp.backend.sessionStore import sessionLogsDir
 
 managerLock = threading.RLock()
 agentCache: dict[str, object] = {}
@@ -33,7 +35,7 @@ HISTORY_MAX_EVENTS = 2000
 
 
 def getAgent(sessionId: str):
-    # 懒建缓存：按索引中的 workDir/providerId/modelId 建 agent，集中 logDir 到 webData/sessionLogs。
+    # 懒建缓存：按索引中的 workDir/providerId/modelId 建 agent，logDir 落到 ~/.flamingo/logs/webData/<workDir路径>/。
     meta = sessionStore.getSession(sessionId)
     if meta is None:
         raise RuntimeError(f'会话不存在：{sessionId}')
@@ -43,7 +45,7 @@ def getAgent(sessionId: str):
             return cached
         newAgent = createAgent(
             workDir=meta['workDir'],
-            logDir=sessionLogsDir,
+            logDir=ensureSessionLogDir('webData', Path(meta['workDir'])),
             providerId=meta['providerId'],
             modelId=meta['modelId'],
         )

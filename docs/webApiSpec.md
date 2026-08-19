@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.11
-> Date: 2026-08-17
+> Version: 1.15
+> Date: 2026-08-19
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 8 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -18,6 +18,10 @@
 > v1.9：上传 pi models.json 导入——新增 §3.18 POST /api/models/importPi（只收 rawText；不读盘不写盘；响应 providers 含上传文件明文 apiKey，鉴权内有意为之）。
 > v1.10：Skill 能力——新增 §3.19 GET /api/skills、§3.20 GET /api/skills/{name}（只读、鉴权；slash `/skill:名` 选中后把正文填进输入框，不自动发送）。
 > v1.11：workDirPickerPlan——新增 §3.21 POST /api/fs/listDir（服务器绝对路径列目录，供新建会话 workDir 补全）；§3.3/§3.4 放开多级目录创建（`mkdir(parents=True)` + `nearestWritableAncestor`），probe 响应去掉 `parentPath`。
+> v1.12：日志路径迁移——session jsonl / usage.db 迁至 `~/.flamingo/logs/`；DELETE 会话删的是新位置 jsonl。
+> v1.13：新会话 `sessionId` 为 `YYMMDDHHmmss-xxxxxxxx`；存量 `session_*` 仍合法；日志子目录改为 workDir 真实路径。
+> v1.14：日志子目录改为一层路径名（`~／project／FlamingoAgents`，／为全角）。
+> v1.15：一层路径名里的 `/` 改成 `-`（`~-project-FlamingoAgents`）。
 
 ---
 
@@ -65,7 +69,7 @@
 
 ```json
 {
-  "sessionId": "session_0bcd11873ded",
+  "sessionId": "260805101755-0bcd1187",
   "title": "新会话",
   "workDir": "/Users/wilbur/project/FlamingoAgents",
   "providerId": "volcano",
@@ -76,6 +80,7 @@
 }
 ```
 
+- `sessionId`：新会话为本地时间 `YYMMDDHHmmss` + `-` + 8 位 hex（如 `260819115719-a1b2c3d4`）；存量 `session_*` 仍合法，API / 书签不改旧 ID；
 - `title`：默认「新会话」；**首条用户消息发出后后端自动改为消息前 20 字**；可经 PATCH 改名；
 - `modelId`：建会话时未指定则为该 provider 首个模型（与库 `selectModel` 行为一致），此处记录的是**实际生效值**；
 - `usage`：会话累计 token（来源 `conversation.usageTotal`，泵线程每轮结束后回写）；初始值 `{ "promptTokens": 0, "cachedTokens": 0, "completionTokens": 0 }`（审核 L6）；
@@ -268,7 +273,7 @@
 ### 3.6 DELETE /api/sessions/{sessionId} —— 删除会话
 
 - 200：`{ "ok": true }`；404：不存在；**409：该会话有活跃流，拒绝删除**；
-- 副作用：删索引条目 + 删 `webData/sessionLogs/{sessionId}.jsonl` + 清 agent 缓存实例。
+- 副作用：删索引条目 + 删 `~/.flamingo/logs/webData/~-project-FlamingoAgents/{sessionId}.jsonl` + 清 agent 缓存实例。
 
 ### 3.7 GET /api/sessions/{sessionId}/messages —— 历史消息
 
@@ -312,7 +317,7 @@
 }
 ```
 
-- 数据源：`webData/usage.db`（SQLite `usageTurns` 表，泵线程终态写入增量 + 空表时从 jsonl 回填一次，webAppPlan §11.4）；
+- 数据源：`~/.flamingo/logs/usage.db`（SQLite `usageTurns` 表，泵线程终态写入增量；旧库由一次性迁移脚本搬迁/merge，webAppPlan §11.4）；
 - 粒度与默认范围：`hour` = 近 72 小时（label `2026-08-07 13`）、`day` = 近 90 天（label `2026-08-07`）、`month` = 最早记录所在月 → 当前月，无记录返回空 `buckets`（label `2026-08`）；**空桶补齐**保证时间轴连续；**桶切分按服务器本地时区**（jsonl 时间戳为 UTC，聚合时先转本地时区再切桶，审核高 3）；
 - `cost` 查询时按 `config/models.yaml` 当前 cost 计算：`(promptTokens−cachedTokens)×input/1M + cachedTokens×cacheRead/1M + completionTokens×output/1M`（美元；promptTokens 含 cachedTokens，OpenAI 原生语义，cached 只按 cacheRead 折扣价计一次、不得重复计费；cacheWrite 无分开计数，恒不计）；**byModel/models 的 key 为 `providerId/modelId` 二元组**（不同 provider 下同 id 模型不撞桶、价格各自查，审核高 4）；yaml 中已删除的模型 cost 按 0 计；全部模型 cost 为 0 时所有 cost 字段恒 0，前端据此隐藏费用展示；
 - `models` 为出现过的全部 `providerId/modelId` 列表（前端配色/图例用）；

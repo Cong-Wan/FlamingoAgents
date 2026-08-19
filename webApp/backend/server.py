@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.11
-Date: 2026-08-17
+Version: 1.12
+Date: 2026-08-19
 Description: FastAPI 应用与全部路由：认证依赖、统一异常映射（库 RuntimeError → 400 透传中文消息）、sessionId 入口校验、SSE 对话流、静态文件容忍空目录挂载。
             v1.1 随包改名调整 import（webApp.backend.*）；静态目录由 static/ 改为 webApp/frontend/，projectRoot 随目录加深改为 parents[2]。
             v1.2 迭代一（契约 v1.2 §3.3/§3.4/§3.10）：新增 probeWorkDir 与 usage/series 端点；create 会话 workDir 改必填 + allowCreate，
@@ -20,6 +20,7 @@ Description: FastAPI 应用与全部路由：认证依赖、统一异常映射�
             probeWorkDir/createSession 放开多级目录创建--新增 nearestWritableAncestor（遇最近存在节点是文件/不可写目录返 None，禁止跨过），
             mkdir(parents=True, exist_ok=True) + FileNotFoundError/PermissionError/泛化 OSError 兜底 + mkdir 后 is_dir/可读写双保险
             （parents 后 FileExistsError 可能是中间级被文件占，不再一律视为成功）。
+            v1.12 删除会话改按 workDir 定位 ~/.flamingo/logs/webData/<folder>/{sessionId}.jsonl；unlink OSError 只 warning 不 500。
 '''
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from flamingoAgents.models.modelConfig import loadModelConfigFromYaml
+from flamingoAgents.utils.logPaths import resolveSessionLogDir
 
 from webApp.backend import agentManager, fileBrowser, historyView, modelConfigStore, sessionStore, skillStore, usageStore
 from webApp.backend.piModelsImport import convertPiDocument
@@ -355,12 +357,15 @@ def renameSession(sessionId: str, body: dict = Body(...)):
 @authedApi.delete('/sessions/{sessionId}')
 def deleteSession(sessionId: str):
     checkSessionId(sessionId)
-    requireSession(sessionId)
+    session = requireSession(sessionId)
     if agentManager.hasActiveStream(sessionId):
         raise HTTPException(status_code=409, detail='该会话有活跃流，无法删除。')
     sessionStore.deleteSession(sessionId)
-    logPath = sessionStore.sessionLogsDir / f'{sessionId}.jsonl'
-    logPath.unlink(missing_ok=True)
+    logPath = resolveSessionLogDir('webData', Path(session['workDir'])) / f'{sessionId}.jsonl'
+    try:
+        logPath.unlink(missing_ok=True)
+    except OSError as error:
+        print(f'warning: 删除会话日志失败 {logPath}: {error}')
     agentManager.dropAgent(sessionId)
     return {'ok': True}
 

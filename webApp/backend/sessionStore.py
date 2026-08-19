@@ -1,11 +1,13 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-08-08
+Version: 1.5
+Date: 2026-08-19
 Description: webData/sessions.json 会话索引 CRUD：进程内锁 + 临时文件 rename 原子写；updatedAt/usage/标题的刷新时机对齐契约 §2.1。
             v1.1 随包改名调整：webDataDir 因目录加深一级改为 parents[2]。
             v1.2 迭代二（方案 §3.3/§3.6）：updateUsage 增加可选 contextTokens 字段回写；新增 updateSessionModel（/model 指令）。
             v1.3 状态栏口径：updateUsage 增加可选 lastUsage（最近一轮 token 增量）回写。
+            v1.4 移除 sessionLogsDir（日志已迁至 ~/.flamingo/logs/webData/，本模块只保留 sessions.json 索引）。
+            v1.5 新会话 sessionId 改为 YYMMDDHHmmss-xxxxxxxx（存量 session_* 仍合法）。
 '''
 
 from __future__ import annotations
@@ -15,10 +17,10 @@ import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
+
+from flamingoAgents.utils.logPaths import newSessionId
 
 webDataDir = Path(__file__).resolve().parents[2] / 'webData'
-sessionLogsDir = webDataDir / 'sessionLogs'
 indexPath = webDataDir / 'sessions.json'
 
 indexLock = threading.RLock()
@@ -68,7 +70,7 @@ def createSession(workDir: str, providerId: str, modelId: str) -> dict:
         sessions = loadIndex()
         timestamp = nowIso()
         session = {
-            'sessionId': 'session_' + uuid4().hex[:12],
+            'sessionId': newSessionId(),
             'title': '新会话',
             'workDir': workDir,
             'providerId': providerId,

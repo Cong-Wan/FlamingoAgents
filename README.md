@@ -1,10 +1,14 @@
 # FlamingoAgents
 
 > Author: wilbur
-> Version: 1.2
-> Date: 2026-08-17
+> Version: 1.6
+> Date: 2026-08-19
 > Description: 项目自述——开发初心、现状能力、架构、快速开始与路线图。v1.1 现状能力与目录结构补 skill。
 > v1.2 补全漏写的已落地能力：askSubAgent 子代理、Skill 系统（技能页编辑 + /skill: chip）、工具停止、多窗口流式、文件树与文件夹@附件、/model 切换、状态栏、models.json 导入等。
+> v1.3 日志与 usage.db 迁至 ~/.flamingo/logs/；启用新代码前须先跑一次性迁移脚本。
+> v1.4 日志子目录改为 workDir 真实路径；新会话文件名为 YYMMDDHHmmss-xxxxxxxx.jsonl。
+> v1.5 日志子目录改为一层路径名（如 ~／project／FlamingoAgents）。
+> v1.6 一层路径名里的 / 改成 -（如 ~-project-FlamingoAgents）。
 
 **一个为多 Agent 协同作业而生的本地 Agent 系统**：分别接入不同 Coding Plan 的模型，让多个 Agent 并发作业，突破单个 Coding Plan 的并发限制。
 
@@ -64,6 +68,14 @@ flamingoAgents 纯库（事件流 + 工具 + jsonl 日志）
 
 环境：Python ≥ 3.12 + [uv](https://docs.astral.sh/uv/)
 
+> **已有旧数据必读（时序约束）**：session jsonl 与 `usage.db` 已迁到 `~/.flamingo/logs/`。启用新代码的 webApp/CLI **之前**，先跑一次性迁移脚本，否则旧历史不会被自动搬迁（webApp 看空历史、CLI 旧日志被冻结）。脚本幂等，可重复跑。
+>
+> ```bash
+> uv run python -m flamingoAgents.utils.logMigration
+> ```
+>
+> 全新环境无旧数据也可跑（空转后写 `~/.flamingo/logs/.migrationDone`）。迁完后 `webData/sessionLogs/` 与各 workDir 的 `.agentLogs/` 残留由你手动删。
+
 ```bash
 # 1. 配置模型（复制示例，填入各家 Coding Plan 的 key）
 cp config/models.example.yaml config/models.yaml
@@ -85,7 +97,8 @@ webApp/
   frontend/          # 原生 HTML/CSS/JS（vendor: marked + DOMPurify + Chart.js）
 config/              # models.yaml（多 provider 密钥配置）/ tools.yaml / systemPrompt.md / skills/<name>/SKILL.md
 docs/                # 契约与手册（见下）；方案与事故报告归入 docs/plan/
-webData/             # 运行数据（gitignore）：会话索引、集中 jsonl 日志、usage.db
+webData/             # 运行数据（gitignore）：现仅含会话索引 sessions.json
+~/.flamingo/logs/    # usage.db + {webData,cliData}/~-project-FlamingoAgents/*.jsonl
 ```
 
 ## 文档索引

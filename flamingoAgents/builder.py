@@ -1,9 +1,10 @@
 '''
 Author: wilbur
-Version: 1.5
-Date: 2026-08-14
+Version: 1.6
+Date: 2026-08-19
 Description: Pure-library assembly factory: resolves paths, loads model config/auth, system prompt, and schema-driven tools, then returns a ready-to-use agent. v1.4 lets callers inject the system prompt as a string (systemPrompt), control the current-time suffix (appendCurrentTime), and whitelist built-in tools by name (toolNames) per docs/initAgentCustomizationPlan.md.
             v1.5 新建 agent 时在「当前时间」之前注入 config/skills 的 <available_skills> 块；skillsDir='' 禁用 / None 用默认目录 / 路径覆盖。
+            v1.6 默认 logDir 从 workDir/.agentLogs 改为 ~/.flamingo/logs/cliData/<workDir路径>/（logPathMigrationPlan / logPathLayoutFixPlan）。
 '''
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from flamingoAgents.skills import defaultSkillsDir, formatSkillsXml, loadSkills
 from flamingoAgents.tools.builtinTools import createBuiltinTools
 from flamingoAgents.tools.toolConfig import loadToolSettings
 from flamingoAgents.utils.debug import debugConsole
+from flamingoAgents.utils.logPaths import ensureSessionLogDir
 
 
 defaultSystemPromptPath = Path(__file__).resolve().parents[1] / 'config' / 'systemPrompt.md'
@@ -41,7 +43,7 @@ def createAgent(
 ) -> agent:
     workDirPath = Path(workDir).resolve()
     printer = debugConsole(debug)
-    resolvedLogDir = Path(logDir).resolve() if logDir else workDirPath / '.agentLogs'
+    resolvedLogDir = Path(logDir).resolve() if logDir else ensureSessionLogDir('cliData', workDirPath)
     if printer.isDebug:
         printer.debug(f'装配 Agent workDir={workDirPath} logDir={resolvedLogDir} providerId={providerId} modelId={modelId}')
     resolved = loadModelConfig(
