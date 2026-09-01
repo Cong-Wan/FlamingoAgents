@@ -1,26 +1,5 @@
 # FlamingoAgents
 
-> Author: wilbur
-> Version: 1.6
-> Date: 2026-08-19
-> Description: 项目自述——开发初心、现状能力、架构、快速开始与路线图。v1.1 现状能力与目录结构补 skill。
-> v1.2 补全漏写的已落地能力：askSubAgent 子代理、Skill 系统（技能页编辑 + /skill: chip）、工具停止、多窗口流式、文件树与文件夹@附件、/model 切换、状态栏、models.json 导入等。
-> v1.3 日志与 usage.db 迁至 ~/.flamingo/logs/；启用新代码前须先跑一次性迁移脚本。
-> v1.4 日志子目录改为 workDir 真实路径；新会话文件名为 YYMMDDHHmmss-xxxxxxxx.jsonl。
-> v1.5 日志子目录改为一层路径名（如 ~／project／FlamingoAgents）。
-> v1.6 一层路径名里的 / 改成 -（如 ~-project-FlamingoAgents）。
-
-**一个为多 Agent 协同作业而生的本地 Agent 系统**：分别接入不同 Coding Plan 的模型，让多个 Agent 并发作业，突破单个 Coding Plan 的并发限制。
-
-## 开发初心
-
-FlamingoAgents 的思路：
-
-1. **多 Plan 接入**：把多家 Coding Plan 的端点统一配置进 `config/models.yaml`（OpenAI 兼容协议），每个 provider 独立 key、独立限流池；
-2. **多 Agent 并发**：每个 Agent 实例绑定不同的 provider/model，任务拆开并行派发，N 个 plan 就有 N 倍并发；
-3. **统一管控**：一个 Web 界面管所有会话、看所有用量、配所有模型。
-
-> 现状：多 provider 接入与按会话绑定模型已实现（地基完成）；多 Agent 编排派发在路线图上（见文末）。
 
 ## 现状能力
 
