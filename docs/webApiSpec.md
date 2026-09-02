@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.15
-> Date: 2026-08-19
+> Version: 1.17.1
+> Date: 2026-09-01
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 8 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -22,6 +22,9 @@
 > v1.13：新会话 `sessionId` 为 `YYMMDDHHmmss-xxxxxxxx`；存量 `session_*` 仍合法；日志子目录改为 workDir 真实路径。
 > v1.14：日志子目录改为一层路径名（`~／project／FlamingoAgents`，／为全角）。
 > v1.15：一层路径名里的 `/` 改成 `-`（`~-project-FlamingoAgents`）。
+> v1.16：订阅登录——modelConfig 增加三种 API 与 `auth`；新增 §3.22–§3.27 modelAuth 状态/登录任务/manual code/取消/退出接口；所有响应禁止包含 OAuth Token/code_verifier。
+> v1.17：订阅模型配置候选——modelAuth 状态/任务增加 `credentialGeneration`；新增 §3.28 POST discovery。xAI 固定主机、禁止重定向、401 stale-token 单次刷新；响应只含安全候选且不写 models.yaml。
+> v1.17.1：模型目录 transport 遵循 `HTTPS_PROXY/NO_PROXY`，同时继续拒绝全部重定向；普通响应和 HTTPError body 均有界读取。
 
 ---
 
@@ -159,6 +162,7 @@
     "volcano": {
       "baseUrl": "https://ark.cn-beijing.volces.com/api/coding/v3",
       "api": "openai-completions",
+      "auth": "api-key",
       "apiKey": "__KEEP__",
       "headers": { "User-Agent": "curl/8.7.1" },
       "models": [
@@ -186,7 +190,7 @@
 |---|---|---|
 | 明文 key（如 `ark-f6f4...`） | `"__KEEP__"` | 保留 yaml 原值 |
 | 环境变量引用（`$FOO` / `${FOO}`） | 原样返回 | 写回该引用串 |
-| 缺失/空 | `""` | 删除该字段（校验：该 provider 将因缺 key 无法使用，允许保存但建会话时报 400） |
+| 缺失/空 | `""` | 删除该字段；`auth=api-key` 时 PUT 拒绝，唯 `openai-responses` 可由服务端 `XAI_API_KEY` 回退 |
 | — | 任何其它新字符串 | 覆盖为新值 |
 
 **`$` 前缀约定（审核 L3）**：任何以 `$` 开头的 apiKey 值一律视为环境变量引用（GET 原样返回不脱敏、PUT 按引用写回）；因此**明文 key 不得以 `$` 开头**，UI 输入校验需拦截并提示。
@@ -198,7 +202,8 @@
 **PUT 校验规则**（失败 400，消息中文）：
 
 - `providers` 必须是对象且非空；
-- 每 provider：`baseUrl` 非空字符串；`api` 仅允许 `"openai-completions"`；`models` 非空数组；
+- 每 provider：`baseUrl` 非空字符串；`api` 允许 `"openai-completions"` / `"openai-responses"` / `"openai-codex-responses"`；`auth` 缺省 `"api-key"`，允许 `"api-key"` / `"oauth"`；`models` 非空数组；
+- 组合约束：Chat Completions 仅 API Key；Codex Responses 仅 OAuth 且 host 为 `chatgpt.com`；Responses OAuth 仅 xAI 且 host 为 `api.x.ai`；OAuth 不要求/不写 `apiKey`；
 - 每 model：`id` 非空字符串；`name` 可空字符串；`input` 为字符串数组（元素限 `"text"`/`"image"`）；`contextWindow`/`maxTokens` 为正整数；`reasoning` 为布尔；`thinking` 可缺省，存在时 `type ∈ {"enabled","disabled"}`；`reasoningEffort` 可缺省，存在时为字符串；`cost` 四字段为数值（≥0）。
 
 ## 3. REST 接口明细
@@ -551,6 +556,90 @@
 - 400：目标不存在 → `目录不存在：…`；存在但不是目录 → `不是目录：…`；不可读 → `目录不存在或不可读：…`（`RuntimeError` 走统一异常映射）。
 - 无副作用（只读）。
 - **信任边界** = 持有登录 token 的本机用户。只返回目录名，不含文件内容/文件列表。多用户或对外网暴露时必须加根路径白名单，且应同时收紧 §3.3 的 workDir——单收紧本端点没有意义。
+
+### 3.22 GET /api/modelAuth —— 订阅登录状态
+
+200：
+
+```json
+{
+  "providers": {
+    "openai-codex": {"loggedIn": true, "expiresAt": 1788230000, "accountHint": "acct…1234", "error": null, "credentialGeneration": 1},
+    "xai": {"loggedIn": false, "expiresAt": null, "accountHint": null, "error": null, "credentialGeneration": 0}
+  }
+}
+```
+
+`expiresAt` 为 Unix 秒。`credentialGeneration` 是本 Web 进程内成功登录/退出时递增的非敏感整数，仅用于丢弃异步旧结果，不是账户标识。响应绝不包含 `access`、`refresh`、`authorization` 或 `code_verifier`；已保存模型仍由 `/api/models` 返回，凭据状态不合并进去。
+
+### 3.23 POST /api/modelAuth/{provider}/login —— 启动后台登录
+
+- `provider`：`openai-codex` / `xai`；
+- OpenAI 请求体 `{"method":"browser"}` 或 `{"method":"device_code"}`；xAI 仅 `device_code`；
+- 同 Provider 已有 pending 任务 → 409；HTTP 请求不等待 OAuth 完成。
+
+200 返回安全任务状态：
+
+```json
+{"loginId":"login_随机值","provider":"openai-codex","method":"browser","status":"pending","authUrl":"https://auth.openai.com/...","deviceCode":null,"manualCodeRequired":false,"expiresAt":1788230000,"accountHint":null,"error":null,"credentialGeneration":0}
+```
+
+### 3.24 GET /api/modelAuth/logins/{loginId} —— 轮询登录任务
+
+`status` 为 `pending/completed/error/cancelled`；设备码流程在就绪后返回 HTTPS `authUrl` 与 `deviceCode`。完成/失败任务保留 10 分钟；未知/已清理 ID → 404。任务 JSON 与 §3.23 使用同一安全字段集。
+
+### 3.25 POST /api/modelAuth/logins/{loginId}/manualCode —— 提交远程回调
+
+请求 `{"code":"完整回调 URL、code#state 或裸 code"}`。仅 pending OpenAI browser 任务接受；输入带 state 时必须匹配。任何响应均不回显 code。
+
+### 3.26 DELETE /api/modelAuth/logins/{loginId} —— 取消登录
+
+把 pending 任务原子置为 `cancelled` 并唤醒 listener/轮询。取消后迟到 Token 响应不得写凭据；返回终态安全任务 JSON。未知 ID → 404。
+
+### 3.27 DELETE /api/modelAuth/{provider} —— 退出订阅登录
+
+删除 canonical Provider 凭据、递增 `credentialGeneration` 并使 Agent 缓存失效；进行中的模型请求不强杀，下一次请求重新解析认证。200：`{"ok":true}`。
+
+### 3.28 POST /api/modelAuth/{provider}/discover —— 发现订阅模型配置候选
+
+请求体为空对象；`provider` 为 `xai/openai-codex`。响应头固定 `Cache-Control: no-store`。此接口不修改 `models.yaml`，但 xAI 请求可能在凭据临期或首次 401 时刷新 `auth.json`。
+
+xAI 只访问固定 `https://api.x.ai/v1/models`；使用 `ProxyHandler` 遵循标准 `HTTPS_PROXY/NO_PROXY`，自定义 redirect handler 禁止全部重定向，普通/HTTPError 响应体均限制 1 MiB；首次 401 使用本次 Access Token 作为 stale 条件并发安全刷新，只重放一次。只有实时 ID 与本地已知 Responses 元数据交集可 `autoApplicable=true`；其它模型带原因跳过。
+
+200 示例：
+
+```json
+{
+  "provider": "xai",
+  "source": "live-catalog-match",
+  "autoApplicable": true,
+  "credentialGeneration": 1,
+  "providerTemplate": {
+    "suggestedId": "xaiSubscription",
+    "baseUrl": "https://api.x.ai/v1",
+    "api": "openai-responses",
+    "auth": "oauth",
+    "headers": {},
+    "models": [{
+      "id": "grok-4.6", "name": "Grok 4.6 Subscription",
+      "input": ["text", "image"], "contextWindow": 500000,
+      "maxTokens": 500000, "reasoning": true, "reasoningEffort": "high",
+      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+    }]
+  },
+  "report": {
+    "discoveredModelIds": ["grok-4.6", "grok-imagine-video"],
+    "includedModelIds": ["grok-4.6"],
+    "skippedModels": [{"id":"grok-imagine-video","reason":"unsupported_output_modality"}],
+    "warnings": ["实时目录只证明上游返回该 ID，不保证最终账户权益或每次调用成功。"],
+    "liveFailureCode": null
+  }
+}
+```
+
+`source`：`live-catalog-match` / `local-fallback` / `local-only`。后两者固定 `autoApplicable=false`，前端必须显式确认。`cost=0` 仅表示不做订阅按 Token 成本估算。
+
+结构化失败：未登录/需重登/账户变化为 409，限流为 429，其余上游安全错误为 502；JSON 为 `{"error":"安全消息","code":"枚举值","retryAfter":17}`。任何成功/失败响应均不得出现 OAuth Token、Authorization 或原始上游响应体。
 
 ## 4. SSE 流式接口
 

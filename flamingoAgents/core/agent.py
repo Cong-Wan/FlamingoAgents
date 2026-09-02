@@ -1,9 +1,8 @@
 '''
 Author: wilbur
-Version: 1.19
-Date: 2026-08-19
-Description: Coordinates pure Agent sessions using a callable tool registry and per-session confirmation state. v1.10 adds the event-stream API (docs/streamOutputPlan.md §6, v2.3 定稿): runUserMessageStream/continueConfirmationStream generators yield 7 event types with real-time text/reasoning deltas; terminal events (completed/confirmationRequired/error) are yielded only after the session lock is released; legacy sync APIs runUserMessage/continueConfirmation are kept as thin wrappers that drain the stream, map terminal events back to runResult, and accept optional onDelta/onReasoning callbacks. v1.11 调整 maxModelSteps 默认值 8 -> 32。v1.12（streamingLatencyFixPlan Phase3/D2）：driveToolBatch 改为「可执行前缀批量 Start」——从 startIndex 起连续可执行（未知或免确认）的工具先全部 yield toolCallStart，再串行 exec + toolCallEnd；遇需确认工具不发 Start，直接 setPending + confirmationRequired 终态（契约 §6.2 红线不变）。v1.13 模型调用重试：连接建立期(chunkSeen=False)可重试错误 3 次指数退避，分片可中断，retryNotice 通知前端。v1.14 maxModelSteps 支持 None/<=0 表示不限制模型循环步数。v1.15（stopResponsivenessPlan L3）：interruptEvent + interruptActiveStreams 薄封装；driveModelLoop 透传 stopEvent、except modelInterruptedError 直通 return、completion is None 先查中断、退避片末尾检查。v1.16 中断事件改按会话存储（interruptEvents dict + getInterruptEvent），修复验收发现的「一会在飞 + 他会话新流 clear 误杀在飞中断」竞态。v1.17（stopResponsivenessPlan L3.5）：executeToolCall 加 sessionId 形参，toolContext 透传 interruptEvent；driveToolBatch 捕获 modelInterruptedError 直通 return。v1.18（toolCallTranscriptClosureFixPlan）：modelInterruptedError 捕获点补写 cancellation toolResult 闭合 transcript（含批次内未 Start 的 requiresApproval call），停止轮不再继续模型；新增 closeUnfinishedToolCalls/logStopRequestedOnce/findUnclosedTailCallIndex；删除 dangling 自动重跑与 queuedUserMessage 机制，driveUserMessage 改 preflight 自愈。
-            v1.19 createSessionId 改为 YYMMDDHHmmss-xxxxxxxx（logPathLayoutFixPlan）。
+Version: 1.20
+Date: 2026-09-01
+Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.20 passes the stable sessionId into model adapters and honors explicit retryable=False authentication failures instead of retrying login errors.
 '''
 
 from __future__ import annotations
@@ -202,7 +201,12 @@ class agent:
             for attempt in range(MODEL_RETRY_MAX_ATTEMPTS + 1):
                 chunkSeen = False
                 try:
-                    for chunk in self.modelAdapter.completeStream(currentConversation.messages, modelTools, stopEvent=interruptEvent):
+                    for chunk in self.modelAdapter.completeStream(
+                        currentConversation.messages,
+                        modelTools,
+                        stopEvent=interruptEvent,
+                        sessionId=sessionId,
+                    ):
                         if isinstance(chunk, textChunk):
                             chunkSeen = True
                             yield textDeltaEvent(text=chunk.text)
@@ -223,8 +227,11 @@ class agent:
                     self.logModelError(currentConversation, error)
                     statusCode = getattr(error, 'statusCode', None)
                     hasStatusAttr = hasattr(error, 'statusCode')
-                    isRetryable = hasStatusAttr and (
-                        statusCode in MODEL_RETRYABLE_STATUS_CODES or statusCode is None
+                    retryableOverride = getattr(error, 'retryable', None)
+                    isRetryable = (
+                        retryableOverride
+                        if isinstance(retryableOverride, bool)
+                        else hasStatusAttr and (statusCode in MODEL_RETRYABLE_STATUS_CODES or statusCode is None)
                     )
                     if chunkSeen or not isRetryable or attempt >= MODEL_RETRY_MAX_ATTEMPTS:
                         yield errorEvent(

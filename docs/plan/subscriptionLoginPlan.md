@@ -1,14 +1,14 @@
 # ChatGPT 与 xAI 订阅登录 Python 原生接入方案
 
 Author: wilbur
-Version: 1.1
+Version: 1.2
 Date: 2026-09-01
-Description: 基于 pi 0.84.4 的现行实现，说明 ChatGPT Plus/Pro 与 xAI SuperGrok/X Premium 的 OAuth、凭据刷新、Responses 请求及多轮回放机制，并给出 FlamingoAgents 的 Python 原生落地计划；不依赖 pi/Node 运行时。v1.1 根据独立审核修订并发 401 强刷、accountId 刷新、canonical authProvider、SSE 完整事件、reasoning terminal 回填、Device Code 轮询、远程回调及敏感信息测试。
+Description: 基于 pi 0.84.4 的现行实现，说明 ChatGPT Plus/Pro 与 xAI SuperGrok/X Premium 的 OAuth、凭据刷新、Responses 请求及多轮回放机制，并给出 FlamingoAgents 的 Python 原生落地计划；不依赖 pi/Node 运行时。v1.2 根据实施前二次独立审核，补充 Responses item 白名单序列化、terminal output 全类型权威合并、浏览器回调全局互斥与端口降级、取消终态 CAS、凭据路径防 symlink/owner 校验及跨模型工具链成对降级。
 
-- 状态：待实施
+- 状态：代码与自动化测试已实施；真实 ChatGPT/xAI 账户烟测待用户凭据环境验收
 - 调研基线：`@earendil-works/pi-coding-agent 0.84.4` / 内置 `@earendil-works/pi-ai`
 - 目标工程：FlamingoAgents（Python >= 3.12、FastAPI、`urllib`、原生前端）
-- 独立审核：`docs/codeReview/260901_subscriptionLoginPlan.md`（v1.1 已落实全部高/中问题及低风险修订）
+- 独立审核：`docs/codeReview/260901_subscriptionLoginPlan.md`（v1.1）、`docs/codeReview/260901_subscriptionLoginPlanV2.md`（v1.2）；实现审核：`docs/codeReview/260901_subscriptionLoginImplementation.md`
 
 ---
 
@@ -321,8 +321,8 @@ xAI 当前 Grok 推理模型也依赖 encrypted reasoning replay；不能因为�
 | `response.function_call_arguments.delta` | 累积工具 JSON 参数 |
 | `response.function_call_arguments.done` | 用完整 `arguments` 覆盖流式半成品并重新解析 JSON |
 | `response.custom_tool_call_input.delta/done` | 首版不支持 custom tool：收到即以 `unsupportedResponseItem` 明确失败，不静默忽略或执行 |
-| `response.output_item.done` | 保存完整 item、确定 message ID / call ID / encrypted content |
-| `response.completed` / Codex `response.done` | 统一为 completed，读取 usage、output、结束原因并生成 `finalChunk` |
+| `response.output_item.done` | 更新临时槽位，并按类型白名单生成可持久化 item；不保存只允许出现在响应中的字段 |
+| `response.completed` / Codex `response.done` | 统一为 completed；以 terminal `response.output` 为全部支持 item 的最终权威状态，再读取 usage、结束原因并生成 `finalChunk` |
 | `response.incomplete` | 按原因映射 length/error，保留已完成输出 |
 | `response.failed` / `error` | 转 `modelRequestError` |
 
@@ -333,9 +333,9 @@ Responses 下一轮不是简单的 role/content 回放。至少要保留：
 - function call item 的 `id` 与 `call_id`；
 - 工具结果对应的 `function_call_output.call_id`。
 
-这些字段作为 Provider opaque data 原样保存；业务层不解析、不修改 `encrypted_content`。
+这些字段属于 Provider opaque data，但**不能把完整服务端 item 未经筛选直接写盘并重发**。持久化和下一轮发送统一经过类型白名单 serializer：reasoning 仅保留 `id/type/summary/encrypted_content`，message 仅保留 `id/type/role/content/phase`，function call 仅保留 `id/type/name/call_id/arguments`，function call output 仅保留 `type/call_id/output`；`status`、内部元数据和未知字段一律不进入下一轮。业务层不解析、不修改 `encrypted_content`。
 
-终态还必须执行 reasoning 回填：部分服务不会在 `response.output_item.done` 给出 `encrypted_content`，而只在 `response.completed.response.output`（或归一后的 Codex `response.done`）中返回。finalize 时按 reasoning item ID 合并终态 output；若已保存 item 缺少 encrypted content，则回填后再写入 `providerData.responseItems`。
+terminal `response.output` 是全部支持 item 的最终权威状态。部分服务可能不发 `response.output_item.done`，或只在 terminal 给出完整 message、function call、arguments/call ID、reasoning encrypted content。finalize 时按 item ID 合并所有支持类型：terminal 的完整字段覆盖增量半成品，新增 item 补建 completion；之后再通过白名单 serializer 写入 `providerData.responseItems`。
 
 ---
 
@@ -442,10 +442,10 @@ providers:
 
 写入要求：
 
-1. `~/.flamingo` 权限 0700；凭据/锁文件 0600。
-2. 同进程使用每 Provider `threading.Lock`；跨进程使用 `fcntl.flock`。
+1. `~/.flamingo` 权限 0700；凭据/锁文件 0600；用 `lstat` 拒绝 symlink、非当前 uid 和异常文件类型。
+2. 同进程使用每 Provider `threading.Lock`；跨进程始终锁稳定的 `auth.lock`（不锁会被 replace 的 `auth.json` inode）；login/write、logout/delete、refresh 均覆盖完整 read-modify-write。
 3. 刷新获得锁后必须重新读文件：即将过期场景重查有效期；401 强刷场景比较 `staleAccess`，若当前 Access 已变化则直接使用新值。
-4. 临时文件写入、flush、`fsync`、`os.replace` 原子替换；不得原地 truncate。
+4. 临时文件在目标目录排他创建并直接设 0600，写入后 flush、`fsync`、`os.replace`，再 `fsync` 父目录；不得原地 truncate。
 5. Refresh Token 轮换时，Access/Refresh/Expiry 必须作为一个原子对象写入；OpenAI 还必须把从新 Access 提取的 AccountId 放在同一原子对象中。
 6. JSON 损坏时保留原文件并报明确错误，不用空对象静默覆盖。
 
@@ -512,18 +512,20 @@ assistant 的 `providerData` 至少保存：
   "authProvider": "openai-codex",
   "configProviderId": "openaiCodex",
   "model": "gpt-5.4",
-  "responseItems": ["服务端返回的完整必要 item"]
+  "responseItems": ["按类型白名单规范化后的可回放 item"]
 }
 ```
 
 回放规则：
 
 - exact replay 只比较 `api + authProvider + model`；`configProviderId` 仅用于展示/排查，不影响凭据共享与协议兼容判断。
-- 同 Responses API 但切换模型：丢弃 reasoning opaque item；用文本和工具调用重建安全输入，不带旧 item ID。
+- exact match 也必须再次经过 serializer，只允许 reasoning/message/function_call/function_call_output 的协议白名单字段；未知字段和 `status` 不发送。
+- 同 Responses API 但切换模型：丢弃 reasoning opaque item和旧 item ID；function call 与其后续 output 只有在 `call_id` 可可靠配对时才成对重建。
+- 不得发送没有前置 call 的孤立 `function_call_output`；缺 call、缺 result 或无法可靠配对时，将整组调用/结果转换为带明确标记的普通文本，不能只保留其中一半。
 - 切回 Chat Completions：忽略 `providerData`，沿用 role/content/toolCalls。
 - 老 JSONL 没有字段时默认为 `{}`。
 
-`providerData` 只允许 JSON 类型；写盘前不放请求头、Token 或整个 HTTP 响应。
+`providerData` 只允许 JSON 类型；写盘前不放请求头、Token、未筛选的服务端 item 或整个 HTTP 响应。
 
 ### D7. Web 登录采用内存任务，不阻塞 HTTP 请求
 
@@ -540,12 +542,12 @@ assistant 的 `providerData` 至少保存：
 
 `modelAuthManager.py`：
 
-- 使用后台线程执行等待回调/设备码轮询；
-- 内存任务用随机 `loginId`，含取消 Event，完成/失败后 10 分钟清理；
-- 同 Provider 同时只允许一个登录任务，第二个请求返回 409；
-- 服务重启只丢失未完成任务，不影响已落盘凭据；
+- 使用后台线程执行等待回调/设备码轮询；所有 OAuth HTTP 请求设置有限超时，网络返回后、Token 交换前和凭据写入前均复查取消状态。
+- 内存任务用随机 `loginId`，含取消 Event；状态更新在锁内做终态 CAS，`cancelled` 后迟到 worker 不得转 `completed` 或写凭据；worker 退出后，完成/失败任务保留 10 分钟再清理。
+- 同 Provider 同时只允许一个登录任务，第二个请求返回 409；OpenAI browser 额外使用进程内全局互斥和跨进程固定 callback lock，避免多个任务/进程争抢 1455。
+- 服务重启只丢失未完成任务，不影响已落盘凭据；多 worker 不受支持，浏览器回调只由单一认证协调进程承载。
 - 任务状态只保存 URL、user code、错误摘要，不保存可返回前端的 Token；不得返回 `code_verifier`。
-- 浏览器登录时后端监听 `127.0.0.1:1455`：浏览器与后端同机可自动回调；远程浏览器的 `localhost` 指向用户机器，通常必须通过 `manualCode` 提交完整回调 URL/code，或改用设备码。
+- 浏览器登录时后端尝试监听 `127.0.0.1:1455`：bind/锁失败立即降级为 `manualCodeRequired`，不让整个登录失败；成功、取消、超时、异常均统一 `shutdown/server_close`。浏览器与后端同机可自动回调；远程浏览器的 `localhost` 指向用户机器，通常必须通过 `manualCode` 提交完整回调 URL/code，或改用设备码。
 
 ### D8. CLI 共用同一实现
 
@@ -578,7 +580,8 @@ CLI 只负责打印 URL/code 和读取人工输入，OAuth、存储、刷新均�
 
 - `oauthCredential` 数据结构和严格 JSON 校验。
 - `readCredential(provider)`、`writeCredential(provider, credential)`、`deleteCredential(provider)`。
-- 0700/0600 权限、进程锁、原子替换。
+- 0700/0600 权限、稳定锁文件覆盖完整 read-modify-write、排他临时文件、原子替换与父目录 fsync。
+- 目录/锁/凭据用 `lstat` 校验非 symlink、归当前 uid 且文件类型正确。
 - 只接受 `openai-codex`、`xai` canonical key，未知键读取可保留但不执行。
 
 ### 5.2 新增 `flamingoAgents/models/subscriptionAuth.py`
@@ -587,6 +590,8 @@ CLI 只负责打印 URL/code 和读取人工输入，OAuth、存储、刷新均�
 - OpenAI 浏览器、OpenAI device code、xAI device code。
 - 两类 Refresh Token 流程；OpenAI 登录与刷新都从新 Access 重提 `accountId`，缺失即失败并禁止覆盖旧凭据。
 - 可取消、超时、interval/slow_down 状态机：默认 5 秒、最小 1 秒、slow_down 缺省 +5 秒；xAI 首 poll 前等待，OpenAI device 可立即首 poll。
+- 所有 OAuth HTTP 请求使用有限 timeout；网络返回后和返回凭据前复查取消，调用方写盘前再复查，消除 cancel/token-success 竞争。
+- OpenAI browser callback 使用全局互斥；1455 bind 失败保留 manual-code 能力，所有出口关闭 listener。
 - `resolveOAuthCredential(provider, forceRefresh=False, staleAccess=None)` 实现 minimum-validity 与 401 双重检查锁。
 - 所有 HTTP 错误统一转 `modelAuthError(provider, action, statusCode, errorCode)`，字符串化时先做敏感字段剔除。
 
@@ -616,10 +621,10 @@ CLI 只负责打印 URL/code 和读取人工输入，OAuth、存储、刷新均�
 1. `buildRequestPayload(messages, tools, sessionId)`；
 2. Chat Completions tool schema → Responses function tool schema；
 3. role messages → Responses input items；
-4. opaque item 安全回放；
+4. opaque item 使用类型白名单 serializer 安全持久化/回放，并对非 exact 工具调用/result 成对降级；
 5. `/responses` 与 `/codex/responses` URL/头分派；
 6. SSE 增量解析和 `textChunk/reasoningChunk/finalChunk`：覆盖 summary/reasoning/refusal、function arguments delta+done、Codex `response.done` 归一化；custom tool 事件首版明确报不支持；
-7. 终态 `response.output` 按 item ID 回填 reasoning `encrypted_content`，再生成可持久化 `responseItems`；
+7. 以终态 `response.output` 为权威，按 item ID 合并 reasoning/message/function call，terminal 完整字段覆盖增量半成品并补建仅 terminal 出现的 item；随后经白名单 serializer 生成 `responseItems`;
 8. usage 转成现有格式：
 
 ```text
@@ -682,21 +687,24 @@ output_tokens_details.reasoning_tokens → completion_tokens_details.reasoning_t
 
 - `tests/testCredentialStore.py`
   - 权限、原子写、损坏 JSON、不丢未知 Provider；
-  - 两线程/两进程竞争刷新只保留完整凭据。
+  - symlink/错误 owner/异常文件类型拒绝，replace 后父目录 fsync；
+  - 两线程/两进程竞争刷新只保留完整凭据；login/refresh/logout 三方竞争不丢更新。
 - `tests/testSubscriptionAuth.py`
   - PKCE 长度和 challenge；
-  - OpenAI callback state mismatch；
+  - OpenAI callback state mismatch、1455 端口占用降级、取消后再次登录、跨进程 callback lock；
   - JWT Base64URL padding/accountId 提取；
   - OpenAI device pending/slow_down/success/timeout，且允许立即首 poll；
   - xAI pending/slow_down/denied/expired，且首 poll 前等待、默认/最小 interval 正确；
   - xAI 刷新不返回 refresh_token 时保留旧值；
   - OpenAI refresh 产生新 accountId 时凭据和请求头同时换新；
   - `expires=now+60s` 触发 minimum-validity refresh；
-  - 两个并发 401 使用同一 staleAccess 时 Refresh HTTP 只调用一次。
+  - 两个并发 401 使用同一 staleAccess 时 Refresh HTTP 只调用一次；
+  - OAuth HTTP 均有有限 timeout；取消与 Token 成功同时发生时 cancelled 任务不能写凭据。
 - `tests/testResponsesAdapter.py`
   - Codex/xAI URL、头和请求体快照；
   - 文本/reasoning/refusal/tool 参数跨 SSE chunk 拼接；
   - `function_call_arguments.done` 覆盖半包 JSON，Codex `response.done` 正常终止；
+  - terminal output 覆盖完整 message/function arguments/call ID，且缺少 `output_item.done` 时补建 completion；
   - custom tool 事件返回可识别的不支持错误；
   - usage 映射；
   - response.failed/incomplete；
@@ -704,9 +712,11 @@ output_tokens_details.reasoning_tokens → completion_tokens_details.reasoning_t
   - stop 中断阻塞读。
 - `tests/testResponsesReplay.py`
   - encrypted reasoning 完整 round-trip；`output_item.done` 缺密文而 terminal output 带密文时可回填；
+  - item 白名单过滤未知字段、`status`、空密文和跨版本字段；
   - item ID/call ID/function_call_output 配对；
   - JSONL resume 后第二轮 payload 与首次内存态一致；
-  - 切模型/切 Provider 时不回放不兼容 opaque item；
+  - 切模型/切 Provider 时不回放不兼容 opaque item，function call/output 成对重建；
+  - 缺失 tool result、孤立 tool result 不产生孤立 `function_call_output`；
   - 老 JSONL 兼容。
 - `tests/testModelConfigAuth.py`
   - 老配置默认 API Key；
@@ -720,7 +730,8 @@ output_tokens_details.reasoning_tokens → completion_tokens_details.reasoning_t
 - 未带 Flamingo Web Token 访问 modelAuth 路由 → 401。
 - 登录状态响应不含 `access`、`refresh`、`authorization`、`code_verifier`。
 - 同 Provider 重复启动登录 → 409。
-- cancel 后后台轮询停止。
+- cancel 后后台轮询停止；取消与 Token 成功竞争时终态保持 cancelled 且不写凭据。
+- 浏览器 1455 端口占用时任务进入 manual-code 状态，取消后 listener/全局锁释放，可再次登录。
 - logout 删除凭据，下一模型请求返回可识别的 `modelAuthError`。
 - `PUT /api/models` 对旧配置和新认证类型均正确合并。
 - 构造特征 Access/Refresh Secret，触发登录、刷新和模型 401 错误；断言 Web 响应、`repr`/异常字符串、debug buffer、`modelError` JSONL 均不含 Secret。
@@ -748,12 +759,15 @@ output_tokens_details.reasoning_tokens → completion_tokens_details.reasoning_t
 | Refresh Token 并发旋转导致旧值覆盖新值 | Provider 级线程锁 + 文件锁 + expiry/staleAccess 锁内重查 + 原子整体写 |
 | Token 泄漏 | 独立 0600 文件；响应、repr、debug、JSONL 全面排除 |
 | 回调 state/恶意 verification URI | 强制 state 比对；设备验证链接只允许 HTTPS |
+| 固定 1455 端口/多进程竞争 | browser callback 全局线程锁 + 固定文件锁；占用时降级 manual code；所有出口关闭 listener |
+| 取消时 urllib 仍在阻塞或迟到写凭据 | 有限 HTTP timeout + 网络返回/写盘前复查 + 任务终态 CAS |
+| 凭据路径被 symlink 替换 | `lstat`/uid/type 校验；稳定 lock inode；排他临时文件 + 父目录 fsync |
 | SSE 中途重试造成重复输出/工具副作用 | 仅零 chunk 401 刷新重试；其它沿用 chunkSeen 红线 |
-| 丢失 encrypted reasoning/item ID 导致第二轮 400 | 完整必要 item 落 JSONL并做 resume round-trip 测试 |
-| Provider/模型切换回放不兼容 opaque data | 仅 exact `api+authProvider+model` 原样回放，其余降级重建 |
+| 丢失 encrypted reasoning/item ID 导致第二轮 400 | terminal output 全类型权威合并；白名单 item 落 JSONL 并做 resume round-trip 测试 |
+| Provider/模型切换回放不兼容 opaque data | 仅 exact `api+authProvider+model` 白名单回放；其余工具 call/output 成对降级，禁止孤立 output |
 | Codex SSE 性能不及 WebSocket | 首版正确性优先；后续独立增加 WS/zstd，不污染认证层 |
 | Session JSONL 含 encrypted reasoning | 文档声明其为会话敏感数据，沿用用户目录权限；不含 Token |
-| 临时 1455 端口被占 | 手工 URL/code 回退或设备码模式 |
+| 临时 1455 端口被占 | 自动进入 manual-code 状态并释放 listener 资源，或改用设备码模式 |
 
 ---
 
@@ -761,48 +775,48 @@ output_tokens_details.reasoning_tokens → completion_tokens_details.reasoning_t
 
 ### Phase 1：认证闭环
 
-- [ ] T1 新增 `credentialStore.py` 与并发/权限测试
-- [ ] T2 新增 OpenAI PKCE + device code + refresh
-- [ ] T3 新增 xAI device code + refresh
-- [ ] T4 改造动态 `modelAuthResolver`
-- [ ] T5 新增 `modelLogin.py`，完成 CLI 真实登录烟测
+- [x] T1 新增 `credentialStore.py` 与并发/权限测试
+- [x] T2 新增 OpenAI PKCE + device code + refresh
+- [x] T3 新增 xAI device code + refresh
+- [x] T4 改造动态 `modelAuthResolver`
+- [x] T5 新增 `modelLogin.py`（真实账户烟测归 T21）
 
 验收：S1–S4、S10。
 
 ### Phase 2：Responses 协议
 
-- [ ] T6 扩展 model config API/auth schema，保证旧配置测试通过
-- [ ] T7 新增 adapter factory 与 `responsesAdapter.py`
-- [ ] T8 完成 message/tool 请求转换和 Codex/xAI 头/URL
-- [ ] T9 完成 SSE text/reasoning/refusal/function call delta+done/terminal output/usage 解析
-- [ ] T10 接入 stop、零 chunk 401 refresh、现有 retry 策略
+- [x] T6 扩展 model config API/auth schema，保证旧配置测试通过
+- [x] T7 新增 adapter factory 与 `responsesAdapter.py`
+- [x] T8 完成 message/tool 请求转换和 Codex/xAI 头/URL
+- [x] T9 完成 SSE text/reasoning/refusal/function call delta+done/terminal output/usage 解析
+- [x] T10 接入 stop、零 chunk 401 refresh、现有 retry 策略
 
 验收：S5–S7、S9。
 
 ### Phase 3：多轮持久化
 
-- [ ] T11 给 `chatMessage/toolCall` 增加 `providerData`
-- [ ] T12 JSONL 保存/恢复 response items
-- [ ] T13 exact `api+authProvider+model` 回放与跨模型降级
-- [ ] T14 工具结果 call ID 配对和 resume round-trip 测试
+- [x] T11 给 `chatMessage/toolCall` 增加 `providerData`
+- [x] T12 JSONL 保存/恢复 response items
+- [x] T13 exact `api+authProvider+model` 回放与跨模型降级
+- [x] T14 工具结果 call ID 配对和 resume round-trip 测试
 
 验收：S7–S9，重点 S8。
 
 ### Phase 4：Web 登录体验
 
-- [ ] T15 新增后台登录任务管理器和 modelAuth API
-- [ ] T16 扩展模型配置读写/API/auth 校验
-- [ ] T17 设置页登录状态、登录面板、manual code、取消/退出
-- [ ] T18 双窗口、重启、取消、Token 不泄漏测试
+- [x] T15 新增后台登录任务管理器和 modelAuth API
+- [x] T16 扩展模型配置读写/API/auth 校验
+- [x] T17 设置页登录状态、登录面板、manual code、取消/退出
+- [x] T18 登录任务并发、持久化、取消竞态、Token 不泄漏自动化测试（真实浏览器双窗口归 T21）
 
 验收：S1–S4、S10 的 Web 场景。
 
 ### Phase 5：文档与最终验收
 
-- [ ] T19 更新 `models.example.yaml` 和 README（保留用户现有 README 改动）
-- [ ] T20 全量 `uv run pytest`
-- [ ] T21 ChatGPT/xAI 各完成文本 + 工具 + 第二轮 + 重启烟测
-- [ ] T22 检查 git diff：无 Token、无真实 auth.json、无无关格式化
+- [x] T19 更新 `models.example.yaml`、README 与 Web API 契约（保留用户现有 README 内容）
+- [x] T20 全量 `uv run pytest`（35 passed）
+- [ ] T21 ChatGPT/xAI 各完成文本 + 工具 + 第二轮 + 重启烟测（需要用户真实订阅账户授权）
+- [x] T22 检查 git diff：无 Token、无真实 auth.json、无无关格式化
 
 ---
 

@@ -1,11 +1,8 @@
 '''
 Author: wilbur
-Version: 1.7
-Date: 2026-08-14
-Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.4 adds streaming structures (docs/streamOutputPlan.md §6.2): 3 adapter-layer chunks (textChunk/reasoningChunk/finalChunk) and 7 agent event classes (textDeltaEvent/reasoningDeltaEvent/toolCallStartEvent/toolCallEndEvent/confirmationRequiredEvent/completedEvent/errorEvent) plus the terminalEventTypes tuple.
-             v1.5 新增 retryNoticeEvent（模型调用重试非终态事件，不进 terminalEventTypes）。
-             v1.6 新增 modelInterruptedError（用户中断信号：shutdown 唤醒/退避打断专用，非模型错误，非 modelRequestError 子类）。
-             v1.7（stopResponsivenessPlan L3.5）：toolContext 新增可选 interruptEvent，供 bash/askSubAgent 分片 poll 查中断。
+Version: 1.8
+Date: 2026-09-01
+Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.8 adds JSON-only providerData to chatMessage/toolCall for Responses opaque item persistence and replay while preserving empty defaults for old sessions.
 '''
 
 from __future__ import annotations
@@ -24,6 +21,7 @@ class toolCall:
     id: str
     toolName: str
     arguments: dict[str, Any]
+    providerData: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -33,6 +31,7 @@ class chatMessage:
     toolCalls: list[toolCall] = field(default_factory=list)
     toolCallId: str | None = None
     name: str | None = None
+    providerData: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

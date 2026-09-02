@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.16
-Date: 2026-08-17
-Description: Adapts internal chat messages and tool schemas to OpenAI-compatible chat completions using injected model auth. v1.9 adds stream_options.include_usage to streaming requests so the provider emits a final usage chunk, keeping usageTotal accumulation and assistantMessage usage logging working under streaming (OpenAI-compatible streaming omits usage by default). v1.10 sends modelConfig.headers as custom request headers (Authorization/Content-Type always set by the adapter and cannot be overridden). v1.11（fixPlan Phase2）：流式累积 reasoningParts 并在流结束时写入顶层 responsePayload['reasoning']（非空才写，不入 messagePayload）；complete() 非流式出口归一化 choices[0].message.reasoning_content -> 顶层 reasoning，保持 choices[0].message 与非流式同构（reasoning 不得进入发往模型的 messages，D2 红线）。v1.12（streamingLatencyFixPlan Phase1/T1.1）：iterSseData 改优先 read1(4096)（getattr fallback read），修复 chunked SSE 上 read(amt) 阻塞凑批导致的「长时间真空后一次性喷出」。v1.13：默认 User-Agent 为 OpenAI/JS 6.26.0，避免 urllib 自动带上 Python-urllib/x.y；models.yaml 自定义 headers 仍可覆盖。v1.14 modelRequestError 新增 retryAfterSeconds（解析 429 Retry-After 头，秒/HTTP-date）。v1.15（stopResponsivenessPlan L3）：activeResponses 登记 + interruptActiveStreams shutdown 唤醒；completeStream/consumeSseStream/iterSseData 透传 stopEvent，三路径（IncompleteRead/空字节/OSError）统一 raise modelInterruptedError；interrupt 时给 response 打 _flamingoInterrupted 标记，覆盖「先 shutdown 后 set stopEvent」竞态。v1.16（emptyAssistantRequestFixPlan）：convertMessage 对无 toolCalls 且 content 空/空白的 assistant 在 wire 上改发 '.'，避免 provider 400 assistant must not be empty；不写回 chatMessage/jsonl，不读 reasoning。
+Version: 1.18
+Date: 2026-09-01
+Description: Adapts internal messages/tools to OpenAI-compatible Chat Completions. v1.17 accepts the shared optional sessionId adapter argument and intentionally ignores it, preserving all existing request behavior while the Agent can dispatch both Chat Completions and Responses adapters through one port. v1.18 relaxes the urlopen socket timeout 60s→300s：thinking 模型静默期可达数分钟，60s 会误杀长思考。
 '''
 
 from __future__ import annotations
@@ -97,7 +97,9 @@ class chatCompletionsAdapter:
         if self.debugConsole:
             self.debugConsole.debug(f"Source request:\n{requestBytes.decode('utf-8')}\n")
         try:
-            return urllib.request.urlopen(request, timeout=60)
+            # 读超时 300s：thinking 模型静默期可达 1~3 分钟，60s 会误杀长思考；
+            # 保持有限值（非 None）兜底真死连接，避免永久占用会话锁。
+            return urllib.request.urlopen(request, timeout=300)
         except urllib.error.HTTPError as error:
             errorText = error.read().decode('utf-8', errors='replace')
             retryAfterSeconds = None
@@ -127,7 +129,7 @@ class chatCompletionsAdapter:
                 responseBody=str(error.reason),
             ) from error
 
-    def complete(self, messages: list[chatMessage], tools: list[dict[str, Any]]) -> modelCompletion:
+    def complete(self, messages: list[chatMessage], tools: list[dict[str, Any]], sessionId: str | None = None) -> modelCompletion:
         requestPayload = self.buildRequestPayload(messages, tools, stream=False)
         with self.openRequest(requestPayload) as response:
             responseText = response.read().decode('utf-8')
@@ -146,10 +148,16 @@ class chatCompletionsAdapter:
             responsePayload=payload,
         )
 
-    def completeStream(self, messages: list[chatMessage], tools: list[dict[str, Any]], stopEvent=None) -> Iterator:
-        # stream=False 回退：迭代器退化为单发 finalChunk，走现有非流式路径。
+    def completeStream(
+        self,
+        messages: list[chatMessage],
+        tools: list[dict[str, Any]],
+        stopEvent=None,
+        sessionId: str | None = None,
+    ) -> Iterator:
+        # sessionId 由 Responses 用于缓存/请求头；Chat Completions 为兼容统一端口而接收但忽略。
         if not self.config.stream:
-            yield finalChunk(completion=self.complete(messages, tools))
+            yield finalChunk(completion=self.complete(messages, tools, sessionId=sessionId))
             return
         requestPayload = self.buildRequestPayload(messages, tools, stream=True)
         yield from self.consumeSseStream(requestPayload, stopEvent=stopEvent)

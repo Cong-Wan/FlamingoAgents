@@ -1,10 +1,8 @@
 '''
 Author: wilbur
-Version: 1.2
-Date: 2026-08-05
-Description: config/models.yaml 读写：GET 原始 yaml 宽松读取 + apiKey 脱敏（__KEEP__/$ 引用规则，契约 §2.4）；PUT 合并式更新（保留 stream 等 schema 外字段）+ .bak 备份 + 原子写。
-            v1.1 随包改名调整：modelsYamlPath 因目录加深一级改为 parents[2]。
-            v1.2：headers 自定义请求头纳入 schema（provider/model 两级，dict[str,str]；PUT 传空对象=删除该字段）。
+Version: 1.3
+Date: 2026-09-01
+Description: Reads and atomically merges config/models.yaml for Web settings. v1.3 supports three model APIs and api-key/oauth auth, keeps credentials separate, validates canonical subscription combinations, and preserves legacy auth defaults and apiKey masking.
 '''
 
 from __future__ import annotations
@@ -15,11 +13,14 @@ from pathlib import Path
 
 import yaml
 
+from flamingoAgents.models.modelConfig import validateApiAuth
+
 modelsYamlPath = Path(__file__).resolve().parents[2] / 'config' / 'models.yaml'
 backupPath = modelsYamlPath.with_suffix('.yaml.bak')
 
 keepPlaceholder = '__KEEP__'
-allowedApi = 'openai-completions'
+allowedApis = {'openai-completions', 'openai-responses', 'openai-codex-responses'}
+allowedAuthTypes = {'api-key', 'oauth'}
 allowedInputTypes = {'text', 'image'}
 allowedThinkingTypes = {'enabled', 'disabled'}
 
@@ -90,6 +91,7 @@ def readModelsConfig() -> dict:
             providers[str(providerId)] = {
                 'baseUrl': providerDict.get('baseUrl') if isinstance(providerDict.get('baseUrl'), str) else '',
                 'api': providerDict.get('api') if isinstance(providerDict.get('api'), str) else '',
+                'auth': providerDict.get('auth') if providerDict.get('auth') in allowedAuthTypes else 'api-key',
                 'apiKey': maskApiKey(providerDict.get('apiKey')),
                 'headers': normalizeHeadersForRead(providerDict.get('headers')),
                 'models': [normalizeModelForRead(item) for item in rawModels] if isinstance(rawModels, list) else [],
@@ -149,10 +151,18 @@ def validateProvider(providerId: str, provider) -> None:
     require(isinstance(provider, dict), f'provider {providerId} 必须是对象。')
     require(isinstance(provider.get('baseUrl'), str) and bool(provider['baseUrl'].strip()),
             f'provider {providerId} 的 baseUrl 必须是非空字符串。')
-    require(provider.get('api') == allowedApi, f'provider {providerId} 的 api 仅允许 {allowedApi}。')
+    apiType = provider.get('api')
+    require(apiType in allowedApis, f'provider {providerId} 的 api 仅允许 {"/".join(sorted(allowedApis))}。')
+    authType = provider.get('auth', 'api-key')
+    require(authType in allowedAuthTypes, f'provider {providerId} 的 auth 仅允许 api-key/oauth。')
+    validateApiAuth(providerId, apiType, authType, provider['baseUrl'].strip())
     apiKey = provider.get('apiKey')
     if apiKey is not None:
         require(isinstance(apiKey, str), f'provider {providerId} 的 apiKey 必须是字符串。')
+    if authType == 'api-key':
+        hasConfiguredKey = isinstance(apiKey, str) and bool(apiKey.strip())
+        hasXaiFallback = apiType == 'openai-responses' and bool(os.getenv('XAI_API_KEY', '').strip())
+        require(hasConfiguredKey or hasXaiFallback, f'provider {providerId} 的 auth=api-key 时必须配置 apiKey。')
     models = provider.get('models')
     require(isinstance(models, list) and bool(models), f'provider {providerId} 的 models 必须是非空数组。')
     validateHeaders(provider.get('headers'), f'provider {providerId}')
@@ -203,8 +213,11 @@ def mergeProvider(requestProvider: dict, existingProvider) -> dict:
     existing = dict(existingProvider) if isinstance(existingProvider, dict) else {}
     existing['baseUrl'] = requestProvider['baseUrl'].strip()
     existing['api'] = requestProvider['api']
+    existing['auth'] = requestProvider.get('auth', 'api-key')
     apiKey = requestProvider.get('apiKey')
-    if apiKey == keepPlaceholder:
+    if existing['auth'] == 'oauth':
+        existing.pop('apiKey', None)
+    elif apiKey == keepPlaceholder:
         # 保留 yaml 原值：无原值则视为缺省（不落字段）。
         if not isinstance(existing.get('apiKey'), str) or not existing['apiKey'].strip():
             existing.pop('apiKey', None)

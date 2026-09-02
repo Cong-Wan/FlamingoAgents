@@ -1,16 +1,8 @@
 /*
 Author: wilbur
-Version: 1.6
-Date: 2026-08-14
-Description: 模型配置编辑页：整页表单化（§11.3）——顶部 provider tab 条 + 全宽纵向字段 + 模型折叠卡片 +
-             底部固定保存/重置栏。内存工作副本：open 时 GET 一次，tab 切换不重拉（脏数据 confirm 提示），
-             重置 = 放弃修改重拉，保存 = 工作副本全量 PUT（契约 §2.4/§3.11/§3.12）。
-             apiKey 遵循 __KEEP__ / $ 引用 / 空串删除规则。
-             v1.2：provider 级新增 headers 自定义请求头编辑（每行 Key: Value；空=删除该字段；可用于伪装 UA 绕过中转 CF 拦截）。
-             v1.3：新增 provider 改名时仅刷新 tab，避免每输入一个字符重建表单并导致 providerId 输入框失焦。
-             v1.4：新增 provider 的名称默认为空；模型表单隐藏 reasoning/thinking.type，仅保留思考强度选择。
-             v1.5：上传 models.json 导入：设置页面板选择文件，预览/应用走 POST /api/models/importPi + mergePiImport 合进工作副本。
-             v1.6：技能区从本页抽出为与模型配置平级的独立「技能」页（skillsView），本页不再渲染技能。
+Version: 1.9
+Date: 2026-09-01
+Description: Model editor with independent subscription discovery, non-overwrite guarded merge, account-epoch flights, and per-open revision commits so inverse asynchronous reloads cannot restore stale configuration.
 */
 (function () {
   'use strict';
@@ -48,6 +40,21 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
   var piImportApplyButton = document.getElementById('piImportApplyButton');
   var piImportCancelButton = document.getElementById('piImportCancelButton');
   var piImportReport = document.getElementById('piImportReport');
+  var modelAuthModal = document.getElementById('modelAuthModal');
+  var modelAuthLoginStatus = document.getElementById('modelAuthLoginStatus');
+  var modelAuthLoginUrlRow = document.getElementById('modelAuthLoginUrlRow');
+  var modelAuthLoginUrl = document.getElementById('modelAuthLoginUrl');
+  var modelAuthDeviceCodeRow = document.getElementById('modelAuthDeviceCodeRow');
+  var modelAuthDeviceCode = document.getElementById('modelAuthDeviceCode');
+  var modelAuthCountdown = document.getElementById('modelAuthCountdown');
+  var modelAuthManualRow = document.getElementById('modelAuthManualRow');
+  var modelAuthManualCode = document.getElementById('modelAuthManualCode');
+  var modelAuthManualSubmit = document.getElementById('modelAuthManualSubmit');
+  var modelAuthLoginError = document.getElementById('modelAuthLoginError');
+  var modelAuthLoginCancel = document.getElementById('modelAuthLoginCancel');
+  var modelAuthLoginClose = document.getElementById('modelAuthLoginClose');
+  var subscriptionAccounts = document.getElementById('subscriptionAccounts');
+  var subscriptionDiscoveryNotice = document.getElementById('subscriptionDiscoveryNotice');
 
   var modelConfig = null;       // GET /api/models 原始返回（编辑工作副本，tab 切换不重拉）
   var fetchedApiKeys = {};      // providerId → GET 返回的 apiKey 原值（判断是否为「新输入」）
@@ -56,6 +63,12 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
   var expandedModels = [];      // 展开的模型卡片（按对象引用）
   var dirty = false;            // 有未保存修改
   var cachedImport = null;      // {providers, report} 当前文件的转换结果
+  var modelAuthStatuses = {};   // canonical provider → 脱敏状态
+  var activeLogin = null;       // 当前登录任务的公开状态（不含凭据）
+  var loginPollTimer = null;
+  var workingRevision = 0;      // 任意编辑/reload/save 都使旧 discovery 结果失效
+  var accountEpoch = { 'openai-codex': 0, xai: 0 };
+  var discoveryFlights = {};    // provider + accountEpoch → Promise
 
   function showError(message) {
     errorEl.textContent = message;
@@ -63,6 +76,7 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
   }
 
   function markDirty() {
+    workingRevision += 1;
     dirty = true;
     dirtyHintEl.classList.remove('hidden');
   }
@@ -117,9 +131,382 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
     return select;
   }
 
+  function canonicalProviderForApi(apiType) {
+    if (apiType === 'openai-codex-responses') return 'openai-codex';
+    if (apiType === 'openai-responses') return 'xai';
+    return null;
+  }
+
+  function formatAuthStatus(status) {
+    if (!status || !status.loggedIn) return '未登录';
+    var expiresAt = Number(status.expiresAt || 0);
+    var remaining = expiresAt - Date.now() / 1000;
+    if (remaining <= 0) return '已过期';
+    if (remaining <= 300) return '即将过期';
+    return '已登录' + (status.accountHint ? '（' + status.accountHint + '）' : '');
+  }
+
+  function isDiscoveryPending(authProvider) {
+    var key = window.subscriptionModels.flightKey(authProvider, accountEpoch[authProvider] || 0);
+    return !!discoveryFlights[key];
+  }
+
+  function buildSubscriptionAccount(authProvider) {
+    var status = modelAuthStatuses[authProvider] || {};
+    var isXai = authProvider === 'xai';
+    var card = document.createElement('div');
+    card.className = 'subscription-account-card';
+    var head = document.createElement('div');
+    head.className = 'subscription-account-head';
+    var name = document.createElement('div');
+    name.className = 'subscription-account-name';
+    name.textContent = isXai ? 'xAI SuperGrok / X Premium' : 'ChatGPT Plus / Pro';
+    var statusLine = document.createElement('div');
+    statusLine.className = 'subscription-account-status';
+    statusLine.textContent = formatAuthStatus(status);
+    head.appendChild(name);
+    head.appendChild(statusLine);
+    card.appendChild(head);
+    var description = document.createElement('div');
+    description.className = 'subscription-account-description';
+    description.textContent = isXai
+      ? '登录后读取 xAI 实时模型目录，并与本地 Responses 元数据取交集。'
+      : 'Codex 无可靠账户枚举端点，仅提供需手工确认的内置配置候选。';
+    card.appendChild(description);
+    if (status.error) {
+      var statusError = document.createElement('div');
+      statusError.className = 'field-error';
+      statusError.textContent = status.error;
+      card.appendChild(statusError);
+    }
+    var actions = document.createElement('div');
+    actions.className = 'subscription-account-actions';
+    function addAction(label, handler, className) {
+      var button = document.createElement('button');
+      button.className = className || 'btn';
+      button.type = 'button';
+      button.textContent = label;
+      button.addEventListener('click', handler);
+      actions.appendChild(button);
+      return button;
+    }
+    if (!status.loggedIn) {
+      if (isXai) {
+        addAction('订阅登录', function () { startSubscriptionLogin('xai', 'device_code'); });
+      } else {
+        addAction('浏览器登录', function () { startSubscriptionLogin('openai-codex', 'browser'); });
+        addAction('设备码登录', function () { startSubscriptionLogin('openai-codex', 'device_code'); });
+      }
+    } else {
+      var syncLabel = isDiscoveryPending(authProvider)
+        ? '正在发现…'
+        : (isXai ? '同步模型候选' : '应用内置候选');
+      var syncButton = addAction(syncLabel, function () { discoverAndApplySubscription(authProvider, true); });
+      syncButton.disabled = isDiscoveryPending(authProvider);
+      addAction('退出登录', function () { logoutSubscription(authProvider); }, 'btn btn-danger');
+    }
+    card.appendChild(actions);
+    return card;
+  }
+
+  function renderSubscriptionAccounts() {
+    subscriptionAccounts.innerHTML = '';
+    subscriptionAccounts.appendChild(buildSubscriptionAccount('openai-codex'));
+    subscriptionAccounts.appendChild(buildSubscriptionAccount('xai'));
+  }
+
+  function buildProviderOauthStatus(provider) {
+    var authProvider = canonicalProviderForApi(provider.api);
+    var status = modelAuthStatuses[authProvider] || {};
+    var wrap = document.createElement('div');
+    wrap.className = 'model-auth-card';
+    var statusLine = document.createElement('div');
+    statusLine.className = 'model-auth-status';
+    statusLine.textContent = formatAuthStatus(status);
+    wrap.appendChild(statusLine);
+    var note = document.createElement('div');
+    note.className = 'field-hint';
+    note.textContent = '登录、同步候选和退出请使用页面顶部“订阅账户”；凭据不会写入 models.yaml。';
+    wrap.appendChild(note);
+    return wrap;
+  }
+
+  function showDiscoveryNotice(message, kind) {
+    subscriptionDiscoveryNotice.textContent = message || '';
+    subscriptionDiscoveryNotice.className = 'subscription-discovery-notice' + (kind ? ' ' + kind : '');
+    subscriptionDiscoveryNotice.classList.toggle('hidden', !message);
+  }
+
+  async function refreshModelAuthStatuses() {
+    var response = await window.api.getModelAuth();
+    modelAuthStatuses = (response && response.providers) || {};
+  }
+
+  function hasStrictSubscriptionProvider(authProvider) {
+    var providers = (modelConfig && modelConfig.providers) || {};
+    var expectedApi = authProvider === 'xai' ? 'openai-responses' : 'openai-codex-responses';
+    var expectedUrl = authProvider === 'xai'
+      ? 'https://api.x.ai/v1' : 'https://chatgpt.com/backend-api';
+    return Object.keys(providers).some(function (providerId) {
+      var provider = providers[providerId] || {};
+      return provider.api === expectedApi && provider.auth === 'oauth' &&
+        window.subscriptionModels.normalizeBaseUrl(provider.baseUrl) === expectedUrl;
+    });
+  }
+
+  function formatDiscoveryReport(result, merged) {
+    var report = (result && result.report) || {};
+    var sourceNames = {
+      'live-catalog-match': 'xAI 实时目录与本地 Responses 目录交集',
+      'local-fallback': '离线本地候选（实时目录失败）',
+      'local-only': '内置本地候选'
+    };
+    var reasonNames = {
+      unsupported_output_modality: '当前不支持图像/视频生成',
+      requires_openai_completions: '仅确认支持 Chat Completions',
+      missing_responses_metadata: '缺少可信 Responses 元数据'
+    };
+    var lines = [
+      '来源：' + (sourceNames[result.source] || result.source),
+      '配置候选：' + ((report.includedModelIds || []).join('、') || '（无）')
+    ];
+    var skipped = report.skippedModels || [];
+    if (skipped.length) {
+      lines.push('未自动加入：');
+      skipped.slice(0, 20).forEach(function (item) {
+        lines.push('  - ' + item.id + '：' + (reasonNames[item.reason] || item.reason));
+      });
+      if (skipped.length > 20) lines.push('  - 另有 ' + (skipped.length - 20) + ' 项');
+    }
+    (report.warnings || []).forEach(function (warning) { lines.push('提示：' + warning); });
+    if (report.liveFailureCode) lines.push('实时目录失败码：' + report.liveFailureCode);
+    if (merged) {
+      lines.push('已加入编辑区 Provider：' + merged.providerId);
+      lines.push('新增模型：' + (merged.addedModelIds.join('、') || '（无，已有同名配置均保持不变）'));
+      lines.push('尚未写入 models.yaml，请确认后点击页面底部“保存”。');
+    }
+    return lines.join('\n');
+  }
+
+  function discoveryGuardMatches(startRevision, authProvider, startEpoch, startGeneration, resultGeneration) {
+    return window.subscriptionModels.canApplyResult(
+      startRevision,
+      workingRevision,
+      startEpoch,
+      accountEpoch[authProvider] || 0,
+      startGeneration,
+      resultGeneration
+    );
+  }
+
+  function discoverAndApplySubscription(authProvider, manualTrigger) {
+    var epoch = accountEpoch[authProvider] || 0;
+    var key = window.subscriptionModels.flightKey(authProvider, epoch);
+    if (discoveryFlights[key]) return discoveryFlights[key];
+    var status = modelAuthStatuses[authProvider] || {};
+    if (!status.loggedIn) {
+      showDiscoveryNotice('请先完成 ' + authProvider + ' 订阅登录。', 'error');
+      return Promise.resolve();
+    }
+    var startRevision = workingRevision;
+    var startGeneration = Number(status.credentialGeneration || 0);
+    var operation = (async function () {
+      showDiscoveryNotice('正在读取 ' + authProvider + ' 模型配置候选…');
+      try {
+        var result = await window.api.discoverSubscriptionModels(authProvider);
+        var resultGeneration = Number(result.credentialGeneration || 0);
+        if (!discoveryGuardMatches(startRevision, authProvider, epoch, startGeneration, resultGeneration)) {
+          showDiscoveryNotice('发现期间配置或订阅账户发生变化，旧结果已丢弃；请重新同步。', 'warning');
+          return;
+        }
+        showDiscoveryNotice(formatDiscoveryReport(result), result.autoApplicable ? '' : 'warning');
+        var candidateModels = result.providerTemplate && result.providerTemplate.models;
+        if (!Array.isArray(candidateModels) || candidateModels.length === 0) return;
+        if (!result.autoApplicable) {
+          if (!manualTrigger) return;
+          if (!window.confirm('这些只是未验证的本地配置候选，不代表账户权益。仍要加入当前编辑区吗？')) return;
+        }
+        if (!discoveryGuardMatches(startRevision, authProvider, epoch, startGeneration, resultGeneration)) {
+          showDiscoveryNotice('确认期间配置或订阅账户发生变化，结果未应用。', 'warning');
+          return;
+        }
+        var merged = window.subscriptionModels.mergeDiscovery(modelConfig, result, currentProviderId);
+        if (!merged.ok) {
+          showDiscoveryNotice(
+            '存在多个匹配的订阅 Provider：' + merged.matchingProviderIds.join('、') +
+            '。请先切换到目标 Provider，再点击“同步模型候选”。',
+            'warning'
+          );
+          return;
+        }
+        modelConfig = merged.config;
+        if (merged.createdProvider) newProviderIds[merged.providerId] = true;
+        currentProviderId = merged.providerId;
+        expandedModels = [];
+        var targetModels = modelConfig.providers[merged.providerId].models || [];
+        if (targetModels[0]) expandedModels.push(targetModels[0]);
+        markDirty();
+        render();
+        showDiscoveryNotice(formatDiscoveryReport(result, merged), 'warning');
+      } catch (error) {
+        showDiscoveryNotice(error.message, 'error');
+      } finally {
+        if (discoveryFlights[key] === operation) delete discoveryFlights[key];
+        renderSubscriptionAccounts();
+      }
+    })();
+    discoveryFlights[key] = operation;
+    renderSubscriptionAccounts();
+    return operation;
+  }
+
+  async function autoDiscoverMissingXaiProvider() {
+    var status = modelAuthStatuses.xai || {};
+    if (status.loggedIn && !hasStrictSubscriptionProvider('xai')) {
+      await discoverAndApplySubscription('xai', false);
+    }
+  }
+
+  function resetLoginModal() {
+    modelAuthLoginError.classList.add('hidden');
+    modelAuthLoginError.textContent = '';
+    modelAuthLoginUrlRow.classList.add('hidden');
+    modelAuthDeviceCodeRow.classList.add('hidden');
+    modelAuthManualRow.classList.add('hidden');
+    modelAuthCountdown.textContent = '';
+    modelAuthManualCode.value = '';
+    modelAuthLoginCancel.classList.remove('hidden');
+  }
+
+  function updateLoginModal(task) {
+    activeLogin = task;
+    var labels = {
+      pending: '等待用户完成授权…',
+      completed: '登录成功。',
+      error: '登录失败。',
+      cancelled: '登录已取消。'
+    };
+    modelAuthLoginStatus.textContent = labels[task.status] || task.status;
+    if (task.manualCodeRequired && task.status === 'pending') {
+      modelAuthLoginStatus.textContent = '本机回调端口不可用，请使用手工回调 code 或设备码登录。';
+    }
+    if (task.authUrl) {
+      modelAuthLoginUrl.href = task.authUrl;
+      modelAuthLoginUrlRow.classList.remove('hidden');
+    } else {
+      modelAuthLoginUrlRow.classList.add('hidden');
+    }
+    if (task.deviceCode) {
+      modelAuthDeviceCode.textContent = task.deviceCode;
+      modelAuthDeviceCodeRow.classList.remove('hidden');
+    } else {
+      modelAuthDeviceCode.textContent = '';
+      modelAuthDeviceCodeRow.classList.add('hidden');
+    }
+    modelAuthManualRow.classList.toggle('hidden', task.method !== 'browser' || task.status !== 'pending');
+    var remaining = Math.max(0, Math.ceil(Number(task.expiresAt || 0) - Date.now() / 1000));
+    modelAuthCountdown.textContent = task.status === 'pending' && task.expiresAt
+      ? '剩余约 ' + remaining + ' 秒' : '';
+    if (task.error) {
+      modelAuthLoginError.textContent = task.error;
+      modelAuthLoginError.classList.remove('hidden');
+    } else {
+      modelAuthLoginError.classList.add('hidden');
+    }
+    modelAuthLoginCancel.classList.toggle('hidden', task.status !== 'pending');
+  }
+
+  function scheduleLoginPoll() {
+    if (loginPollTimer) window.clearTimeout(loginPollTimer);
+    loginPollTimer = window.setTimeout(pollSubscriptionLogin, 1000);
+  }
+
+  async function pollSubscriptionLogin() {
+    if (!activeLogin) return;
+    try {
+      var task = await window.api.getModelLogin(activeLogin.loginId);
+      updateLoginModal(task);
+      if (task.status === 'pending') {
+        scheduleLoginPoll();
+      } else if (task.status === 'completed') {
+        await refreshModelAuthStatuses();
+        render();
+        await discoverAndApplySubscription(task.provider, false);
+      }
+    } catch (error) {
+      modelAuthLoginError.textContent = error.message;
+      modelAuthLoginError.classList.remove('hidden');
+    }
+  }
+
+  async function startSubscriptionLogin(provider, method) {
+    if (!provider) return;
+    accountEpoch[provider] = (accountEpoch[provider] || 0) + 1;
+    resetLoginModal();
+    modelAuthLoginStatus.textContent = '正在启动登录…';
+    modelAuthModal.classList.remove('hidden');
+    try {
+      var task = await window.api.startModelLogin(provider, method);
+      updateLoginModal(task);
+      if (task.method === 'browser' && task.authUrl) {
+        window.open(task.authUrl, '_blank', 'noopener');
+      }
+      scheduleLoginPoll();
+    } catch (error) {
+      activeLogin = null;
+      modelAuthLoginStatus.textContent = '登录启动失败。';
+      modelAuthLoginError.textContent = error.message;
+      modelAuthLoginError.classList.remove('hidden');
+    }
+  }
+
+  async function submitManualLoginCode() {
+    if (!activeLogin || !modelAuthManualCode.value.trim()) return;
+    modelAuthManualSubmit.disabled = true;
+    try {
+      updateLoginModal(await window.api.submitModelLoginCode(activeLogin.loginId, modelAuthManualCode.value.trim()));
+      modelAuthManualCode.value = '';
+    } catch (error) {
+      modelAuthLoginError.textContent = error.message;
+      modelAuthLoginError.classList.remove('hidden');
+    } finally {
+      modelAuthManualSubmit.disabled = false;
+    }
+  }
+
+  async function cancelSubscriptionLogin() {
+    if (!activeLogin) return;
+    try {
+      updateLoginModal(await window.api.cancelModelLogin(activeLogin.loginId));
+    } catch (error) {
+      modelAuthLoginError.textContent = error.message;
+      modelAuthLoginError.classList.remove('hidden');
+    }
+  }
+
+  function closeLoginModal() {
+    if (loginPollTimer) window.clearTimeout(loginPollTimer);
+    loginPollTimer = null;
+    activeLogin = null;
+    modelAuthModal.classList.add('hidden');
+  }
+
+  async function logoutSubscription(provider) {
+    if (!window.confirm('退出 ' + provider + ' 订阅登录？')) return;
+    accountEpoch[provider] = (accountEpoch[provider] || 0) + 1;
+    try {
+      await window.api.logoutModelAuth(provider);
+      await refreshModelAuthStatuses();
+      render();
+    } catch (error) {
+      showError(error.message);
+    }
+  }
+
   /* ---------- 渲染 ---------- */
 
   function render() {
+    renderSubscriptionAccounts();
     renderTabs();
     renderForm();
   }
@@ -168,32 +555,56 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
 
     formEl.appendChild(makeField('baseUrl', makeTextInput(provider.baseUrl || '', function (v) { provider.baseUrl = v; })));
 
-    // api：只读 openai-completions（契约 §2.4 唯一允许值）
-    var apiInput = makeTextInput('openai-completions', function () {});
-    apiInput.readOnly = true;
-    apiInput.style.background = 'var(--gray-block)';
-    formEl.appendChild(makeField('api', apiInput));
+    var apiPairs = [
+      ['openai-completions', 'OpenAI Chat Completions'],
+      ['openai-responses', 'OpenAI Responses（xAI）'],
+      ['openai-codex-responses', 'ChatGPT Codex Responses']
+    ];
+    if (!provider.api) provider.api = 'openai-completions';
+    formEl.appendChild(makeField('api', makeSelect(apiPairs, provider.api, function (value) {
+      provider.api = value;
+      if (value === 'openai-completions') provider.auth = 'api-key';
+      if (value === 'openai-codex-responses') provider.auth = 'oauth';
+      if (!provider.auth) provider.auth = value === 'openai-responses' ? 'oauth' : 'api-key';
+      renderForm();
+    })));
 
-    // apiKey：password 输入 + 眼睛切换；__KEEP__/$/空串语义不变
-    var apiKeyRow = document.createElement('div');
-    apiKeyRow.className = 'apikey-row';
-    var apiKeyInput = document.createElement('input');
-    apiKeyInput.className = 'form-input';
-    apiKeyInput.type = 'password';
-    apiKeyInput.value = provider.apiKey == null ? '' : provider.apiKey;
-    apiKeyInput.autocomplete = 'off';
-    apiKeyInput.addEventListener('input', function () { provider.apiKey = apiKeyInput.value; markDirty(); });
-    var eyeButton = document.createElement('button');
-    eyeButton.className = 'apikey-eye';
-    eyeButton.type = 'button';
-    eyeButton.textContent = '👁';
-    eyeButton.title = '显示/隐藏 apiKey';
-    eyeButton.addEventListener('click', function () {
-      apiKeyInput.type = apiKeyInput.type === 'password' ? 'text' : 'password';
-    });
-    apiKeyRow.appendChild(apiKeyInput);
-    apiKeyRow.appendChild(eyeButton);
-    formEl.appendChild(makeField('apiKey', apiKeyRow, '__KEEP__ 表示保留原值；留空表示删除该字段；$ 开头视为环境变量引用'));
+    if (!provider.auth) provider.auth = 'api-key';
+    var authPairs = provider.api === 'openai-responses'
+      ? [['api-key', 'API Key'], ['oauth', '订阅 OAuth']]
+      : (provider.api === 'openai-codex-responses' ? [['oauth', '订阅 OAuth']] : [['api-key', 'API Key']]);
+    if (!authPairs.some(function (pair) { return pair[0] === provider.auth; })) {
+      provider.auth = authPairs[0][0];
+    }
+    formEl.appendChild(makeField('auth', makeSelect(authPairs, provider.auth, function (value) {
+      provider.auth = value;
+      renderForm();
+    })));
+
+    if (provider.auth === 'api-key') {
+      // apiKey：password 输入 + 眼睛切换；__KEEP__/$/空串语义不变
+      var apiKeyRow = document.createElement('div');
+      apiKeyRow.className = 'apikey-row';
+      var apiKeyInput = document.createElement('input');
+      apiKeyInput.className = 'form-input';
+      apiKeyInput.type = 'password';
+      apiKeyInput.value = provider.apiKey == null ? '' : provider.apiKey;
+      apiKeyInput.autocomplete = 'off';
+      apiKeyInput.addEventListener('input', function () { provider.apiKey = apiKeyInput.value; markDirty(); });
+      var eyeButton = document.createElement('button');
+      eyeButton.className = 'apikey-eye';
+      eyeButton.type = 'button';
+      eyeButton.textContent = '👁';
+      eyeButton.title = '显示/隐藏 apiKey';
+      eyeButton.addEventListener('click', function () {
+        apiKeyInput.type = apiKeyInput.type === 'password' ? 'text' : 'password';
+      });
+      apiKeyRow.appendChild(apiKeyInput);
+      apiKeyRow.appendChild(eyeButton);
+      formEl.appendChild(makeField('apiKey', apiKeyRow, '__KEEP__ 表示保留原值；留空表示删除该字段；xAI 可回退服务端 XAI_API_KEY'));
+    } else {
+      formEl.appendChild(makeField('订阅认证', buildProviderOauthStatus(provider)));
+    }
 
     // headers：自定义请求头（可选），随每次模型请求发送；Authorization/Content-Type 由系统设置不可覆盖
     var headersInput = document.createElement('textarea');
@@ -388,7 +799,24 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
       if (!provider.baseUrl || typeof provider.baseUrl !== 'string') {
         return 'provider「' + providerId + '」的 baseUrl 不能为空。';
       }
-      provider.api = 'openai-completions';
+      var allowedApis = ['openai-completions', 'openai-responses', 'openai-codex-responses'];
+      if (allowedApis.indexOf(provider.api) === -1) {
+        return 'provider「' + providerId + '」的 api 不受支持。';
+      }
+      provider.auth = provider.auth || 'api-key';
+      if (['api-key', 'oauth'].indexOf(provider.auth) === -1) {
+        return 'provider「' + providerId + '」的 auth 仅允许 api-key/oauth。';
+      }
+      if (provider.api === 'openai-completions' && provider.auth !== 'api-key') {
+        return 'provider「' + providerId + '」的 Chat Completions 仅支持 API Key。';
+      }
+      if (provider.api === 'openai-codex-responses' && provider.auth !== 'oauth') {
+        return 'provider「' + providerId + '」的 Codex Responses 仅支持订阅 OAuth。';
+      }
+      if (provider.auth === 'api-key' && provider.api !== 'openai-responses' &&
+          (!provider.apiKey || typeof provider.apiKey !== 'string')) {
+        return 'provider「' + providerId + '」的 apiKey 不能为空。';
+      }
       if (!Array.isArray(provider.models) || provider.models.length === 0) {
         return 'provider「' + providerId + '」的 models 不能为空数组。';
       }
@@ -430,6 +858,7 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
     var providers = config.providers || {};
     var ids = Object.keys(providers);
     for (var i = 0; i < ids.length; i++) {
+      if ((providers[ids[i]].auth || 'api-key') !== 'api-key') continue;
       var apiKey = providers[ids[i]].apiKey;
       if (typeof apiKey !== 'string' || apiKey.charAt(0) !== '$') continue;
       var isNewInput = fetchedApiKeys[ids[i]] !== apiKey; // GET 原样返回的引用不算新输入
@@ -480,6 +909,7 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
     modelConfig.providers[providerId] = {
       baseUrl: '',
       api: 'openai-completions',
+      auth: 'api-key',
       apiKey: '',
       models: [model]
     };
@@ -547,6 +977,7 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
           }
         }
         existing.api = 'openai-completions';
+        existing.auth = 'api-key';
         if (!Array.isArray(existing.models)) existing.models = [];
       } else if (policy.overwriteApiKey) {
         if (!(typeof importedProvider.apiKey === 'string' && importedProvider.apiKey)) {
@@ -769,7 +1200,10 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
   window.settingsView = {
     // open 时 GET 一次存工作副本；之后 tab 切换不重拉
     open: async function () {
+      workingRevision += 1;
+      var openRevision = workingRevision;
       errorEl.classList.add('hidden');
+      showDiscoveryNotice('');
       tabsEl.innerHTML = '';
       formEl.innerHTML = '';
       dirty = false;
@@ -778,10 +1212,14 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
       expandedModels = [];
       closeImportPanel();
       try {
-        modelConfig = await window.api.getModels();
+        var responses = await Promise.all([window.api.getModels(), window.api.getModelAuth()]);
+        if (!window.subscriptionModels.canCommitOpen(openRevision, workingRevision)) return;
+        modelConfig = responses[0];
+        modelAuthStatuses = (responses[1] && responses[1].providers) || {};
         fetchedApiKeys = {};
         Object.keys(modelConfig.providers || {}).forEach(function (providerId) {
           var provider = modelConfig.providers[providerId];
+          if (!provider.auth) provider.auth = 'api-key';
           var apiKey = provider.apiKey;
           fetchedApiKeys[providerId] = apiKey == null ? '' : apiKey;
           // 工作副本规范化，避免 PUT 回传 null
@@ -794,7 +1232,10 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
         var ids = Object.keys(modelConfig.providers || {});
         currentProviderId = ids[0] || null;
         render();
+        if (!window.subscriptionModels.canCommitOpen(openRevision, workingRevision)) return;
+        await autoDiscoverMissingXaiProvider();
       } catch (error) {
+        if (!window.subscriptionModels.canCommitOpen(openRevision, workingRevision)) return;
         modelConfig = null;
         showError(error.message);
       }
@@ -820,4 +1261,10 @@ Description: 模型配置编辑页：整页表单化（§11.3）——顶部 pro
   piOverwriteApiKey.addEventListener('change', refreshDryRunIfPreviewed);
   piImportPreviewButton.addEventListener('click', previewPiImport);
   piImportApplyButton.addEventListener('click', applyPiImport);
+  modelAuthManualSubmit.addEventListener('click', submitManualLoginCode);
+  modelAuthManualCode.addEventListener('keydown', function (event) {
+    if (event.key === 'Enter') submitManualLoginCode();
+  });
+  modelAuthLoginCancel.addEventListener('click', cancelSubscriptionLogin);
+  modelAuthLoginClose.addEventListener('click', closeLoginModal);
 })();

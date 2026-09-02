@@ -1,14 +1,8 @@
 /*
 Author: wilbur
-Version: 1.6
-Date: 2026-08-17
-Description: fetch 封装：自动带 Bearer token；任意请求 401 → 清 token → 登录门（契约 §1.1/§3.1/§5）。
-             v1.1 迭代一：新增 probeWorkDir（§3.4）与 getUsageSeries（§3.10）。
-             v1.2 迭代二（方案 §4.9）：新增 getSessionStatus / updateSessionModel / listFiles / getFileContent。
-             v1.3 上传 models.json 导入：新增 importPiModels → POST /api/models/importPi { rawText }。
-             v1.4 新增 getSkills / getSkillBody（§3.19/§3.20，技能只读列表/正文，技能页与 /skill: 共用）。
-             v1.5 新增 saveSkill → PUT /api/skills/{name}（技能页结构化编辑保存）。
-             v1.6（workDirPickerPlan §2.1）：新增 listFsDir -> POST /api/fs/listDir（新建会话 workDir 补全，服务器绝对路径列目录）。
+Version: 1.8
+Date: 2026-09-01
+Description: Authenticated fetch wrapper for Web APIs. v1.8 adds POST subscription model-candidate discovery while preserving credential-secret-free login/status/task calls.
 */
 (function () {
   'use strict';
@@ -104,6 +98,29 @@ Description: fetch 封装：自动带 Bearer token；任意请求 401 → 清 to
     putModels: function (config) { return request('/api/models', { method: 'PUT', body: config }); },
     importPiModels: function (rawText) {
       return request('/api/models/importPi', { method: 'POST', body: { rawText: rawText } });
+    },
+    getModelAuth: function () { return request('/api/modelAuth'); },
+    startModelLogin: function (provider, method) {
+      return request('/api/modelAuth/' + encodeURIComponent(provider) + '/login', {
+        method: 'POST', body: method ? { method: method } : {}
+      });
+    },
+    getModelLogin: function (loginId) {
+      return request('/api/modelAuth/logins/' + encodeURIComponent(loginId));
+    },
+    submitModelLoginCode: function (loginId, code) {
+      return request('/api/modelAuth/logins/' + encodeURIComponent(loginId) + '/manualCode', {
+        method: 'POST', body: { code: code }
+      });
+    },
+    cancelModelLogin: function (loginId) {
+      return request('/api/modelAuth/logins/' + encodeURIComponent(loginId), { method: 'DELETE' });
+    },
+    discoverSubscriptionModels: function (provider) {
+      return request('/api/modelAuth/' + encodeURIComponent(provider) + '/discover', { method: 'POST', body: {} });
+    },
+    logoutModelAuth: function (provider) {
+      return request('/api/modelAuth/' + encodeURIComponent(provider), { method: 'DELETE' });
     },
 
     // 迭代二：状态栏 / /model 指令 / 文件浏览器与@附件

@@ -67,6 +67,31 @@ FLAMINGO_WEB_TOKEN=你的token uv run python -m webApp
 # 浏览器打开 http://<本机IP>:8787，输入 token 登录
 ```
 
+## ChatGPT / xAI 订阅登录
+
+FlamingoAgents 原生支持 ChatGPT Plus/Pro 的 Codex Responses 与 SuperGrok/X Premium 的 xAI Responses，不依赖 pi/Node 运行时。CLI 登录与模型配置相互独立；可登录后复制 `config/models.example.yaml` 的订阅 Provider。Web 用户无需预先创建 Provider，可直接在模型设置页顶部登录并生成模型配置候选：
+
+```bash
+# ChatGPT：本机浏览器 PKCE（远程环境可粘贴回调 URL/code）
+uv run python modelLogin.py login openai-codex --method browser
+
+# ChatGPT：无浏览器/远程环境设备码
+uv run python modelLogin.py login openai-codex --method device-code
+
+# xAI：SuperGrok / X Premium 设备码
+uv run python modelLogin.py login xai
+
+# 脱敏状态与退出
+uv run python modelLogin.py status
+uv run python modelLogin.py logout xai
+```
+
+Web 模型设置页顶部始终显示独立的“订阅账户”：xAI 登录完成后只读请求固定的 `https://api.x.ai/v1/models`，并把实时 ID 与内置 Responses 元数据取交集；结果只加入浏览器编辑区，用户点击“保存”后才写 `models.yaml`。图像/视频、Completions-only 和元数据未知模型会带原因跳过。ChatGPT 没有可靠的账户枚举端点，只提供需显式确认的内置 Codex 候选。所有目录候选均不代表最终账户权益或调用必然成功。
+
+OAuth 凭据仅写入 `~/.flamingo/auth.json`（目录 0700、文件 0600），不会进入 `models.yaml`、浏览器响应或会话 JSONL；Access Token 到期前自动刷新。xAI 模型发现遵循标准 `HTTPS_PROXY/NO_PROXY`，但禁止全部 HTTP 重定向；401 只进行一次带 stale-token 并发保护的刷新重试。
+
+Responses 会把多轮继续所需的加密 reasoning/item ID 以白名单字段写入会话 JSONL；它们不是 Access/Refresh Token，但会话日志仍应按敏感数据保护。
+
 ## 目录结构
 
 ```

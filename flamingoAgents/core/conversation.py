@@ -1,12 +1,13 @@
 '''
 Author: wilbur
-Version: 1.11
-Date: 2026-08-17
-Description: Maintains per-session conversation state (messages, session lock, pending confirmation). Messages are appended as atomic log events (systemMessage/userMessage/assistantMessage/toolResult); in-memory list is kept for the next model request. v1.6 adds session resume: replay the JSONL log into messages, track dangling/queued tool-call state, and accumulate a session usage total. v1.7 accumulates live-turn usage in appendAssistantMessage so usageTotal covers post-resume turns too. v1.8 restores the logged systemMessage on resume (instead of re-injecting the current one) so the resumed prefix matches the original and provider prompt cache stays hit. v1.9 tracks lastTurnTokens (last call's prompt+completion tokens, rebuilt on resume) for the web status bar's context-window estimate (docs/webAppIteration2Plan.md §3.6). v1.10（fixPlan Phase2）：appendAssistantMessage 从 responsePayload 顶层读取 reasoning（非空才写 event['reasoning']）；_resumeFromLog 不把 reasoning 注入 chatMessage.content（D2 红线：reasoning 不得进入发往模型的 messages）。v1.11（toolCallTranscriptClosureFixPlan）：resume 识别 stopRequested 事件；日志尾部 dangling 不再待重跑，统一持久化 cancellation toolResult（userStopped/crashRecovered）；删除 dangling/queuedUserMessage 死代码。
+Version: 1.12
+Date: 2026-09-01
+Description: Maintains and resumes per-session JSONL conversations. v1.12 persists JSON-safe assistant/toolCall providerData for Responses opaque replay, restores malformed/legacy values as empty objects, and keeps reasoning display text separate from model content.
 '''
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from threading import RLock
 
@@ -63,10 +64,21 @@ class conversation:
             elif eventType == 'assistantMessage':
                 self._closeOrphanToolCalls(openCallIds)
                 toolCalls = [
-                    toolCall(id=tc.get('id', ''), toolName=tc.get('toolName', ''), arguments=tc.get('arguments', {}))
+                    toolCall(
+                        id=tc.get('id', ''),
+                        toolName=tc.get('toolName', ''),
+                        arguments=tc.get('arguments', {}) if isinstance(tc.get('arguments'), dict) else {},
+                        providerData=normalizeProviderData(tc.get('providerData')),
+                    )
                     for tc in (event.get('toolCalls') or [])
+                    if isinstance(tc, dict)
                 ]
-                self.messages.append(chatMessage(role='assistant', content=event.get('content', ''), toolCalls=toolCalls))
+                self.messages.append(chatMessage(
+                    role='assistant',
+                    content=event.get('content', ''),
+                    toolCalls=toolCalls,
+                    providerData=normalizeProviderData(event.get('providerData')),
+                ))
                 openCallIds.extend(tc.id for tc in toolCalls)
                 self._accumulateUsage(event.get('usage'))
             elif eventType == 'toolResult':
@@ -141,6 +153,9 @@ class conversation:
         self.messages.append(chatMessage(role='user', content=content))
 
     def appendAssistantMessage(self, message: chatMessage, responsePayload: dict) -> None:
+        message.providerData = normalizeProviderData(message.providerData)
+        for call in message.toolCalls:
+            call.providerData = normalizeProviderData(call.providerData)
         toolCallCount = len(message.toolCalls)
         reasoning = responsePayload.get('reasoning')
         if self.debugConsole:
@@ -153,6 +168,7 @@ class conversation:
             'model': responsePayload.get('model'),
             'content': message.content,
             'toolCalls': message.toolCalls,
+            'providerData': message.providerData,
             'usage': responsePayload.get('usage'),
             'timings': responsePayload.get('timings'),
         }
@@ -177,3 +193,14 @@ class conversation:
             toolCallId=result.toolCallId,
             name=result.toolName,
         ))
+
+
+def normalizeProviderData(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        normalized = json.loads(serialized)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return normalized if isinstance(normalized, dict) else {}

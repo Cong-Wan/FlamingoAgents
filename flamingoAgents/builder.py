@@ -1,10 +1,8 @@
 '''
 Author: wilbur
-Version: 1.6
-Date: 2026-08-19
-Description: Pure-library assembly factory: resolves paths, loads model config/auth, system prompt, and schema-driven tools, then returns a ready-to-use agent. v1.4 lets callers inject the system prompt as a string (systemPrompt), control the current-time suffix (appendCurrentTime), and whitelist built-in tools by name (toolNames) per docs/initAgentCustomizationPlan.md.
-            v1.5 新建 agent 时在「当前时间」之前注入 config/skills 的 <available_skills> 块；skillsDir='' 禁用 / None 用默认目录 / 路径覆盖。
-            v1.6 默认 logDir 从 workDir/.agentLogs 改为 ~/.flamingo/logs/cliData/<workDir路径>/（logPathMigrationPlan / logPathLayoutFixPlan）。
+Version: 1.7
+Date: 2026-09-01
+Description: Pure-library Agent assembly factory. v1.7 dispatches openai-completions to the unchanged static-key adapter and ChatGPT/xAI Responses APIs to the dynamic auth Responses adapter.
 '''
 
 from __future__ import annotations
@@ -14,8 +12,9 @@ from pathlib import Path
 
 from flamingoAgents.core.agent import agent
 from flamingoAgents.models.chatCompletions import chatCompletionsAdapter
-from flamingoAgents.models.modelAuth import createModelAuth
+from flamingoAgents.models.modelAuth import createModelAuth, modelAuthResolver
 from flamingoAgents.models.modelConfig import loadModelConfig
+from flamingoAgents.models.responsesAdapter import responsesAdapter
 from flamingoAgents.skills import defaultSkillsDir, formatSkillsXml, loadSkills
 from flamingoAgents.tools.builtinTools import createBuiltinTools
 from flamingoAgents.tools.toolConfig import loadToolSettings
@@ -52,8 +51,15 @@ def createAgent(
         configPath=modelConfigPath,
         debugConsole=printer,
     )
-    auth = createModelAuth(resolved.apiKey)
-    adapter = chatCompletionsAdapter(resolved.config, auth, debugConsole=printer)
+    if resolved.config.apiType == 'openai-completions':
+        auth = createModelAuth(resolved.apiKey or '')
+        adapter = chatCompletionsAdapter(resolved.config, auth, debugConsole=printer)
+    else:
+        adapter = responsesAdapter(
+            resolved.config,
+            modelAuthResolver(resolved),
+            debugConsole=printer,
+        )
     settings = loadToolSettings(configPath=toolsConfigPath, debugConsole=printer)
     definitions = createBuiltinTools(settings.toolSchemas, debugConsole=printer)
     if toolNames is not None:

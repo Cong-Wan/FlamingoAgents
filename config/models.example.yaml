@@ -1,3 +1,8 @@
+# Author: wilbur
+# Version: 1.1
+# Date: 2026-09-01
+# Description: FlamingoAgents model examples; subscription Providers can now be generated as unsaved Web candidates after login, while these blocks remain useful for CLI/manual setup.
+
 providers: # 模型提供商列表
   "glm": # 智谱 GLM Coding Plan（OpenAI 协议端点，到 /v4 为止，代码会自动拼 /chat/completions）
     baseUrl: https://open.bigmodel.cn/api/coding/paas/v4
@@ -37,3 +42,41 @@ providers: # 模型提供商列表
           output: 0 # 输出 token 成本
           cacheRead: 0 # 缓存读取成本
           cacheWrite: 0 # 缓存写入成本
+  "openaiCodex": # ChatGPT Plus/Pro；CLI 可手工复制，Web 可登录后应用内置候选
+    baseUrl: https://chatgpt.com/backend-api
+    api: openai-codex-responses
+    auth: oauth # OAuth 凭据独立保存在 ~/.flamingo/auth.json，不写 apiKey
+    models:
+      - id: gpt-5.4
+        name: GPT-5.4 Codex Subscription
+        input:
+          - text
+          - image
+        contextWindow: 272000
+        maxTokens: 128000
+        reasoning: true
+        reasoningEffort: high
+        cost: # 订阅额度不按 API token 单价估算
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+  "xaiSubscription": # SuperGrok/X Premium；Web 可登录后从实时目录生成配置候选
+    baseUrl: https://api.x.ai/v1
+    api: openai-responses
+    auth: oauth
+    models:
+      - id: grok-4.6
+        name: Grok 4.6 Subscription
+        input:
+          - text
+          - image
+        contextWindow: 500000
+        maxTokens: 500000
+        reasoning: true
+        reasoningEffort: high
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0

@@ -1,26 +1,8 @@
 '''
 Author: wilbur
-Version: 1.12
-Date: 2026-08-19
-Description: FastAPI 应用与全部路由：认证依赖、统一异常映射（库 RuntimeError → 400 透传中文消息）、sessionId 入口校验、SSE 对话流、静态文件容忍空目录挂载。
-            v1.1 随包改名调整 import（webApp.backend.*）；静态目录由 static/ 改为 webApp/frontend/，projectRoot 随目录加深改为 parents[2]。
-            v1.2 迭代一（契约 v1.2 §3.3/§3.4/§3.10）：新增 probeWorkDir 与 usage/series 端点；create 会话 workDir 改必填 + allowCreate，
-            校验顺序调整为先 providerId/modelId 预检再处理目录，已存在目录增加 R_OK|W_OK|X_OK 校验，mkdir TOCTOU 兜底。
-            v1.3 迭代二（方案 webAppIteration2Plan §3）：新增 status（状态栏聚合）、PATCH model（/model）、files/fileContent（文件浏览器与@附件）端点；
-            chat/stream 支持 attachments（后端拼接附件块）且 message 校验放宽为「与 attachments 不同时为空」。
-            v1.4 状态栏口径：status 返回 lastUsage（最近一轮增量）与 contextUsedPercent（使用率，替代剩余率展示语义）。
-            v1.5 lastUsage 优先 sessions 索引，缺省回退 usageTurns 最近一条（重启/升级前会话不丢增量）。
-            v1.6 多窗口并行（multiWindowStreamingPlan §4.3）：chatStream/chatConfirm 启动泵前采样 baseCount 并传 meta；
-            新增 POST /api/chat/attach（404=无活跃流；SSE 首帧 streamResume + 回放 + 实时）；sseResponse 走订阅队列。
-            v1.7 上传 models.json 导入：新增 POST /api/models/importPi（只收 rawText，纯转换不读盘不写盘）。
-            v1.8（stopResponsivenessPlan §4.1.A）：chatStream 宽容闸——旧泵已 stopping 且会话锁空闲时 wait(2) 后重试 startStream，超时/锁占用仍 409。
-            v1.9 新增 GET /api/skills 与 GET /api/skills/{name}（只读，鉴权，name 白名单 400 / 未知 404 / 越界 400）。
-            v1.10 GET /api/skills/{name} 改调 getSkillForEdit（响应扩 description/disabled）；新增 PUT /api/skills/{name} 编辑保存。
-            v1.11（workDirPickerPlan §2.1/§2.3）：新增 POST /api/fs/listDir（workDir 补全，调 fileBrowser.listAbsDirs）；
-            probeWorkDir/createSession 放开多级目录创建--新增 nearestWritableAncestor（遇最近存在节点是文件/不可写目录返 None，禁止跨过），
-            mkdir(parents=True, exist_ok=True) + FileNotFoundError/PermissionError/泛化 OSError 兜底 + mkdir 后 is_dir/可读写双保险
-            （parents 后 FileExistsError 可能是中间级被文件占，不再一律视为成功）。
-            v1.12 删除会话改按 workDir 定位 ~/.flamingo/logs/webData/<folder>/{sessionId}.jsonl；unlink OSError 只 warning 不 500。
+Version: 1.14
+Date: 2026-09-01
+Description: FastAPI application and authenticated REST/SSE routes. v1.14 adds no-store subscription model-candidate discovery with credential-generation race rejection and structured secret-free errors.
 '''
 
 from __future__ import annotations
@@ -38,9 +20,10 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from flamingoAgents.models.modelConfig import loadModelConfigFromYaml
+from flamingoAgents.models.subscriptionModels import discoverSubscriptionModels, modelDiscoveryError
 from flamingoAgents.utils.logPaths import resolveSessionLogDir
 
-from webApp.backend import agentManager, fileBrowser, historyView, modelConfigStore, sessionStore, skillStore, usageStore
+from webApp.backend import agentManager, fileBrowser, historyView, modelAuthManager, modelConfigStore, sessionStore, skillStore, usageStore
 from webApp.backend.piModelsImport import convertPiDocument
 from webApp.backend.auth import authDependency, checkToken
 from webApp.backend.sseCodec import sseGen
@@ -447,6 +430,85 @@ def getModels():
 def putModels(body: dict = Body(...)):
     modelConfigStore.writeModelsConfig(body)
     agentManager.invalidateAllAgents()
+    return {'ok': True}
+
+
+@authedApi.get('/modelAuth')
+def getModelAuth():
+    return modelAuthManager.defaultModelAuthManager.getAuthStatus()
+
+
+@authedApi.post('/modelAuth/{provider}/login')
+def startModelLogin(provider: str, body: dict | None = Body(default=None)):
+    method = body.get('method') if isinstance(body, dict) else None
+    if method is not None and not isinstance(method, str):
+        raise HTTPException(status_code=400, detail='method 必须是字符串。')
+    try:
+        return modelAuthManager.defaultModelAuthManager.startLogin(provider, method)
+    except modelAuthManager.loginConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+
+@authedApi.get('/modelAuth/logins/{loginId}')
+def getModelLogin(loginId: str):
+    try:
+        return modelAuthManager.defaultModelAuthManager.getLogin(loginId)
+    except modelAuthManager.loginNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+
+
+@authedApi.post('/modelAuth/logins/{loginId}/manualCode')
+def submitModelLoginCode(loginId: str, body: dict = Body(...)):
+    code = body.get('code') if isinstance(body, dict) else None
+    if not isinstance(code, str) or not code.strip():
+        raise HTTPException(status_code=400, detail='code 必须是非空字符串。')
+    try:
+        return modelAuthManager.defaultModelAuthManager.submitManualCode(loginId, code)
+    except modelAuthManager.loginNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+
+
+@authedApi.delete('/modelAuth/logins/{loginId}')
+def cancelModelLogin(loginId: str):
+    try:
+        return modelAuthManager.defaultModelAuthManager.cancelLogin(loginId)
+    except modelAuthManager.loginNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+
+
+@authedApi.post('/modelAuth/{provider}/discover')
+def discoverModelCandidates(provider: str):
+    manager = modelAuthManager.defaultModelAuthManager
+    if provider not in ('openai-codex', 'xai'):
+        error = modelDiscoveryError(provider, 'unsupported_provider')
+        return JSONResponse(status_code=400, content=error.toPublic(), headers={'Cache-Control': 'no-store'})
+    try:
+        generationBefore = manager.getCredentialGeneration(provider)
+        result = discoverSubscriptionModels(provider, store=manager.store)
+        generationAfter = manager.getCredentialGeneration(provider)
+        if generationAfter != generationBefore:
+            raise modelDiscoveryError(provider, 'account_changed')
+        result['credentialGeneration'] = generationAfter
+        return JSONResponse(content=result, headers={'Cache-Control': 'no-store'})
+    except modelDiscoveryError as error:
+        statusCodes = {
+            'unsupported_provider': 400,
+            'not_logged_in': 409,
+            'reauth_required': 409,
+            'credential_error': 409,
+            'account_changed': 409,
+            'rate_limited': 429,
+        }
+        return JSONResponse(
+            status_code=statusCodes.get(error.code, 502),
+            content=error.toPublic(),
+            headers={'Cache-Control': 'no-store'},
+        )
+
+
+@authedApi.delete('/modelAuth/{provider}')
+def logoutModelAuth(provider: str):
+    modelAuthManager.defaultModelAuthManager.logout(provider)
     return {'ok': True}
 
 
