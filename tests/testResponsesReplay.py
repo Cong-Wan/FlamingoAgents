@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-09-01
-Description: Verifies Responses item whitelist replay, encrypted reasoning JSONL round-trip, exact canonical matching, cross-model call/output pairing, orphan degradation, and legacy log compatibility.
+Version: 1.1
+Date: 2026-09-02
+Description: Verifies Responses item whitelist replay, encrypted reasoning JSONL round-trip, exact canonical matching, cross-model call/output pairing, orphan degradation, and legacy log compatibility. v1.1 covers reasoning.summary always present on persist/replay even when empty.
 '''
 
 from __future__ import annotations
@@ -81,6 +81,23 @@ def testSerializerDropsResponseOnlyAndUnknownFields() -> None:
     assert serializeResponseItem({
         'type': 'reasoning', 'id': 'rs_empty', 'summary': [], 'encrypted_content': '',
     }, forReplay=True) is None
+
+
+def testReasoningSummaryKeyAlwaysPresentEvenIfEmpty() -> None:
+    persisted = serializeResponseItem({
+        'type': 'reasoning', 'id': 'rs_nosummary', 'encrypted_content': 'cipher',
+    })
+    assert persisted == {
+        'type': 'reasoning',
+        'id': 'rs_nosummary',
+        'summary': [],
+        'encrypted_content': 'cipher',
+    }
+    replayed = serializeResponseItem({
+        'type': 'reasoning', 'id': 'rs_nosummary', 'encrypted_content': 'cipher',
+    }, forReplay=True)
+    assert replayed is not None
+    assert replayed['summary'] == []
 
 
 def testExactReplayUsesCanonicalProviderNotConfigAlias() -> None:
