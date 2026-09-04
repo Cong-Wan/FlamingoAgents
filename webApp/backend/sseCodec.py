@@ -1,17 +1,21 @@
 '''
 Author: wilbur
-Version: 1.2
-Date: 2026-08-12
+Version: 1.4
+Date: 2026-09-02
 Description: 库 7 种事件 dataclass → SSE 文本帧（ensure_ascii=False 单行 JSON），以及只消费订阅队列的 SSE 生成器（15s 空闲发 keep-alive 注释帧）。
             v1.1 多窗口并行（multiWindowStreamingPlan §4.2）：sseGen 签名改 (eventQueue, meta, pump)——attach 订阅首发
             streamResume 帧（baseCount/userMessage）；finally 经 pump.unsubscribe 反注册死订阅。
             v1.2 新增 retryNotice 事件映射（模型调用重试非终态事件）。
+            v1.3 非客户端断开的 sseGen 异常经 pump.logSseGenError 落盘后再 re-raise。
+            v1.4 logSseGenError 失败不得盖掉真正的生成器异常。
 '''
 
 from __future__ import annotations
 
 import json
 import queue
+
+from starlette.requests import ClientDisconnect
 
 from flamingoAgents.core.types import (
     completedEvent,
@@ -87,6 +91,10 @@ def encodeResumeFrame(meta: dict) -> str:
     return f'event: streamResume\ndata: {payload}\n\n'
 
 
+def isClientDisconnect(error) -> bool:
+    return isinstance(error, (ClientDisconnect, BrokenPipeError, ConnectionResetError, ConnectionAbortedError))
+
+
 def sseGen(eventQueue, meta=None, pump=None):
     # SSE 生成器只从订阅队列取（带 timeout 轮询）；泵结束放 None 哨兵后返回关闭连接。
     # meta 非 None（attach 订阅）时先发 streamResume 帧；pump 非 None 时 finally 反注册订阅（客户端断连清理死订阅）。
@@ -102,6 +110,15 @@ def sseGen(eventQueue, meta=None, pump=None):
             if event is None:
                 return
             yield encodeSse(event)
+    except GeneratorExit:
+        raise
+    except Exception as error:
+        if not isClientDisconnect(error) and pump is not None:
+            try:
+                pump.logSseGenError(error)
+            except Exception:
+                pass
+        raise
     finally:
         if pump is not None:
             pump.unsubscribe(eventQueue)

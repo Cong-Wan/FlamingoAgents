@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-09-01
-Description: Adapts Flamingo messages/tools to ChatGPT Codex and xAI Responses SSE, including dynamic auth, safe opaque replay, terminal-authoritative item merging, usage normalization, stop, and one zero-output OAuth 401 refresh retry. v1.1 relaxes the urlopen socket timeout 60s→300s：thinking 模型静默期可达数分钟，60s 会误杀长思考。
+Version: 1.4
+Date: 2026-09-02
+Description: Adapts Flamingo messages/tools to ChatGPT Codex and xAI Responses SSE, including dynamic auth, safe opaque replay, terminal-authoritative item merging, usage normalization, stop, and one zero-output OAuth 401 refresh retry. v1.2 always persists/replays reasoning.summary（empty list if none）so OpenAI Responses does not 400 missing input[n].summary. v1.3 attaches stack-local stream diagnosis on connect/firstByte/streamRead/decode/streamEnd, records authRefresh only on failed 401 refresh, and writes success timings with sawDone. v1.4 connect diag assignment cannot replace the original modelRequestError.
 '''
 
 from __future__ import annotations
@@ -19,7 +19,16 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Iterator
 
 from flamingoAgents.core.types import chatMessage, finalChunk, modelInterruptedError, reasoningChunk, textChunk, toolCall
-from flamingoAgents.models.chatCompletions import modelCompletion, modelRequestError
+from flamingoAgents.models.chatCompletions import (
+    applyHeaderDiag,
+    connectDiagFromError,
+    elapsedMs,
+    mergeErrorDiag,
+    modelCompletion,
+    modelRequestError,
+    newStreamDiag,
+    successTimings,
+)
 from flamingoAgents.models.modelAuth import modelAuth, modelAuthResolver
 from flamingoAgents.models.modelConfig import modelConfig
 
@@ -265,21 +274,31 @@ class responsesAdapter:
         except urllib.error.HTTPError as error:
             errorText = error.read(65536).decode('utf-8', errors='replace')
             safeText = redactSecret(errorText, auth.accessToken)
-            raise modelRequestError(
+            requestError = modelRequestError(
                 message=f'模型请求失败：status={error.code} body={safeText[:1000]}',
                 requestPayload=requestPayload,
                 statusCode=error.code,
                 responseBody=safeText,
                 retryAfterSeconds=parseRetryAfter(error.headers),
-            ) from error
+            )
+            try:
+                requestError.diag = connectDiagFromError(error, config=self.config, requestBytes=requestBytes)
+            except Exception:
+                pass
+            raise requestError from error
         except urllib.error.URLError as error:
             reasonText = redactSecret(str(error.reason), auth.accessToken)
-            raise modelRequestError(
+            requestError = modelRequestError(
                 message=f'模型请求失败：{reasonText}',
                 requestPayload=requestPayload,
                 statusCode=None,
                 responseBody=reasonText,
-            ) from error
+            )
+            try:
+                requestError.diag = connectDiagFromError(error, config=self.config, requestBytes=requestBytes)
+            except Exception:
+                pass
+            raise requestError from error
 
     def complete(
         self,
@@ -311,16 +330,31 @@ class responsesAdapter:
         stopEvent=None,
         sessionId: str | None = None,
     ) -> Iterator:
+        diag = newStreamDiag(self.config, requestPayload)
         auth = self.authResolver.resolve()
+        authRefresh = False
         try:
             response = self.openRequest(requestPayload, auth, sessionId=sessionId)
         except modelRequestError as error:
             if error.statusCode != 401 or self.config.authType != 'oauth':
+                mergeErrorDiag(error, diag, stage='connect', underlying=error.__cause__)
                 raise
+            authRefresh = True
             auth = self.authResolver.resolve(forceRefresh=True, staleAccess=auth.accessToken)
-            response = self.openRequest(requestPayload, auth, sessionId=sessionId)
+            try:
+                response = self.openRequest(requestPayload, auth, sessionId=sessionId)
+            except modelRequestError as refreshError:
+                mergeErrorDiag(refreshError, diag, stage='connect', underlying=refreshError.__cause__)
+                diag['authRefresh'] = True
+                refreshError.diag = diag
+                raise
+
+        for key in ('stage', 'exceptionName', 'errno'):
+            diag.pop(key, None)
+        applyHeaderDiag(diag, getattr(response, 'headers', None))
 
         state = responseState(self.config, requestPayload)
+        ssePayloadSeen = False
         try:
             with response:
                 if stopEvent is not None and stopEvent.is_set():
@@ -331,9 +365,20 @@ class responsesAdapter:
                     for dataPayload in self.iterSseData(response, stopEvent=stopEvent):
                         if dataPayload == '[DONE]':
                             continue
-                        event = self.parseEvent(dataPayload, requestPayload)
-                        for outputChunk in state.processEvent(event):
-                            yield outputChunk
+                        ssePayloadSeen = True
+                        diag['chunks'] = int(diag.get('chunks') or 0) + 1
+                        try:
+                            event = self.parseEvent(dataPayload, requestPayload)
+                        except modelRequestError as error:
+                            mergeErrorDiag(error, diag, stage='decode', underlying=error.__cause__)
+                            raise
+                        try:
+                            for outputChunk in state.processEvent(event):
+                                self._noteStreamYield(diag, outputChunk)
+                                yield outputChunk
+                        except modelRequestError as error:
+                            mergeErrorDiag(error, diag, stage='decode', underlying=error.__cause__)
+                            raise
                     if self._isStreamInterrupted(response, stopEvent):
                         raise modelInterruptedError('用户已停止')
                 finally:
@@ -341,22 +386,67 @@ class responsesAdapter:
                         self.activeResponses.discard(response)
         except modelInterruptedError:
             raise
-        except modelRequestError:
+        except modelRequestError as error:
+            if authRefresh:
+                diag['authRefresh'] = True
+            if getattr(error, 'diag', None) is not diag:
+                mergeErrorDiag(error, diag, underlying=error.__cause__)
+            else:
+                t0 = diag.get('t0')
+                if isinstance(t0, (int, float)):
+                    diag['durationMs'] = elapsedMs(t0)
+                error.diag = diag
             raise
         except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
             if self._isStreamInterrupted(response, stopEvent):
                 raise modelInterruptedError('用户已停止') from error
-            raise modelRequestError(
+            requestError = modelRequestError(
                 message=f'模型流式响应中断：{error}',
                 requestPayload=requestPayload,
                 statusCode=None,
                 responseBody=str(error),
-            ) from error
+            )
+            mergeErrorDiag(
+                requestError,
+                diag,
+                stage='streamRead' if ssePayloadSeen else 'firstByte',
+                underlying=error,
+            )
+            if authRefresh:
+                diag['authRefresh'] = True
+                requestError.diag = diag
+            raise requestError from error
 
-        completion = state.buildCompletion()
+        try:
+            completion = state.buildCompletion()
+        except modelRequestError as error:
+            stage = 'streamEnd' if not state.terminalSeen else 'decode'
+            mergeErrorDiag(error, diag, stage=stage, underlying=error.__cause__)
+            if authRefresh:
+                diag['authRefresh'] = True
+                error.diag = diag
+            raise
+        completion.responsePayload['timings'] = successTimings(
+            diag,
+            textChars=len(completion.message.content or ''),
+            reasoningChars=len(completion.responsePayload.get('reasoning') or ''),
+            sawDone=bool(state.terminalSeen),
+        )
         if self.debugConsole:
             self.debugConsole.debug(f'\nSource Responses response:\n{completion.responsePayload}')
         yield finalChunk(completion=completion)
+
+    def _noteStreamYield(self, diag: dict[str, Any], event) -> None:
+        if isinstance(event, textChunk):
+            diag['textChars'] = int(diag.get('textChars') or 0) + len(event.text or '')
+        elif isinstance(event, reasoningChunk):
+            diag['reasoningChars'] = int(diag.get('reasoningChars') or 0) + len(event.text or '')
+        else:
+            return
+        if 'ttfbMs' not in diag:
+            t0 = diag.get('t0')
+            if isinstance(t0, (int, float)):
+                diag['ttfbMs'] = elapsedMs(t0)
 
     def _isStreamInterrupted(self, response, stopEvent) -> bool:
         if stopEvent is not None and stopEvent.is_set():
@@ -762,10 +852,12 @@ def serializeResponseItem(rawItem: Any, forReplay: bool = False) -> dict[str, An
         encryptedContent = rawItem.get('encrypted_content')
         if forReplay and (not isinstance(encryptedContent, str) or not encryptedContent):
             return None
-        result: dict[str, Any] = {'type': 'reasoning', 'id': itemId}
-        summary = sanitizeTextParts(rawItem.get('summary'), {'summary_text', 'text'})
-        if summary:
-            result['summary'] = summary
+        result: dict[str, Any] = {
+            'type': 'reasoning',
+            'id': itemId,
+            # OpenAI Responses 回放必填 summary；空摘要也要带键，不能省略。
+            'summary': sanitizeTextParts(rawItem.get('summary'), {'summary_text', 'text'}),
+        }
         if isinstance(encryptedContent, str) and encryptedContent:
             result['encrypted_content'] = encryptedContent
         return result

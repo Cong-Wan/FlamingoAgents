@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.7
-Date: 2026-08-19
+Version: 1.9
+Date: 2026-09-02
 Description: sessionId → agent 实例缓存（懒建、模型配置变更后置失效标记惰性重建）、活跃流登记（同会话并发 409）、停止标志与泵线程结构。
             v1.1 随包改名调整 import（webApp.backend.*）。
             v1.2 迭代一（方案 §11.4）：泵线程流开始快照 usageTotal、终态算 delta 先写 usageStore.usageTurns（后回写 sessions 索引，原有回写不变）。
@@ -13,12 +13,15 @@ Description: sessionId → agent 实例缓存（懒建、模型配置变更后�
             v1.6（stopResponsivenessPlan L2）：requestStop 改主动收尾（interrupt + 广播 stopped + 幂等 usage + 注销 + 关订阅）；
             doneEvent/usageRecorded/historyOverflowed；_broadcast 拦截已终态事件；history 2000 截尾。
             v1.7 logDir 按会话 workDir 注入 ~/.flamingo/logs/webData/<workDir路径>/，不再用扁平 sessionLogsDir。
+            v1.8 泵异常与 sseGen 意外异常落 jsonl（pumpError/sseGenError），只用 conversations.get，禁止 getConversation。
+            v1.9 泵/sseGen 诊断落盘失败不得盖掉真正的流异常。
 '''
 
 from __future__ import annotations
 
 import queue
 import threading
+import traceback
 from pathlib import Path
 
 from flamingoAgents import createAgent
@@ -256,6 +259,12 @@ class streamPump:
                 if isinstance(event, terminalEventTypes):
                     break
         except Exception as error:
+            try:
+                stack = traceback.format_exc()
+                traceback.print_exc()
+                self._logDiagEvent('pumpError', error, stack)
+            except Exception:
+                pass
             self._broadcast(errorEvent(message=str(error), errorType=type(error).__name__))
         finally:
             self.stream.close()
@@ -267,6 +276,30 @@ class streamPump:
             if not self.doneEvent.is_set():
                 unregisterStream(self.sessionId)
                 self._closeSubscribers()
+
+    def logSseGenError(self, error) -> None:
+        try:
+            stack = traceback.format_exc()
+            traceback.print_exc()
+            self._logDiagEvent('sseGenError', error, stack)
+        except Exception:
+            pass
+
+    def _logDiagEvent(self, eventType: str, error, stack: str) -> None:
+        try:
+            with self.agent.sessionLocksGuard:
+                currentConversation = self.agent.conversations.get(self.sessionId)
+            if currentConversation is None:
+                return
+            currentConversation.logger.logEvent({
+                'type': eventType,
+                'sessionId': self.sessionId,
+                'errorType': type(error).__name__,
+                'message': str(error),
+                'traceback': stack,
+            })
+        except Exception:
+            pass
 
     def _currentUsage(self) -> dict:
         # 从已缓存 conversation 读 usageTotal（禁止 getConversation()，避免为未发消息会话落 jsonl 的副作用）。

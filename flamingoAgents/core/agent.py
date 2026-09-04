@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.20
-Date: 2026-09-01
-Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.20 passes the stable sessionId into model adapters and honors explicit retryable=False authentication failures instead of retrying login errors.
+Version: 1.21
+Date: 2026-09-02
+Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.21 writes modelRequestStart per attempt and merges adapter diag plus attempt/willRetry/backoffMs into modelError without changing retry semantics.
 '''
 
 from __future__ import annotations
@@ -201,6 +201,16 @@ class agent:
             for attempt in range(MODEL_RETRY_MAX_ATTEMPTS + 1):
                 chunkSeen = False
                 try:
+                    try:
+                        currentConversation.logger.logEvent({
+                            'type': 'modelRequestStart',
+                            'sessionId': sessionId,
+                            'attempt': attempt + 1,
+                            'messageCount': len(currentConversation.messages),
+                            'contextTokens': currentConversation.lastTurnTokens,
+                        })
+                    except Exception:
+                        pass
                     for chunk in self.modelAdapter.completeStream(
                         currentConversation.messages,
                         modelTools,
@@ -224,7 +234,6 @@ class agent:
                 except modelInterruptedError:
                     return
                 except Exception as error:
-                    self.logModelError(currentConversation, error)
                     statusCode = getattr(error, 'statusCode', None)
                     hasStatusAttr = hasattr(error, 'statusCode')
                     retryableOverride = getattr(error, 'retryable', None)
@@ -233,23 +242,35 @@ class agent:
                         if isinstance(retryableOverride, bool)
                         else hasStatusAttr and (statusCode in MODEL_RETRYABLE_STATUS_CODES or statusCode is None)
                     )
-                    if chunkSeen or not isRetryable or attempt >= MODEL_RETRY_MAX_ATTEMPTS:
+                    willRetry = (not chunkSeen) and isRetryable and attempt < MODEL_RETRY_MAX_ATTEMPTS
+                    backoff = 0.0
+                    backoffMs = None
+                    if willRetry:
+                        backoff = min(
+                            MODEL_RETRY_BACKOFF_MAX_SECONDS,
+                            MODEL_RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt),
+                        )
+                        retryAfterSeconds = getattr(error, 'retryAfterSeconds', None)
+                        if retryAfterSeconds is not None:
+                            backoff = max(backoff, float(retryAfterSeconds))
+                        backoffMs = int(backoff * 1000)
+                    self.logModelError(
+                        currentConversation,
+                        error,
+                        attempt=attempt + 1,
+                        willRetry=willRetry,
+                        backoffMs=backoffMs,
+                    )
+                    if not willRetry:
                         yield errorEvent(
                             message=f'模型调用失败（已重试{attempt}次）：{error}',
                             errorType=type(error).__name__,
                         )
                         return
-                    backoff = min(
-                        MODEL_RETRY_BACKOFF_MAX_SECONDS,
-                        MODEL_RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt),
-                    )
-                    retryAfterSeconds = getattr(error, 'retryAfterSeconds', None)
-                    if retryAfterSeconds is not None:
-                        backoff = max(backoff, float(retryAfterSeconds))
                     yield retryNoticeEvent(
                         message=str(error),
                         attempt=attempt + 1,
-                        retryAfterMs=int(backoff * 1000),
+                        retryAfterMs=backoffMs,
                         status='waiting',
                     )
                     remaining = backoff
@@ -510,7 +531,14 @@ class agent:
                 return (calls, position)
         return None
 
-    def logModelError(self, currentConversation: conversation, error: Exception) -> None:
+    def logModelError(
+        self,
+        currentConversation: conversation,
+        error: Exception,
+        attempt: int | None = None,
+        willRetry: bool | None = None,
+        backoffMs: int | None = None,
+    ) -> None:
         event: dict[str, Any] = {
             'type': 'modelError',
             'errorType': type(error).__name__,
@@ -522,7 +550,25 @@ class agent:
         statusCode = getattr(error, 'statusCode', None)
         if isinstance(statusCode, int):
             event['status'] = statusCode
-        currentConversation.logger.logEvent(event)
+        if attempt is not None:
+            event['attempt'] = attempt
+        if willRetry is not None:
+            event['willRetry'] = willRetry
+        if willRetry and backoffMs is not None:
+            event['backoffMs'] = backoffMs
+        diag = getattr(error, 'diag', None)
+        if isinstance(diag, dict):
+            for key in (
+                'stage', 'durationMs', 'ttfbMs', 'chunks', 'textChars', 'reasoningChars',
+                'exceptionName', 'errno', 'requestId', 'responseHeaders', 'requestBytesLen',
+                'api', 'baseUrl', 'authRefresh',
+            ):
+                if key in diag and diag[key] is not None:
+                    event[key] = diag[key]
+        try:
+            currentConversation.logger.logEvent(event)
+        except Exception:
+            pass
 
     def hasPendingConfirmation(self, sessionId: str) -> bool:
         with self.sessionLocksGuard:

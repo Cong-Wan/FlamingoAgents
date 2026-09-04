@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.14
-Date: 2026-09-01
-Description: FastAPI application and authenticated REST/SSE routes. v1.14 adds no-store subscription model-candidate discovery with credential-generation race rejection and structured secret-free errors.
+Version: 1.15
+Date: 2026-09-02
+Description: FastAPI application and authenticated REST/SSE routes. v1.14 adds no-store subscription model-candidate discovery with credential-generation race rejection and structured secret-free errors. v1.15 prints traceback in fallbackErrorHandler so pre-stream 500s leave a stderr stack.
 '''
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess
+import traceback
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
@@ -58,6 +59,7 @@ async def validationErrorHandler(request: Request, exc: RequestValidationError):
 
 @app.exception_handler(Exception)
 async def fallbackErrorHandler(request: Request, exc: Exception):
+    traceback.print_exc()
     return JSONResponse(status_code=500, content={'error': f'服务器内部错误（{type(exc).__name__}）。'})
 
 
