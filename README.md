@@ -1,5 +1,11 @@
 # FlamingoAgents
 
+<!--
+Author: wilbur
+Version: 1.0
+Date: 2026-09-07
+Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history.
+-->
 
 ## 现状能力
 
@@ -54,6 +60,8 @@ flamingoAgents 纯库（事件流 + 工具 + jsonl 日志）
 > ```
 >
 > 全新环境无旧数据也可跑（空转后写 `~/.flamingo/logs/.migrationDone`）。迁完后 `webData/sessionLogs/` 与各 workDir 的 `.agentLogs/` 残留由你手动删。
+>
+> **会话索引也统一存入家目录**：Web 运行时读写 `~/.flamingo/logs/webData/sessions.json`，不再向仓库 `webData/` 写数据。新索引不存在时，首次读取会校验并复制尚存的仓库 `webData/sessions.json`，旧文件保留；新索引存在（包括空列表）时始终以新索引为准，不自动合并旧数据。确认新位置的索引和历史均可读取后，才清理旧目录。已删除的旧索引不会仅凭 JSONL 自动重建；损坏/不可读的索引会报错，不当空索引覆盖。升级后需重启 Web 服务，同一用户家目录只运行一个 Web 服务实例。
 
 ```bash
 # 1. 配置模型（复制示例，填入各家 Coding Plan 的 key）
@@ -66,6 +74,19 @@ uv run python askModel.py
 FLAMINGO_WEB_TOKEN=你的token uv run python -m webApp
 # 浏览器打开 http://<本机IP>:8787，输入 token 登录
 ```
+
+## 索引丢失后的显式历史恢复
+
+如果 `sessions.json` 已删除但家目录日志仍在，改路径不会自动让旧历史出现。先停止会话写入、备份日志，并通过 SQLite backup API 获取一致的 `usage.db` 副本，再运行恢复工具（`--work-dir` 可重复；必须填写真实目录，不能把日志文件夹名中的 `-` 反推成 `/`）：
+
+```bash
+uv run python -m webApp.backend.sessionRecovery \
+  --logs-root /path/to/backup/logs \
+  --work-dir /absolute/work/dir \
+  --output ~/.flamingo/logs/webData/sessions.json
+```
+
+工具严格校验日志、只读数据库，生成恢复索引并原子发布；目标索引已存在则报错，不覆盖或合并。恢复标题取首条消息前 20 字，模型取最后记账记录；原自定义标题、未发送消息的空会话、未发请求的模型切换不能保证还原。历史读取同时支持 JSONL、旧 JSON 事件数组，以及数组后追加的 JSONL，不会为兼容而重写正文。升级读取兼容代码后需重启 Web 服务。
 
 ## ChatGPT / xAI 订阅登录
 
@@ -101,8 +122,10 @@ webApp/
   frontend/          # 原生 HTML/CSS/JS（vendor: marked + DOMPurify + Chart.js）
 config/              # models.yaml（多 provider 密钥配置）/ tools.yaml / systemPrompt.md / skills/<name>/SKILL.md
 docs/                # 契约与手册（见下）；方案与事故报告归入 docs/plan/
-webData/             # 运行数据（gitignore）：现仅含会话索引 sessions.json
-~/.flamingo/logs/    # usage.db + {webData,cliData}/~-project-FlamingoAgents/*.jsonl
+~/.flamingo/logs/    # 全部会话运行数据（不依赖仓库 webData/）
+  usage.db           # 用量统计
+  webData/           # sessions.json 索引 + <workDir映射目录>/*.jsonl 正文
+  cliData/           # <workDir映射目录>/*.jsonl
 ```
 
 ## 文档索引

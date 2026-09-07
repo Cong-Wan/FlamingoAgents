@@ -1,7 +1,7 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.18
+> Version: 1.22
 > Date: 2026-09-07
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 8 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
@@ -26,6 +26,8 @@
 > v1.17：订阅模型配置候选——modelAuth 状态/任务增加 `credentialGeneration`；新增 §3.28 POST discovery。xAI 固定主机、禁止重定向、401 stale-token 单次刷新；响应只含安全候选且不写 models.yaml。
 > v1.17.1：模型目录 transport 遵循 `HTTPS_PROXY/NO_PROXY`，同时继续拒绝全部重定向；普通响应和 HTTPError body 均有界读取。
 > v1.18：ChatGPT Codex 模型候选改为固定 `/codex/models?client_version=0.153.4` 实时账户目录；新增 `live-account-catalog`、可见性/元数据过滤和 GPT-6 映射。
+> v1.21：会话索引也迁至 `~/.flamingo/logs/webData/sessions.json`；新索引缺失时复制尚存的仓库旧索引，之后统一在家目录读写；索引损坏显式报错而非返回空历史。
+> v1.22：历史读取兼容旧 JSON 事件数组及其后续 JSONL 追加；提供显式 sessionRecovery 工具重建已删除索引，DTO 与日常新建写入格式不变。
 
 ---
 
@@ -70,6 +72,8 @@
 ## 2. 数据模型
 
 ### 2.1 session（会话对象）
+
+持久索引：`~/.flamingo/logs/webData/sessions.json`；会话列表、历史定位、模型配置和 usage/context 回写均使用此索引。新索引不存在时，首次读取会校验并原子复制 `<repo>/webData/sessions.json`（若尚存），保留旧文件；新索引存在时始终优先，即使列表为空也不回退/合并旧索引。新旧索引均不存在则返回空列表，不自动从 JSONL 重建。损坏或不可读索引报错，不允许作为空索引后覆盖。仍要求同一用户家目录仅一个 Web 服务实例、单 worker。
 
 ```json
 {

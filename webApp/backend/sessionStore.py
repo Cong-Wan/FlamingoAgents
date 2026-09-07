@@ -1,13 +1,14 @@
 '''
 Author: wilbur
-Version: 1.5
-Date: 2026-08-19
-Description: webData/sessions.json 会话索引 CRUD：进程内锁 + 临时文件 rename 原子写；updatedAt/usage/标题的刷新时机对齐契约 §2.1。
+Version: 1.6
+Date: 2026-09-07
+Description: ~/.flamingo/logs/webData/sessions.json 会话索引 CRUD：进程内锁 + 临时文件 rename 原子写；updatedAt/usage/标题的刷新时机对齐契约 §2.1。
             v1.1 随包改名调整：webDataDir 因目录加深一级改为 parents[2]。
             v1.2 迭代二（方案 §3.3/§3.6）：updateUsage 增加可选 contextTokens 字段回写；新增 updateSessionModel（/model 指令）。
             v1.3 状态栏口径：updateUsage 增加可选 lastUsage（最近一轮 token 增量）回写。
             v1.4 移除 sessionLogsDir（日志已迁至 ~/.flamingo/logs/webData/，本模块只保留 sessions.json 索引）。
             v1.5 新会话 sessionId 改为 YYMMDDHHmmss-xxxxxxxx（存量 session_* 仍合法）。
+            v1.6 索引统一从家目录读写；新索引缺失时无损复制旧索引，新索引始终优先；损坏/不可读索引报错，防止当空索引覆盖。
 '''
 
 from __future__ import annotations
@@ -18,10 +19,11 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flamingoAgents.utils.logPaths import newSessionId
+from flamingoAgents.utils.logPaths import newSessionId, webLogsRoot
 
-webDataDir = Path(__file__).resolve().parents[2] / 'webData'
+webDataDir = webLogsRoot
 indexPath = webDataDir / 'sessions.json'
+legacyIndexPath = Path(__file__).resolve().parents[2] / 'webData' / 'sessions.json'
 
 indexLock = threading.RLock()
 
@@ -34,22 +36,32 @@ def nowIso() -> str:
 
 def loadIndex() -> dict[str, dict]:
     with indexLock:
-        if not indexPath.exists():
+        # 新索引（包括空列表）始终优先；旧索引只作为首次迁移来源，保留不删。
+        sourcePath = indexPath if indexPath.exists() else legacyIndexPath
+        if not sourcePath.exists():
             return {}
         try:
-            raw = json.loads(indexPath.read_text(encoding='utf-8'))
-        except (json.JSONDecodeError, OSError):
-            return {}
+            raw = json.loads(sourcePath.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as error:
+            raise RuntimeError(f'无法读取会话索引：{sourcePath}，请检查文件，未覆盖原数据。') from error
         sessions = raw.get('sessions') if isinstance(raw, dict) else None
         if not isinstance(sessions, list):
-            return {}
-        return {item['sessionId']: item for item in sessions if isinstance(item, dict) and item.get('sessionId')}
+            raise RuntimeError(f'会话索引格式错误：{sourcePath}，sessions 必须是列表。')
+        index = {}
+        for item in sessions:
+            sessionId = item.get('sessionId') if isinstance(item, dict) else None
+            if not isinstance(sessionId, str) or not sessionId or sessionId in index:
+                raise RuntimeError(f'会话索引条目错误：{sourcePath}，sessionId 必须是非空且唯一的字符串。')
+            index[sessionId] = item
+        if sourcePath != indexPath:
+            saveIndex(index)
+        return index
 
 
 def saveIndex(sessions: dict[str, dict]) -> None:
     # 原子写：同目录临时文件 + rename，避免中途崩溃写坏索引。
     with indexLock:
-        webDataDir.mkdir(parents=True, exist_ok=True)
+        indexPath.parent.mkdir(parents=True, exist_ok=True)
         tempPath = indexPath.with_suffix('.json.tmp')
         payload = json.dumps({'sessions': list(sessions.values())}, ensure_ascii=False, indent=2)
         tempPath.write_text(payload, encoding='utf-8')
