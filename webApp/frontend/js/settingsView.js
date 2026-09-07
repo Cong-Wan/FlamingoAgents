@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.9
-Date: 2026-09-01
-Description: Model editor with independent subscription discovery, non-overwrite guarded merge, account-epoch flights, and per-open revision commits so inverse asynchronous reloads cannot restore stale configuration.
+Version: 1.10
+Date: 2026-09-07
+Description: Model editor with independent subscription discovery, non-overwrite guarded merge, account-epoch flights, and per-open revision commits. v1.10 presents live ChatGPT Codex model sync and OpenAI catalog filtering reports.
 */
 (function () {
   'use strict';
@@ -171,7 +171,7 @@ Description: Model editor with independent subscription discovery, non-overwrite
     description.className = 'subscription-account-description';
     description.textContent = isXai
       ? '登录后读取 xAI 实时模型目录，并与本地 Responses 元数据取交集。'
-      : 'Codex 无可靠账户枚举端点，仅提供需手工确认的内置配置候选。';
+      : '登录后读取当前账户的 Codex 实时模型目录，并加入官方标记为可见的模型候选。';
     card.appendChild(description);
     if (status.error) {
       var statusError = document.createElement('div');
@@ -200,7 +200,7 @@ Description: Model editor with independent subscription discovery, non-overwrite
     } else {
       var syncLabel = isDiscoveryPending(authProvider)
         ? '正在发现…'
-        : (isXai ? '同步模型候选' : '应用内置候选');
+        : '同步模型候选';
       var syncButton = addAction(syncLabel, function () { discoverAndApplySubscription(authProvider, true); });
       syncButton.disabled = isDiscoveryPending(authProvider);
       addAction('退出登录', function () { logoutSubscription(authProvider); }, 'btn btn-danger');
@@ -257,14 +257,18 @@ Description: Model editor with independent subscription discovery, non-overwrite
   function formatDiscoveryReport(result, merged) {
     var report = (result && result.report) || {};
     var sourceNames = {
+      'live-account-catalog': 'ChatGPT 当前账户 Codex 实时目录',
       'live-catalog-match': 'xAI 实时目录与本地 Responses 目录交集',
       'local-fallback': '离线本地候选（实时目录失败）',
       'local-only': '内置本地候选'
     };
     var reasonNames = {
       unsupported_output_modality: '当前不支持图像/视频生成',
+      unsupported_input_modality: '当前不支持该输入模态',
       requires_openai_completions: '仅确认支持 Chat Completions',
-      missing_responses_metadata: '缺少可信 Responses 元数据'
+      missing_responses_metadata: '缺少可信 Responses 元数据',
+      missing_model_metadata: '缺少必要模型元数据',
+      hidden_by_provider: '上游标记为隐藏模型'
     };
     var lines = [
       '来源：' + (sourceNames[result.source] || result.source),

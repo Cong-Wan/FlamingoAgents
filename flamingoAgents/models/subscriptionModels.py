@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-09-01
-Description: Safely discovers subscription model candidates with a proxy-aware fixed-URL urllib opener that rejects every redirect, bounded normal/error bodies, stale-token 401 refresh, local metadata, and secret-free reports.
+Version: 1.3
+Date: 2026-09-07
+Description: Safely discovers subscription model candidates with fixed proxy-aware/no-redirect endpoints, bounded bodies, stale-token refresh, and secret-free reports. v1.2 adds live ChatGPT Codex catalog discovery and GPT-6 metadata mapping. v1.3 keeps OpenAI 403 distinct from expired credentials.
 '''
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import copy
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -19,10 +20,18 @@ from flamingoAgents.models.credentialStore import credentialStore, defaultCreden
 from flamingoAgents.models.subscriptionAuth import modelAuthError, resolveOAuthCredential
 
 xaiModelsUrl = 'https://api.x.ai/v1/models'
+openAiCodexModelsClientVersion = '0.153.4'
+openAiCodexModelsBaseUrl = 'https://chatgpt.com/backend-api/codex/models'
+openAiCodexModelsUrl = openAiCodexModelsBaseUrl + '?' + urllib.parse.urlencode({
+    'client_version': openAiCodexModelsClientVersion,
+})
 modelsHttpTimeoutSeconds = 20
 maximumModelsResponseBytes = 1024 * 1024
 maximumDiscoveredModels = 200
+maximumModelNameLength = 200
+openAiDefaultMaxTokens = 128000
 modelIdPattern = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,159}')
+reasoningEffortPattern = re.compile(r'[A-Za-z0-9_-]{1,32}')
 forbiddenTemplateKeys = frozenset({'__proto__', 'prototype', 'constructor'})
 
 
@@ -90,6 +99,7 @@ xaiResponsesCatalog = {
 xaiCompletionsOnlyModels = frozenset({'grok-4.3', 'grok-build-0.1'})
 
 openAiCodexCatalog = {
+    'gpt-6-astra': subscriptionModel('gpt-6-astra', 'GPT-6-Astra', 272000, 128000, reasoningEffort='low'),
     'gpt-5.3-codex-spark': subscriptionModel(
         'gpt-5.3-codex-spark', 'GPT-5.3 Codex Spark', 128000, 128000, inputTypes=('text',),
     ),
@@ -106,59 +116,54 @@ def discoverSubscriptionModels(
     provider: str,
     *,
     store: credentialStore | None = None,
-    requestFn: Callable[[str], modelListHttpResponse] | None = None,
+    requestFn: Callable[..., modelListHttpResponse] | None = None,
 ) -> dict[str, Any]:
-    if provider == 'openai-codex':
-        activeStore = store or defaultCredentialStore
-        try:
-            resolveOAuthCredential(provider, store=activeStore)
-        except modelAuthError as error:
-            raise mapAuthError(provider, error) from None
-        except Exception:
-            raise modelDiscoveryError(provider, 'credential_error') from None
-        return localDiscovery(
-            provider,
-            source='local-only',
-            failureCode=None,
-            warnings=[
-                'ChatGPT 暂无可靠的账户模型枚举端点；以下仅为内置 Codex 配置候选，不代表账户权益。',
-                'cost=0 仅表示不做订阅按 Token 成本估算，不代表订阅没有成本。',
-            ],
-        )
-    if provider != 'xai':
+    if provider not in ('openai-codex', 'xai'):
         raise modelDiscoveryError(provider, 'unsupported_provider')
 
     activeStore = store or defaultCredentialStore
-    activeRequest = requestFn or requestXaiModels
+    activeRequest = requestFn or (
+        requestOpenAiCodexModels if provider == 'openai-codex' else requestXaiModels
+    )
+    parseResponse = (
+        discoveryFromOpenAiResponse if provider == 'openai-codex' else discoveryFromXaiResponse
+    )
+
+    def requestCredential(currentCredential) -> modelListHttpResponse | None:
+        requestArgs = [currentCredential.access]
+        if provider == 'openai-codex':
+            accountId = currentCredential.accountId
+            if not isinstance(accountId, str) or not accountId:
+                raise modelDiscoveryError(provider, 'credential_error')
+            requestArgs.append(accountId)
+        return safeModelListRequest(provider, activeRequest, *requestArgs)
+
     try:
-        credential = resolveOAuthCredential('xai', store=activeStore)
+        credential = resolveOAuthCredential(provider, store=activeStore)
     except modelAuthError as error:
-        raise mapAuthError('xai', error) from None
+        raise mapAuthError(provider, error) from None
     except Exception:
-        raise modelDiscoveryError('xai', 'credential_error') from None
+        raise modelDiscoveryError(provider, 'credential_error') from None
 
     usedAccess = credential.access
-    firstResponse = safeModelListRequest(activeRequest, usedAccess)
-    if firstResponse is None:
-        return localDiscovery('xai', source='local-fallback', failureCode='network_error')
-    if firstResponse.statusCode == 401:
+    response = requestCredential(credential)
+    if response is None:
+        return localDiscovery(provider, source='local-fallback', failureCode='network_error')
+    if response.statusCode == 401:
         try:
             credential = resolveOAuthCredential(
-                'xai', forceRefresh=True, staleAccess=usedAccess, store=activeStore,
+                provider, forceRefresh=True, staleAccess=usedAccess, store=activeStore,
             )
         except modelAuthError:
-            raise modelDiscoveryError('xai', 'reauth_required', statusCode=401) from None
+            raise modelDiscoveryError(provider, 'reauth_required', statusCode=401) from None
         except Exception:
-            raise modelDiscoveryError('xai', 'credential_error') from None
-        secondResponse = safeModelListRequest(activeRequest, credential.access)
-        if secondResponse is None:
-            return localDiscovery('xai', source='local-fallback', failureCode='network_error')
-        if secondResponse.statusCode in (401, 403):
-            raise modelDiscoveryError('xai', 'reauth_required', statusCode=secondResponse.statusCode)
-        return discoveryFromXaiResponse(secondResponse)
-    if firstResponse.statusCode == 403:
-        raise modelDiscoveryError('xai', 'reauth_required', statusCode=403)
-    return discoveryFromXaiResponse(firstResponse)
+            raise modelDiscoveryError(provider, 'credential_error') from None
+        response = requestCredential(credential)
+        if response is None:
+            return localDiscovery(provider, source='local-fallback', failureCode='network_error')
+    if response.statusCode == 401 or (provider == 'xai' and response.statusCode == 403):
+        raise modelDiscoveryError(provider, 'reauth_required', statusCode=response.statusCode)
+    return parseResponse(response)
 
 
 class noRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -166,24 +171,15 @@ class noRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def buildXaiModelsOpener():
+def buildModelsOpener():
     return urllib.request.build_opener(
         urllib.request.ProxyHandler(),
         noRedirectHandler(),
     )
 
 
-def requestXaiModels(accessToken: str) -> modelListHttpResponse:
-    request = urllib.request.Request(
-        xaiModelsUrl,
-        headers={
-            'Authorization': f'Bearer {accessToken}',
-            'Accept': 'application/json',
-            'User-Agent': 'FlamingoAgents/model-discovery',
-        },
-        method='GET',
-    )
-    opener = buildXaiModelsOpener()
+def _openModelListRequest(request: urllib.request.Request) -> modelListHttpResponse:
+    opener = buildModelsOpener()
     try:
         response = opener.open(request, timeout=modelsHttpTimeoutSeconds)
     except urllib.error.HTTPError as error:
@@ -205,6 +201,33 @@ def requestXaiModels(accessToken: str) -> modelListHttpResponse:
         response.close()
 
 
+def requestXaiModels(accessToken: str) -> modelListHttpResponse:
+    request = urllib.request.Request(
+        xaiModelsUrl,
+        headers={
+            'Authorization': f'Bearer {accessToken}',
+            'Accept': 'application/json',
+            'User-Agent': 'FlamingoAgents/model-discovery',
+        },
+        method='GET',
+    )
+    return _openModelListRequest(request)
+
+
+def requestOpenAiCodexModels(accessToken: str, accountId: str) -> modelListHttpResponse:
+    request = urllib.request.Request(
+        openAiCodexModelsUrl,
+        headers={
+            'Authorization': f'Bearer {accessToken}',
+            'ChatGPT-Account-ID': accountId,
+            'Accept': 'application/json',
+            'User-Agent': 'FlamingoAgents/model-discovery',
+        },
+        method='GET',
+    )
+    return _openModelListRequest(request)
+
+
 def safeHttpHeaders(rawHeaders) -> dict[str, str]:
     if rawHeaders is None:
         return {}
@@ -215,42 +238,173 @@ def safeHttpHeaders(rawHeaders) -> dict[str, str]:
 
 
 def safeModelListRequest(
-    requestFn: Callable[[str], modelListHttpResponse],
-    accessToken: str,
+    provider: str,
+    requestFn: Callable[..., modelListHttpResponse],
+    *requestArgs: str,
 ) -> modelListHttpResponse | None:
     try:
-        response = requestFn(accessToken)
+        response = requestFn(*requestArgs)
     except Exception:
         return None
     if (
         not isinstance(response, modelListHttpResponse)
         or not isinstance(response.statusCode, int)
+        or isinstance(response.statusCode, bool)
         or not 100 <= response.statusCode <= 599
         or not isinstance(response.body, bytes)
         or not isinstance(response.headers, dict)
     ):
-        raise modelDiscoveryError('xai', 'invalid_upstream_response')
+        raise modelDiscoveryError(provider, 'invalid_upstream_response')
     return response
 
 
-def discoveryFromXaiResponse(response: modelListHttpResponse) -> dict[str, Any]:
+def checkModelListResponse(
+    provider: str,
+    response: modelListHttpResponse,
+) -> dict[str, Any] | None:
     statusCode = response.statusCode
     if 300 <= statusCode < 400:
-        raise modelDiscoveryError('xai', 'redirect_forbidden', statusCode=statusCode)
+        raise modelDiscoveryError(provider, 'redirect_forbidden', statusCode=statusCode)
     if statusCode == 429:
         raise modelDiscoveryError(
-            'xai', 'rate_limited', statusCode=429,
+            provider, 'rate_limited', statusCode=429,
             retryAfter=parseRetryAfter(response.headers.get('retry-after')),
         )
     if statusCode >= 500:
-        return localDiscovery('xai', source='local-fallback', failureCode=f'upstream_{statusCode}')
-    if statusCode in (401, 403):
-        raise modelDiscoveryError('xai', 'reauth_required', statusCode=statusCode)
+        return localDiscovery(provider, source='local-fallback', failureCode=f'upstream_{statusCode}')
+    if statusCode == 401 or (provider == 'xai' and statusCode == 403):
+        raise modelDiscoveryError(provider, 'reauth_required', statusCode=statusCode)
     if statusCode < 200 or statusCode >= 300:
-        raise modelDiscoveryError('xai', 'upstream_rejected', statusCode=statusCode)
+        raise modelDiscoveryError(provider, 'upstream_rejected', statusCode=statusCode)
     if len(response.body) > maximumModelsResponseBytes:
-        raise modelDiscoveryError('xai', 'invalid_upstream_response', statusCode=statusCode)
+        raise modelDiscoveryError(provider, 'invalid_upstream_response', statusCode=statusCode)
+    return None
 
+
+def discoveryFromOpenAiResponse(response: modelListHttpResponse) -> dict[str, Any]:
+    provider = 'openai-codex'
+    fallback = checkModelListResponse(provider, response)
+    if fallback is not None:
+        return fallback
+    statusCode = response.statusCode
+    try:
+        document = json.loads(response.body.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise modelDiscoveryError(provider, 'invalid_upstream_response', statusCode=statusCode) from None
+    if not isinstance(document, dict) or not isinstance(document.get('models'), list):
+        raise modelDiscoveryError(provider, 'invalid_upstream_response', statusCode=statusCode)
+    rawModels = document['models']
+    if len(rawModels) > maximumDiscoveredModels:
+        raise modelDiscoveryError(provider, 'invalid_upstream_response', statusCode=statusCode)
+
+    discoveredIds = []
+    skippedModels = []
+    candidates = []
+    seenIds = set()
+    invalidCount = 0
+    for index, rawModel in enumerate(rawModels):
+        modelId = rawModel.get('slug') if isinstance(rawModel, dict) else None
+        if not isinstance(modelId, str) or not modelIdPattern.fullmatch(modelId):
+            invalidCount += 1
+            continue
+        if modelId in seenIds:
+            continue
+        seenIds.add(modelId)
+        discoveredIds.append(modelId)
+
+        visibility = rawModel.get('visibility')
+        if visibility in ('hide', 'none'):
+            skippedModels.append({'id': modelId, 'reason': 'hidden_by_provider'})
+            continue
+        if visibility != 'list':
+            skippedModels.append({'id': modelId, 'reason': 'missing_model_metadata'})
+            continue
+
+        contextWindow = rawModel.get('context_window')
+        if (
+            not isinstance(contextWindow, int)
+            or isinstance(contextWindow, bool)
+            or contextWindow <= 0
+        ):
+            skippedModels.append({'id': modelId, 'reason': 'missing_model_metadata'})
+            continue
+
+        rawInput = rawModel.get('input_modalities')
+        if not isinstance(rawInput, list) or not all(isinstance(item, str) for item in rawInput):
+            skippedModels.append({'id': modelId, 'reason': 'missing_model_metadata'})
+            continue
+        inputTypes = []
+        for inputType in rawInput:
+            if inputType in ('text', 'image') and inputType not in inputTypes:
+                inputTypes.append(inputType)
+        if 'text' not in inputTypes:
+            skippedModels.append({'id': modelId, 'reason': 'unsupported_input_modality'})
+            continue
+
+        rawName = rawModel.get('display_name')
+        name = rawName.strip() if isinstance(rawName, str) else ''
+        if not name or len(name) > maximumModelNameLength:
+            name = modelId
+
+        supportedEfforts = []
+        rawEfforts = rawModel.get('supported_reasoning_levels')
+        if isinstance(rawEfforts, list):
+            for rawEffort in rawEfforts:
+                effort = rawEffort.get('effort') if isinstance(rawEffort, dict) else None
+                if (
+                    isinstance(effort, str)
+                    and reasoningEffortPattern.fullmatch(effort)
+                    and effort not in supportedEfforts
+                ):
+                    supportedEfforts.append(effort)
+        defaultEffort = rawModel.get('default_reasoning_level')
+        if not isinstance(defaultEffort, str) or not reasoningEffortPattern.fullmatch(defaultEffort):
+            defaultEffort = supportedEfforts[0] if supportedEfforts else None
+        reasoning = defaultEffort is not None or bool(supportedEfforts)
+        model = subscriptionModel(
+            modelId,
+            name,
+            contextWindow,
+            min(contextWindow, openAiDefaultMaxTokens),
+            inputTypes=tuple(inputTypes),
+            reasoning=reasoning,
+            reasoningEffort=defaultEffort,
+        )
+        priority = rawModel.get('priority')
+        hasPriority = isinstance(priority, int) and not isinstance(priority, bool)
+        sortKey = (0, priority, index) if hasPriority else (1, 0, index)
+        candidates.append((sortKey, model))
+
+    candidates.sort(key=lambda item: item[0])
+    includedModels = [item[1] for item in candidates]
+    includedIds = [item['id'] for item in includedModels]
+    warnings = [
+        '实时目录只代表当前账户本次返回的 Codex 模型，不保证每次调用成功。',
+        'maxTokens 是本地配置兼容值，不是上游声明的模型输出上限。',
+        'cost=0 仅表示不做订阅按 Token 成本估算，不代表订阅没有成本。',
+    ]
+    if invalidCount:
+        warnings.append(f'已忽略 {invalidCount} 个格式非法的模型条目。')
+    if not includedModels:
+        warnings.append('实时目录没有可加入的可见文本模型，未自动创建模型配置。')
+    return buildDiscovery(
+        provider,
+        source='live-account-catalog',
+        autoApplicable=bool(includedModels),
+        models=includedModels,
+        discoveredIds=discoveredIds,
+        includedIds=includedIds,
+        skippedModels=skippedModels,
+        warnings=warnings,
+        failureCode=None,
+    )
+
+
+def discoveryFromXaiResponse(response: modelListHttpResponse) -> dict[str, Any]:
+    fallback = checkModelListResponse('xai', response)
+    if fallback is not None:
+        return fallback
+    statusCode = response.statusCode
     try:
         document = json.loads(response.body.decode('utf-8'))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -322,6 +476,13 @@ def localDiscovery(
         baseWarnings.extend([
             '实时 xAI 目录暂不可用；以下为离线配置候选，未验证当前账户权益。',
             '必须显式确认后才会加入编辑区，不会自动保存。',
+            'cost=0 仅表示不做订阅按 Token 成本估算，不代表订阅没有成本。',
+        ])
+    else:
+        baseWarnings.extend([
+            '实时 ChatGPT 目录暂不可用；以下为离线 Codex 候选，未验证当前账户权益。',
+            '必须显式确认后才会加入编辑区，不会自动保存。',
+            'maxTokens 是本地配置兼容值，不是上游声明的模型输出上限。',
             'cost=0 仅表示不做订阅按 Token 成本估算，不代表订阅没有成本。',
         ])
     modelIds = list(catalog)

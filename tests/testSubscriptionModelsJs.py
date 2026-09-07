@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-09-01
-Description: Runs Node assertions for safe candidate merging, non-overwrite/idempotency, ambiguity, discovery guards, account-epoch flight isolation, and inverse asynchronous open commit rejection.
+Version: 1.2
+Date: 2026-09-07
+Description: Runs Node assertions for safe candidate merging, non-overwrite/idempotency, ambiguity, discovery guards, account-epoch flight isolation, and inverse asynchronous open commit rejection. v1.2 covers live OpenAI GPT-6 additive and idempotent merging.
 '''
 
 from __future__ import annotations
@@ -35,6 +35,16 @@ function discovery(models) {
     report: {warnings: [], skippedModels: []}
   };
 }
+function openAiDiscovery(models) {
+  return {
+    provider: 'openai-codex', source: 'live-account-catalog', autoApplicable: true,
+    providerTemplate: {
+      suggestedId: 'openaiCodex', baseUrl: 'https://chatgpt.com/backend-api',
+      api: 'openai-codex-responses', auth: 'oauth', headers: {}, models: models
+    },
+    report: {warnings: [], skippedModels: []}
+  };
+}
 
 const existingModel = Object.assign(model('grok-4.6', 777), {custom: {keep: true}});
 const config = {providers: {
@@ -63,6 +73,32 @@ assert.notStrictEqual(merged.config.providers.existingXai.models[1].name, 'mutat
 const repeated = helpers.mergeDiscovery(merged.config, discovery([model('grok-4.6', 1), model('grok-4.5', 1)]), null);
 assert.deepStrictEqual(repeated.addedModelIds, []);
 assert.deepStrictEqual(repeated.config, merged.config);
+
+const existingCodex = Object.assign(model('gpt-5.6-sol', 272000), {custom: {keep: 'codex'}});
+const codexConfig = {providers: {
+  openaiCodex: {
+    baseUrl: 'https://chatgpt.com/backend-api/', api: 'openai-codex-responses', auth: 'oauth',
+    headers: {'X-Custom': 'keep'}, models: [existingCodex]
+  }
+}};
+const codexMerged = helpers.mergeDiscovery(
+  codexConfig,
+  openAiDiscovery([model('gpt-6-astra', 272000), model('gpt-5.6-sol', 999)]),
+  'openaiCodex'
+);
+assert.strictEqual(codexMerged.ok, true);
+assert.deepStrictEqual(codexMerged.addedModelIds, ['gpt-6-astra']);
+assert.deepStrictEqual(codexMerged.keptModelIds, ['gpt-5.6-sol']);
+assert.deepStrictEqual(codexMerged.config.providers.openaiCodex.models.map(x => x.id), ['gpt-5.6-sol', 'gpt-6-astra']);
+assert.strictEqual(codexMerged.config.providers.openaiCodex.models[0].contextWindow, 272000);
+assert.deepStrictEqual(codexMerged.config.providers.openaiCodex.models[0].custom, {keep: 'codex'});
+const codexRepeated = helpers.mergeDiscovery(
+  codexMerged.config,
+  openAiDiscovery([model('gpt-6-astra', 1)]),
+  'openaiCodex'
+);
+assert.deepStrictEqual(codexRepeated.addedModelIds, []);
+assert.deepStrictEqual(codexRepeated.config, codexMerged.config);
 
 const collisionConfig = {providers: {
   xaiSubscription: {baseUrl: 'https://relay.example/v1', api: 'openai-completions', auth: 'api-key', models: [model('other', 100)]}

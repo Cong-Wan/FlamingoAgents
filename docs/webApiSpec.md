@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.17.1
-> Date: 2026-09-01
+> Version: 1.18
+> Date: 2026-09-07
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 8 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -25,6 +25,7 @@
 > v1.16：订阅登录——modelConfig 增加三种 API 与 `auth`；新增 §3.22–§3.27 modelAuth 状态/登录任务/manual code/取消/退出接口；所有响应禁止包含 OAuth Token/code_verifier。
 > v1.17：订阅模型配置候选——modelAuth 状态/任务增加 `credentialGeneration`；新增 §3.28 POST discovery。xAI 固定主机、禁止重定向、401 stale-token 单次刷新；响应只含安全候选且不写 models.yaml。
 > v1.17.1：模型目录 transport 遵循 `HTTPS_PROXY/NO_PROXY`，同时继续拒绝全部重定向；普通响应和 HTTPError body 均有界读取。
+> v1.18：ChatGPT Codex 模型候选改为固定 `/codex/models?client_version=0.153.4` 实时账户目录；新增 `live-account-catalog`、可见性/元数据过滤和 GPT-6 映射。
 
 ---
 
@@ -602,9 +603,12 @@
 
 ### 3.28 POST /api/modelAuth/{provider}/discover —— 发现订阅模型配置候选
 
-请求体为空对象；`provider` 为 `xai/openai-codex`。响应头固定 `Cache-Control: no-store`。此接口不修改 `models.yaml`，但 xAI 请求可能在凭据临期或首次 401 时刷新 `auth.json`。
+请求体为空对象；`provider` 为 `xai/openai-codex`。响应头固定 `Cache-Control: no-store`。此接口不修改 `models.yaml`，但请求可能在凭据临期或首次 401 时刷新 `auth.json`。
 
-xAI 只访问固定 `https://api.x.ai/v1/models`；使用 `ProxyHandler` 遵循标准 `HTTPS_PROXY/NO_PROXY`，自定义 redirect handler 禁止全部重定向，普通/HTTPError 响应体均限制 1 MiB；首次 401 使用本次 Access Token 作为 stale 条件并发安全刷新，只重放一次。只有实时 ID 与本地已知 Responses 元数据交集可 `autoApplicable=true`；其它模型带原因跳过。
+两个 Provider 均使用 `ProxyHandler` 遵循标准 `HTTPS_PROXY/NO_PROXY`，自定义 redirect handler 禁止全部重定向，普通/HTTPError 响应体均限制 1 MiB；读取超过上限即整体拒绝且不解析。首次 401 使用本次 Access Token 作为 stale 条件并发安全刷新，只重放一次；ChatGPT 403 按上游拒绝处理，不误报为凭据失效（xAI 保持既有重登语义）。
+
+- xAI 只访问固定 `https://api.x.ai/v1/models`；只有实时 ID 与本地已知 Responses 元数据交集可 `autoApplicable=true`，其它模型带原因跳过。
+- ChatGPT 只访问固定 `https://chatgpt.com/backend-api/codex/models?client_version=0.153.4`，同时发送当前 OAuth 凭据中的 `ChatGPT-Account-ID`；只把 `visibility=list`、slug 合法、context 为正数且支持 text 输入的模型映射为候选，按上游 priority 排序。隐藏、缺元数据或输入模态不支持的模型只进入 `skippedModels`。上游未提供输出上限，本地必填 `maxTokens` 使用 `min(contextWindow, 128000)` 兼容值且不会进入 Responses 请求。
 
 200 示例：
 
@@ -637,7 +641,7 @@ xAI 只访问固定 `https://api.x.ai/v1/models`；使用 `ProxyHandler` 遵循�
 }
 ```
 
-`source`：`live-catalog-match` / `local-fallback` / `local-only`。后两者固定 `autoApplicable=false`，前端必须显式确认。`cost=0` 仅表示不做订阅按 Token 成本估算。
+`source`：ChatGPT 在线目录为 `live-account-catalog`，xAI 在线交集为 `live-catalog-match`，网络/5xx 离线候选为 `local-fallback`；兼容旧响应保留 `local-only` 展示。`local-fallback/local-only` 固定 `autoApplicable=false`，前端必须显式确认。OpenAI 过滤原因包括 `hidden_by_provider`、`missing_model_metadata`、`unsupported_input_modality`。`cost=0` 仅表示不做订阅按 Token 成本估算。
 
 结构化失败：未登录/需重登/账户变化为 409，限流为 429，其余上游安全错误为 502；JSON 为 `{"error":"安全消息","code":"枚举值","retryAfter":17}`。任何成功/失败响应均不得出现 OAuth Token、Authorization 或原始上游响应体。
 

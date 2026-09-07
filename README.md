@@ -86,9 +86,9 @@ uv run python modelLogin.py status
 uv run python modelLogin.py logout xai
 ```
 
-Web 模型设置页顶部始终显示独立的“订阅账户”：xAI 登录完成后只读请求固定的 `https://api.x.ai/v1/models`，并把实时 ID 与内置 Responses 元数据取交集；结果只加入浏览器编辑区，用户点击“保存”后才写 `models.yaml`。图像/视频、Completions-only 和元数据未知模型会带原因跳过。ChatGPT 没有可靠的账户枚举端点，只提供需显式确认的内置 Codex 候选。所有目录候选均不代表最终账户权益或调用必然成功。
+Web 模型设置页顶部始终显示独立的“订阅账户”。ChatGPT 登录后只读请求固定的 `https://chatgpt.com/backend-api/codex/models?client_version=0.153.4`，同步当前账户中官方标记为可见的 Codex 模型（包括 GPT-6）；隐藏或缺少必要元数据的模型会带原因跳过。xAI 登录后只读请求固定的 `https://api.x.ai/v1/models`，并把实时 ID 与内置 Responses 元数据取交集。候选只加入浏览器编辑区，用户点击“保存”后才写 `models.yaml`；目录结果不保证每次调用一定成功。
 
-OAuth 凭据仅写入 `~/.flamingo/auth.json`（目录 0700、文件 0600），不会进入 `models.yaml`、浏览器响应或会话 JSONL；Access Token 到期前自动刷新。xAI 模型发现遵循标准 `HTTPS_PROXY/NO_PROXY`，但禁止全部 HTTP 重定向；401 只进行一次带 stale-token 并发保护的刷新重试。
+OAuth 凭据仅写入 `~/.flamingo/auth.json`（目录 0700、文件 0600），不会进入 `models.yaml`、浏览器响应或会话 JSONL；Access Token 到期前自动刷新。ChatGPT 与 xAI 模型发现均遵循标准 `HTTPS_PROXY/NO_PROXY`、禁止全部 HTTP 重定向、限制响应大小；401 只进行一次带 stale-token 并发保护的刷新重试。
 
 Responses 会把多轮继续所需的加密 reasoning/item ID 以白名单字段写入会话 JSONL；它们不是 Access/Refresh Token，但会话日志仍应按敏感数据保护。
 

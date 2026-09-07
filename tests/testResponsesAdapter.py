@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.2
-Date: 2026-09-01
-Description: Tests Codex/xAI Responses payloads and headers, SSE event accumulation, arguments.done-only completion, terminal-authoritative recovery, usage, non-retryable protocol/custom-item failures, and one pre-output OAuth 401 refresh retry.
+Version: 1.3
+Date: 2026-09-07
+Description: Tests Codex/xAI Responses payloads and headers, SSE event accumulation, arguments.done-only completion, terminal-authoritative recovery, usage, non-retryable protocol/custom-item failures, and one pre-output OAuth 401 refresh retry. v1.3 asserts discovery-only maxTokens metadata never enters Responses payloads.
 '''
 
 from __future__ import annotations
@@ -99,6 +99,8 @@ def testCodexAndXaiPayloadUrlAndHeaders() -> None:
     assert not any(item.get('role') == 'system' for item in payload['input'])
     assert payload['prompt_cache_key'] == 's' * 64
     assert payload['store'] is False
+    assert 'maxTokens' not in payload
+    assert 'max_output_tokens' not in payload
     assert payload['include'] == ['reasoning.encrypted_content']
     assert payload['tools'][0] == {
         'type': 'function', 'name': 'read', 'description': 'Read',
