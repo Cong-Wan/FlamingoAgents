@@ -1,8 +1,8 @@
 <!--
 Author: wilbur
-Version: 1.12
-Date: 2026-09-01
-Description: FlamingoAgents native Web UI shell. v1.12 adds an always-visible subscription account area and model-candidate discovery report independent from models.yaml Provider configuration.
+Version: 1.13
+Date: 2026-09-04
+Description: FlamingoAgents native Web UI shell. v1.13 cache-busts the tool-card JavaScript and CSS assets so UI fixes load after refresh.
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -12,7 +12,7 @@ Description: FlamingoAgents native Web UI shell. v1.12 adds an always-visible su
   <title>FlamingoAgents</title>
   <link rel="icon" type="image/png" href="/static/flamingo.png">
   <link rel="stylesheet" href="/static/vendor/highlight-theme.min.css">
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=1.19">
 </head>
 <body>
   <!-- 登录门：无 token 或任意请求 401 时全屏遮罩 -->
@@ -288,7 +288,7 @@ Description: FlamingoAgents native Web UI shell. v1.12 adds an always-visible su
   <script src="/static/js/slashCommand.js"></script>
   <script src="/static/js/fileMention.js"></script>
   <script src="/static/js/fileExplorer.js"></script>
-  <script src="/static/js/chatView.js"></script>
+  <script src="/static/js/chatView.js?v=1.19"></script>
   <script src="/static/js/subscriptionModels.js"></script>
   <script src="/static/js/settingsView.js"></script>
   <script src="/static/js/skillsView.js"></script>

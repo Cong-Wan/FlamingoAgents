@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.18
-Date: 2026-08-17
+Version: 1.19
+Date: 2026-09-04
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
@@ -44,6 +44,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              live 帧 highlight:false，历史与 renderFinal 四处终态 highlight:true（completed / 跨窗口 stopped / 内联 error / 本窗口 stop）。
              v1.18（skillInjectionDuplicationFixPlan）：/skill: wireText 加 <injected_skill> 定界包裹 + 强禁止句，防模型重复 read；
              新增 userBubbleText 折叠历史/attach 的注入块全文，气泡保持 /skill:名 + 补充文字。
+             v1.19（toolArgsCollapsePlan）：工具入参复用出参折叠交互，统一长内容判据，支持限高滚动及展开全部。
 */
 (function () {
   'use strict';
@@ -157,7 +158,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     preEl.textContent = text || '';
     var old = containerEl.querySelector('.tool-expand-btn');
     if (old) old.remove();
-    if ((text || '').length > 300 || (text || '').split('\n').length > 8) {
+    if ((text || '').length > 1200 || (text || '').split('\n').length > 16) {
       preEl.classList.add('collapsed');
       var btn = document.createElement('button');
       btn.className = 'tool-expand-btn';
@@ -219,10 +220,10 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     argsTitle.textContent = '入参';
     var argsPre = document.createElement('pre');
     argsPre.className = 'tool-pre';
-    // 纯文本节点：JSON 不经过 innerHTML
-    argsPre.textContent = safeJson(toolCall.arguments);
     argsSection.appendChild(argsTitle);
     argsSection.appendChild(argsPre);
+    // 纯文本节点：JSON 不经过 innerHTML
+    setCollapsibleText(argsPre, safeJson(toolCall.arguments), argsSection);
     detail.appendChild(argsSection);
 
     var resultSection = document.createElement('div');
