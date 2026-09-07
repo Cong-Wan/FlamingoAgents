@@ -1,19 +1,21 @@
 '''
 Author: wilbur
-Version: 1.4
-Date: 2026-09-02
-Description: 库 7 种事件 dataclass → SSE 文本帧（ensure_ascii=False 单行 JSON），以及只消费订阅队列的 SSE 生成器（15s 空闲发 keep-alive 注释帧）。
+Version: 1.5
+Date: 2026-09-07
+Description: 库事件 dataclass → SSE 文本帧（ensure_ascii=False 单行 JSON），以及只消费订阅队列的 SSE 生成器（15s 空闲发 keep-alive 注释帧）。
             v1.1 多窗口并行（multiWindowStreamingPlan §4.2）：sseGen 签名改 (eventQueue, meta, pump)——attach 订阅首发
             streamResume 帧（baseCount/userMessage）；finally 经 pump.unsubscribe 反注册死订阅。
             v1.2 新增 retryNotice 事件映射（模型调用重试非终态事件）。
             v1.3 非客户端断开的 sseGen 异常经 pump.logSseGenError 落盘后再 re-raise。
             v1.4 logSseGenError 失败不得盖掉真正的生成器异常。
+            v1.5 永久编码 Core usageUpdateEvent 与 Web usageUpdateDto 为同一 usageUpdate SSE；DTO 固定定义于此。
 '''
 
 from __future__ import annotations
 
 import json
 import queue
+from dataclasses import dataclass
 
 from starlette.requests import ClientDisconnect
 
@@ -26,7 +28,16 @@ from flamingoAgents.core.types import (
     textDeltaEvent,
     toolCallEndEvent,
     toolCallStartEvent,
+    usageUpdateEvent,
 )
+
+
+@dataclass
+class usageUpdateDto:
+    usage: dict[str, int]
+    stepUsage: dict[str, int]
+    contextTokens: int
+    cost: float | None
 
 keepAliveIntervalSeconds = 15
 
@@ -72,6 +83,19 @@ def eventToFrame(event) -> tuple[str, dict]:
         }
     if isinstance(event, errorEvent):
         return 'error', {'message': event.message, 'errorType': event.errorType}
+    if isinstance(event, usageUpdateEvent):
+        return 'usageUpdate', {
+            'usage': event.usage,
+            'stepUsage': event.stepUsage,
+            'contextTokens': event.contextTokens,
+        }
+    if isinstance(event, usageUpdateDto):
+        return 'usageUpdate', {
+            'usage': event.usage,
+            'stepUsage': event.stepUsage,
+            'contextTokens': event.contextTokens,
+            'cost': event.cost,
+        }
     # 泵线程兜底异常已被包装为 errorEvent；走到这里属于未知事件，按 error 帧兜底。
     return 'error', {'message': f'未知事件类型：{type(event).__name__}', 'errorType': type(event).__name__}
 

@@ -1,8 +1,8 @@
 <!--
 Author: wilbur
-Version: 1.13
-Date: 2026-09-04
-Description: FlamingoAgents native Web UI shell. v1.13 cache-busts the tool-card JavaScript and CSS assets so UI fixes load after refresh.
+Version: 1.16
+Date: 2026-09-07
+Description: FlamingoAgents native Web UI shell. v1.16 cache-busts statusUsage.js?v=1.1, statusBar.js?v=1.6, chatView.js?v=1.21 for live-usage R7 pending revision.
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -284,11 +284,12 @@ Description: FlamingoAgents native Web UI shell. v1.13 cache-busts the tool-card
   <script src="/static/js/api.js"></script>
   <script src="/static/js/sse.js"></script>
   <script src="/static/js/sidebarView.js"></script>
-  <script src="/static/js/statusBar.js"></script>
+  <script src="/static/js/statusUsage.js?v=1.1"></script>
+  <script src="/static/js/statusBar.js?v=1.6"></script>
   <script src="/static/js/slashCommand.js"></script>
   <script src="/static/js/fileMention.js"></script>
   <script src="/static/js/fileExplorer.js"></script>
-  <script src="/static/js/chatView.js?v=1.19"></script>
+  <script src="/static/js/chatView.js?v=1.21"></script>
   <script src="/static/js/subscriptionModels.js"></script>
   <script src="/static/js/settingsView.js"></script>
   <script src="/static/js/skillsView.js"></script>

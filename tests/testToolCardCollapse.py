@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-09-04
-Description: Verifies tool collapse behavior/styles and cache-busted loading of the updated frontend assets.
+Version: 1.2
+Date: 2026-09-07
+Description: Verifies tool collapse behavior/styles and cache-busted loading of the updated frontend assets. v1.2 updates the chatView cache-bust URL to 1.21; styles.css?v=1.19 stays.
 '''
 
 from __future__ import annotations
@@ -158,7 +158,7 @@ assert.ok(toolPreRule && /line-height:\s*1\.55/.test(toolPreRule[1]));
 assert.ok(collapsedRule && /max-height:\s*320px/.test(collapsedRule[1]));
 assert.ok(collapsedRule && /overflow-y:\s*auto/.test(collapsedRule[1]));
 assert.ok(indexSource.includes('href="/static/styles.css?v=1.19"'));
-assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.19"'));
+assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.21"'));
 console.log('tool card collapse: ok');
 '''
     result = subprocess.run(

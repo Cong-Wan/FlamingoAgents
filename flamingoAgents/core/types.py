@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.8
-Date: 2026-09-01
-Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.8 adds JSON-only providerData to chatMessage/toolCall for Responses opaque item persistence and replay while preserving empty defaults for old sessions.
+Version: 1.9
+Date: 2026-09-07
+Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.8 adds JSON-only providerData to chatMessage/toolCall for Responses opaque item persistence and replay while preserving empty defaults for old sessions. v1.9 adds usageUpdateEvent for per-model-call live usage without Web pricing fields.
 '''
 
 from __future__ import annotations
@@ -152,5 +152,13 @@ class retryNoticeEvent:
     status: str
 
 
+@dataclass
+class usageUpdateEvent:
+    usage: dict[str, int]
+    stepUsage: dict[str, int]
+    contextTokens: int
+
+
 # 终态事件：消费者收到时会话锁必然已释放（docs/streamOutputPlan.md §6.4）。
+# usageUpdateEvent 是非终态，不得加入此元组。
 terminalEventTypes = (completedEvent, confirmationRequiredEvent, errorEvent)

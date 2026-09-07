@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.21
-Date: 2026-09-02
-Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.21 writes modelRequestStart per attempt and merges adapter diag plus attempt/willRetry/backoffMs into modelError without changing retry semantics.
+Version: 1.22
+Date: 2026-09-07
+Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.21 writes modelRequestStart per attempt and merges adapter diag plus attempt/willRetry/backoffMs into modelError without changing retry semantics. v1.22 yields usageUpdateEvent after each model step with legal terminal usage, using an outer-step value-copied baseline.
 '''
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from flamingoAgents.core.types import (
     toolCallStartEvent,
     toolContext,
     toolResult,
+    usageUpdateEvent,
 )
 from flamingoAgents.tools.toolDefinition import toolDefinition
 from flamingoAgents.tools.toolPolicy import evaluateToolCall
@@ -197,6 +198,11 @@ class agent:
                     f'agent 模型循环 step={stepIndex + 1} sessionId={sessionId} '
                     f'messages={len(currentConversation.messages)} tools={len(modelTools)}'
                 )
+            usageTotalKeys = ('promptTokens', 'cachedTokens', 'completionTokens')
+            stepStart = {
+                key: int(currentConversation.usageTotal.get(key, 0) or 0)
+                for key in usageTotalKeys
+            }
             completion = None
             for attempt in range(MODEL_RETRY_MAX_ATTEMPTS + 1):
                 chunkSeen = False
@@ -289,10 +295,25 @@ class agent:
 
             responsePayload = getattr(completion, 'responsePayload', None)
             assistantMessage = completion.message
-            currentConversation.appendAssistantMessage(
-                assistantMessage,
-                responsePayload if isinstance(responsePayload, dict) else {},
+            safePayload = responsePayload if isinstance(responsePayload, dict) else {}
+            rawUsage = safePayload.get('usage')
+            hasTerminalUsage = isinstance(rawUsage, dict) and all(
+                isinstance(rawUsage.get(key), int)
+                and not isinstance(rawUsage.get(key), bool)
+                and rawUsage[key] >= 0
+                for key in ('prompt_tokens', 'completion_tokens')
             )
+            currentConversation.appendAssistantMessage(assistantMessage, safePayload)
+            if hasTerminalUsage:
+                usageNow = {
+                    key: int(currentConversation.usageTotal.get(key, 0) or 0)
+                    for key in usageTotalKeys
+                }
+                yield usageUpdateEvent(
+                    usage=usageNow,
+                    stepUsage={key: max(0, usageNow[key] - stepStart[key]) for key in usageTotalKeys},
+                    contextTokens=int(currentConversation.lastTurnTokens or 0),
+                )
             if not assistantMessage.toolCalls:
                 if self.debugConsole:
                     self.debugConsole.debug(f'模型循环完成 sessionId={sessionId} contentChars={len(assistantMessage.content)}')

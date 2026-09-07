@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.19
-Date: 2026-09-04
+Version: 1.21
+Date: 2026-09-07
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
@@ -45,6 +45,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              v1.18（skillInjectionDuplicationFixPlan）：/skill: wireText 加 <injected_skill> 定界包裹 + 强禁止句，防模型重复 read；
              新增 userBubbleText 折叠历史/attach 的注入块全文，气泡保持 /skill:名 + 补充文字。
              v1.19（toolArgsCollapsePlan）：工具入参复用出参折叠交互，统一长内容判据，支持限高滚动及展开全部。
+             v1.20 消费 usageUpdate；streamPost 绑定 session+stream+connectionId；latestBound 守卫 closed 空闲特例；本地 stop 等 POST 后再权威刷新。
+             v1.21 attach preInit 外层身份守卫，缓冲回放走绑定 connection。
 */
 (function () {
   'use strict';
@@ -64,6 +66,43 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
   var confirmPreviewRowEl = document.getElementById('confirmPreviewRow');
   var confirmPreviewEl = document.getElementById('confirmPreview');
   var confirmArgsEl = document.getElementById('confirmArgs');
+
+  var nextConnectionId = 1;
+  var latestBound = null;
+
+  function bindConnection(streamState) {
+    var connectionId = nextConnectionId++;
+    streamState.connectionId = connectionId;
+    latestBound = { sessionId: window.appStore.currentSessionId, connectionId: connectionId };
+    return connectionId;
+  }
+
+  function clearLatestBound() {
+    latestBound = null;
+  }
+
+  function isLatestBound(sessionId, connectionId) {
+    return !!(latestBound
+      && latestBound.sessionId === sessionId
+      && latestBound.connectionId === connectionId
+      && sessionId === window.appStore.currentSessionId);
+  }
+
+  function isCurrentConnection(sessionId, streamState, connectionId) {
+    return sessionId === window.appStore.currentSessionId
+      && window.appStore.stream === streamState
+      && streamState.connectionId === connectionId;
+  }
+
+  function onBoundEvent(sessionId, streamState, connectionId, event, data) {
+    if (!isCurrentConnection(sessionId, streamState, connectionId)) return;
+    onStreamEvent(event, data);
+  }
+
+  function onBoundFailed(sessionId, streamState, connectionId, error, meta) {
+    if (!isCurrentConnection(sessionId, streamState, connectionId)) return;
+    onStreamFailed(error, meta);
+  }
 
   // 工具卡片注册表：toolCallId → 卡片对象。历史卡片与新流事件按 id 命中更新（dangling 归位，契约 §5-M5）
   var toolCards = {};
@@ -773,6 +812,10 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         }
         break;
 
+      case 'usageUpdate': // 非终态：只重绘状态栏，不迁移 phase
+        window.statusBar.applyUsageUpdate(data);
+        break;
+
       case 'toolCallStart':
         if (data.toolCall) {
           if (stream.currentStep) flushAndCollapseThinking(stream.currentStep); // attach 首事件可能无 step（§5.2）
@@ -932,24 +975,44 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     return live;
   }
 
-  function onStreamClosed() {
-    var stream = window.appStore.stream;
-    // 连接关闭 = 泵线程已回写用量（先回写后哨兵，D7）；completed 已 goIdle 置空 stream 也需刷新，statusBar 内部防会话竞态
-    window.statusBar.refresh();
-    if (!stream) { focusComposerIfReady(); return; } // v1.11：completed/error/stopped 已 goIdle 置空 stream，早退前必须补 focus（F1 主路径）；切页/登录门由三守卫拦截
-    if (stream.phase === 'waitingConfirm') return; // 等用户确认，保持该态，不抢焦点
-    if (stream.phase === 'stopping') {
-      goIdle();
-      focusComposerIfReady(); // 本窗口点停止：早退分支单独补 focus（v1.10）
+  function onStreamClosed(closedSessionId, closedStream, closedConnectionId) {
+    if (closedSessionId !== window.appStore.currentSessionId) return;
+    if (closedStream.connectionId !== closedConnectionId) return;
+    if (!isLatestBound(closedSessionId, closedConnectionId)) return;
+
+    var currentStream = window.appStore.stream;
+    if (currentStream && currentStream !== closedStream) return;
+
+    function refreshIfStillLatest() {
+      if (!isLatestBound(closedSessionId, closedConnectionId)) return;
+      if (closedSessionId !== window.appStore.currentSessionId) return;
+      if (closedStream.connectionId !== closedConnectionId) return;
+      var latestStream = window.appStore.stream;
+      if (latestStream && latestStream !== closedStream) return;
+      void window.statusBar.refresh({ authoritative: true });
+    }
+    if (closedStream.stopRequest) {
+      void Promise.resolve(closedStream.stopRequest).catch(function () { return null; }).finally(refreshIfStillLatest);
+    } else {
+      refreshIfStillLatest();
+    }
+
+    if (!currentStream) {
+      focusComposerIfReady();
       return;
     }
-    if (!stream.terminalSeen) {
-      // 未收到任何终态事件连接断开 → 按「中断」处理（契约 §1.3）
+    if (currentStream.phase === 'waitingConfirm') return;
+    if (currentStream.phase === 'stopping') {
+      goIdle();
+      focusComposerIfReady();
+      return;
+    }
+    if (!currentStream.terminalSeen) {
       markInterrupted();
       showError('连接中断：未收到终态事件，刷新页面可恢复最新状态。');
     }
     goIdle();
-    focusComposerIfReady(); // 主收口：终态/中断/跨窗口 stopped 后的连接关闭（v1.10）
+    focusComposerIfReady();
   }
 
   var lastUserSend = null; // { text, attachments }：409 静默重试用，避免 composer 已清空导致 send() 空转
@@ -1057,7 +1120,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     }
 
     var step = createStep();
-    window.appStore.stream = {
+    var streamState = {
       phase: 'streaming',
       abort: null,
       currentStep: step,
@@ -1065,14 +1128,20 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       terminalSeen: false,
       pending: null
     };
+    window.appStore.stream = streamState;
     updateComposer();
 
     var body = { sessionId: sessionId, message: text };
     if (attachments.length > 0) body.attachments = attachments;
-    var handle = window.sse.streamPost('/api/chat/stream', body, onStreamEvent);
-    window.appStore.stream.abort = handle.abort;
-    handle.done.then(onStreamClosed).catch(function (error) {
-      onStreamFailed(error, { fromSend: true, isRetry: isRetry });
+    var connectionId = bindConnection(streamState);
+    var handle = window.sse.streamPost('/api/chat/stream', body, function (event, data) {
+      onBoundEvent(sessionId, streamState, connectionId, event, data);
+    });
+    streamState.abort = handle.abort;
+    handle.done.then(function () {
+      onStreamClosed(sessionId, streamState, connectionId);
+    }).catch(function (error) {
+      onBoundFailed(sessionId, streamState, connectionId, error, { fromSend: true, isRetry: isRetry });
     });
   }
 
@@ -1093,13 +1162,20 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     }
     updateComposer();
 
+    var connectionId = bindConnection(stream);
     var handle = window.sse.streamPost(
       '/api/chat/confirm',
       { sessionId: sessionId, confirmationId: pending.confirmationId, approved: approved },
-      onStreamEvent
+      function (event, data) {
+        onBoundEvent(sessionId, stream, connectionId, event, data);
+      }
     );
     stream.abort = handle.abort;
-    handle.done.then(onStreamClosed).catch(onStreamFailed);
+    handle.done.then(function () {
+      onStreamClosed(sessionId, stream, connectionId);
+    }).catch(function (error) {
+      onBoundFailed(sessionId, stream, connectionId, error);
+    });
   }
 
   async function stop() {
@@ -1114,10 +1190,10 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     markInterrupted(); // 立即停渲染 + 半截消息加「已中断」标记
     settleRunningCardsOnStop(); // 本窗口点停止：定格残留 running 卡片（本窗口 abort 后收不到后端 stopped 广播，走不到 handleStreamError）
     updateComposer();
-    // fire-and-forget：先发出 stop POST，再同步 abort 本窗口 SSE；保持 stopping 到 onStreamClosed。
-    var stopDone = window.api.stopChat(sessionId).catch(function () { return null; });
+    // fire-and-forget：先把 stop Promise 挂到本流对象，再同步 abort；权威 refresh 等 POST 完成尝试。
+    stream.stopRequest = window.api.stopChat(sessionId).catch(function () { return null; });
     if (stream.abort) stream.abort();
-    await stopDone;
+    await stream.stopRequest;
   }
 
   /* ---------- 会话装载 ---------- */
@@ -1153,26 +1229,30 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var placeholder = { phase: 'attaching', abort: null, currentStep: null, steps: [], terminalSeen: false, pending: null };
     window.appStore.stream = placeholder;
     updateComposer();
+    var connectionId = bindConnection(placeholder);
     var handle = window.sse.streamPost('/api/chat/attach', { sessionId: sessionId }, function (event, data) {
+      if (sessionId !== window.appStore.currentSessionId) return;
+      if (window.appStore.stream !== placeholder) return;
+      if (placeholder.connectionId !== connectionId) return;
       if (!initialized) {
         if (event !== 'streamResume') { preInitBuf.push({ event: event, data: data }); return; }
-        if (sessionId !== window.appStore.currentSessionId) return; // 已切走，丢弃迟到初始化
-        if (window.appStore.stream !== placeholder) return; // 已被新 attach 替换（A→B→A 快速重进）
         initAttachedStream(messages, data || {});
         initialized = true;
-        preInitBuf.forEach(function (item) { onStreamEvent(item.event, item.data); });
+        preInitBuf.forEach(function (item) {
+          onBoundEvent(sessionId, placeholder, connectionId, item.event, item.data);
+        });
         preInitBuf = null;
         return;
       }
-      onStreamEvent(event, data);
+      onBoundEvent(sessionId, placeholder, connectionId, event, data);
     });
     placeholder.abort = handle.abort;
     handle.done.then(function () {
       if (!initialized) { resetToHistoryState(false); return; } // 未初始化即结束（极端竞态）
-      onStreamClosed();
+      onStreamClosed(sessionId, placeholder, connectionId);
     }).catch(function (error) {
       if (!initialized) { resetToHistoryState(error.status !== 404, error); return; } // 404 静默；其余提示
-      onStreamFailed(error);
+      onBoundFailed(sessionId, placeholder, connectionId, error);
     });
 
     // 历史已在 attach 前渲染（含 pending），兜底只需复位 composer；404=无活跃流/竞态结束属常态，静默
@@ -1217,7 +1297,9 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
   window.chatView = {
     open: async function (sessionId) {
+      clearLatestBound();
       window.appStore.currentSessionId = sessionId;
+      window.statusBar.resetForSession(sessionId);
       stickToBottom = true;
       hideJumpToBottom();
       chatEmptyEl.classList.add('hidden');
@@ -1243,7 +1325,9 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     },
 
     showEmpty: function () {
+      clearLatestBound();
       window.appStore.currentSessionId = null;
+      window.statusBar.resetForSession(null);
       stickToBottom = true;
       hideJumpToBottom();
       topbarTitleEl.textContent = 'FlamingoAgents';
@@ -1261,6 +1345,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
     // 路由切走时：主动 abort 前端流（后端泵线程继续跑到终态，重进自愈，契约 §5）
     close: function () {
+      clearLatestBound();
+      window.statusBar.resetForSession(null);
       var stream = window.appStore.stream;
       if (stream && stream.abort) stream.abort();
       window.appStore.stream = null;

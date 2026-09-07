@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-09-02
-Description: Covers model stream diagnosis: adapter diag stages/timings, agent modelRequestStart and modelError retry fields, pumpError/sseGenError, resume ignoring unknown types, None headers safety, and diagnosis callbacks that must not mask the original exception.
+Version: 1.2
+Date: 2026-09-07
+Description: Covers model stream diagnosis: adapter diag stages/timings, agent modelRequestStart and modelError retry fields, pumpError/sseGenError, resume ignoring unknown types, None headers safety, and diagnosis callbacks that must not mask the original exception. v1.2 gives testPumpErrorWritesJsonl fakeAgent the production modelAdapter.config fields.
 '''
 
 from __future__ import annotations
@@ -403,6 +403,13 @@ def testPumpErrorWritesJsonl(tmp_path, monkeypatch) -> None:
         def __init__(self):
             self.sessionLocksGuard = threading.RLock()
             self.conversations = {'sess-pump': currentConversation}
+            self.modelAdapter = type('adapter', (), {
+                'config': type('cfg', (), {
+                    'configProviderId': 'volcano',
+                    'provider': 'volcano',
+                    'model': 'flash-test',
+                })(),
+            })()
 
     class boomStream:
         def __iter__(self):

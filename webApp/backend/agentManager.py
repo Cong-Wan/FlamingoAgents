@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.9
-Date: 2026-09-02
+Version: 1.11
+Date: 2026-09-07
 Description: sessionId → agent 实例缓存（懒建、模型配置变更后置失效标记惰性重建）、活跃流登记（同会话并发 409）、停止标志与泵线程结构。
             v1.1 随包改名调整 import（webApp.backend.*）。
             v1.2 迭代一（方案 §11.4）：泵线程流开始快照 usageTotal、终态算 delta 先写 usageStore.usageTurns（后回写 sessions 索引，原有回写不变）。
@@ -15,6 +15,8 @@ Description: sessionId → agent 实例缓存（懒建、模型配置变更后�
             v1.7 logDir 按会话 workDir 注入 ~/.flamingo/logs/webData/<workDir路径>/，不再用扁平 sessionLogsDir。
             v1.8 泵异常与 sseGen 意外异常落 jsonl（pumpError/sseGenError），只用 conversations.get，禁止 getConversation。
             v1.9 泵/sseGen 诊断落盘失败不得盖掉真正的流异常。
+            v1.10 固化泵实际模型；Core usageUpdate 转 DTO；中间只写 sessions usage/context；惰性 liveCost；终态锁外落账且异常不阻断 seal。
+            v1.11 生产直接读取 agent.modelAdapter.config，不再用 getattr/unknown 兜底掩盖缺失接口。
 '''
 
 from __future__ import annotations
@@ -25,10 +27,11 @@ import traceback
 from pathlib import Path
 
 from flamingoAgents import createAgent
-from flamingoAgents.core.types import errorEvent, reasoningDeltaEvent, terminalEventTypes, textDeltaEvent
+from flamingoAgents.core.types import errorEvent, reasoningDeltaEvent, terminalEventTypes, textDeltaEvent, usageUpdateEvent
 from flamingoAgents.utils.logPaths import ensureSessionLogDir
 
 from webApp.backend import sessionStore, usageStore
+from webApp.backend.sseCodec import usageUpdateDto
 
 managerLock = threading.RLock()
 agentCache: dict[str, object] = {}
@@ -155,7 +158,15 @@ class streamPump:
         self.stopFlag = threading.Event()
         self.doneEvent = threading.Event()
         self.usageRecorded = False
+        self.usageRecordLock = threading.Lock()
+        self.usageRecordDone = threading.Event()
         self.historyOverflowed = False
+        config = agentInstance.modelAdapter.config
+        self.pumpProviderId = str(config.configProviderId or config.provider)
+        self.pumpModelId = str(config.model)
+        self.liveCostState = 'pending'
+        self.dbBaseCost: float | None = None
+        self.pumpModelCost: dict | None = None
         self.startUsage = self._currentUsage()
         self.thread = threading.Thread(target=self._pump, daemon=True)
 
@@ -249,11 +260,74 @@ class streamPump:
             self._closeSubscribersLocked()
             self.doneEvent.set()
 
+    def _ensureLiveCostState(self) -> None:
+        if self.liveCostState != 'pending':
+            return
+        try:
+            dbBaseCost = usageStore.querySessionCost(self.sessionId)
+            costMap = usageStore.loadCostMap()
+            pumpModelCost = costMap.get(f'{self.pumpProviderId}/{self.pumpModelId}')
+        except Exception as error:
+            self.liveCostState = 'unavailable'
+            self.dbBaseCost = None
+            self.pumpModelCost = None
+            try:
+                self._logDiagEvent('liveCostInitError', error, traceback.format_exc())
+            except Exception:
+                pass
+            return
+        self.dbBaseCost = dbBaseCost
+        self.pumpModelCost = pumpModelCost
+        self.liveCostState = 'ready'
+
+    def _toUsageUpdateDto(self, event: usageUpdateEvent) -> usageUpdateDto:
+        try:
+            sessionStore.updateUsage(
+                self.sessionId,
+                event.usage,
+                contextTokens=event.contextTokens,
+                lastUsage=None,
+            )
+        except Exception as error:
+            try:
+                self._logDiagEvent('liveUsageIndexError', error, traceback.format_exc())
+            except Exception:
+                pass
+        self._ensureLiveCostState()
+        delta = {
+            key: max(0, int(event.usage[key]) - int(self.startUsage[key]))
+            for key in usageStore.tokenKeys
+        }
+        if self.liveCostState != 'ready' or self.dbBaseCost is None:
+            liveCost = None
+        else:
+            deltaCost = (
+                usageStore.calcTurnCost(
+                    delta['promptTokens'],
+                    delta['cachedTokens'],
+                    delta['completionTokens'],
+                    self.pumpModelCost,
+                )
+                if self.pumpModelCost
+                else 0.0
+            )
+            liveCost = self.dbBaseCost + deltaCost
+        return usageUpdateDto(
+            usage={key: int(event.usage[key]) for key in usageStore.tokenKeys},
+            stepUsage={key: int(event.stepUsage.get(key, 0) or 0) for key in usageStore.tokenKeys},
+            contextTokens=int(event.contextTokens),
+            cost=liveCost,
+        )
+
     def _pump(self) -> None:
         try:
             for event in self.stream:
-                if self.stopFlag.is_set():
+                if self.stopFlag.is_set() or self.doneEvent.is_set():
                     # requestStop 已广播 stopped；此处只跳出，避免泵再追加事件。
+                    break
+                if isinstance(event, usageUpdateEvent):
+                    event = self._toUsageUpdateDto(event)
+                if self.stopFlag.is_set() or self.doneEvent.is_set():
                     break
                 self._broadcast(event)
                 if isinstance(event, terminalEventTypes):
@@ -311,25 +385,46 @@ class streamPump:
         return {key: int(usage.get(key, 0) or 0) for key in ('promptTokens', 'cachedTokens', 'completionTokens')}
 
     def _recordUsage(self) -> None:
-        # 回写时机在泵线程结束（审核 L4）：客户端早断时泵仍跑到终态，回写值才完整。
-        # 会话可能尚未建 conversation（如 pendingConfirmationExists 直通错误），无则跳过。
-        # 顺序（方案 §11.4）：先写 usageTurns（账单，delta 任一项 >0 才写），后回写 sessions 索引（回写失败不丢账）。
-        # v1.6 幂等：requestStop 与泵 finally 都可能调用，首行守卫消除双记。
-        if self.usageRecorded:
+        # 锁内只认领，锁外 wait/I/O/set；requestStop 与泵 finally 竞争 at-most-once。
+        # 持久化异常只记诊断，不得阻断 unregister/seal。
+        with self.usageRecordLock:
+            if self.usageRecorded:
+                isOwner = False
+            else:
+                self.usageRecorded = True
+                isOwner = True
+
+        if not isOwner:
+            self.usageRecordDone.wait()
             return
-        self.usageRecorded = True
-        startUsage = self.startUsage
-        with self.agent.sessionLocksGuard:
-            currentConversation = self.agent.conversations.get(self.sessionId)
-        if currentConversation is None:
-            return
-        finalUsage = {key: int(currentConversation.usageTotal.get(key, 0) or 0) for key in startUsage}
-        delta = {key: finalUsage[key] - startUsage[key] for key in finalUsage}
-        meta = sessionStore.getSession(self.sessionId) or {}
-        usageStore.writeUsageTurn(self.sessionId, meta.get('providerId', 'unknown'), meta.get('modelId', ''), delta)
-        sessionStore.updateUsage(
-            self.sessionId,
-            finalUsage,
-            contextTokens=int(currentConversation.lastTurnTokens or 0),
-            lastUsage=delta,
-        )
+
+        try:
+            try:
+                with self.agent.sessionLocksGuard:
+                    currentConversation = self.agent.conversations.get(self.sessionId)
+                if currentConversation is None:
+                    return
+                finalUsage = {
+                    key: int(currentConversation.usageTotal.get(key, 0) or 0)
+                    for key in self.startUsage
+                }
+                delta = {key: finalUsage[key] - self.startUsage[key] for key in finalUsage}
+                usageStore.writeUsageTurn(
+                    self.sessionId,
+                    self.pumpProviderId,
+                    self.pumpModelId,
+                    delta,
+                )
+                sessionStore.updateUsage(
+                    self.sessionId,
+                    finalUsage,
+                    contextTokens=int(currentConversation.lastTurnTokens or 0),
+                    lastUsage=delta,
+                )
+            except Exception as error:
+                try:
+                    self._logDiagEvent('usageRecordError', error, traceback.format_exc())
+                except Exception:
+                    pass
+        finally:
+            self.usageRecordDone.set()

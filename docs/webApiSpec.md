@@ -1,10 +1,10 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.22
+> Version: 1.23
 > Date: 2026-09-07
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
-> 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 8 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
+> 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 9 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
 > v1.2：迭代一（webAppPlan §11）——新增 probeWorkDir 端点（§3.4）与 usage/series 端点（§3.10）；POST /api/sessions 的 workDir 改必填 + 新增 allowCreate；原 §3.4–3.8、§3.9–3.11 顺延为 §3.5–3.9、§3.11–3.13。
 > v1.2.1：按 pi 审核修订——§3.4 probe 响应加 `creatable`/`defaultWorkDir` 字段 + 补「存在但不是目录」情形；§3.10 时区写死服务器本地、byModel key 改 `providerId/modelId`、补双口径声明与 month 空范围语义。
@@ -26,6 +26,9 @@
 > v1.17：订阅模型配置候选——modelAuth 状态/任务增加 `credentialGeneration`；新增 §3.28 POST discovery。xAI 固定主机、禁止重定向、401 stale-token 单次刷新；响应只含安全候选且不写 models.yaml。
 > v1.17.1：模型目录 transport 遵循 `HTTPS_PROXY/NO_PROXY`，同时继续拒绝全部重定向；普通响应和 HTTPError body 均有界读取。
 > v1.18：ChatGPT Codex 模型候选改为固定 `/codex/models?client_version=0.153.4` 实时账户目录；新增 `live-account-catalog`、可见性/元数据过滤和 GPT-6 映射。
+> v1.19：逐模型调用 usageUpdate（非终态）；流中回写 sessions usage/context、不覆盖 lastUsage/不写 usageTurns；liveCost 临时、关闭后 status 权威；本地 abort 不是持久化完成信号。
+> v1.20：验收校正上游事件总数为 9（含非终态 usageUpdate）。
+> v1.23：落地逐模型调用 usageUpdate 的 sessions 中间回写、liveCost 与本地 abort 校准语义。
 > v1.21：会话索引也迁至 `~/.flamingo/logs/webData/sessions.json`；新索引缺失时复制尚存的仓库旧索引，之后统一在家目录读写；索引损坏显式报错而非返回空历史。
 > v1.22：历史读取兼容旧 JSON 事件数组及其后续 JSONL 追加；提供显式 sessionRecovery 工具重建已删除索引，DTO 与日常新建写入格式不变。
 
@@ -91,8 +94,9 @@
 - `sessionId`：新会话为本地时间 `YYMMDDHHmmss` + `-` + 8 位 hex（如 `260819115719-a1b2c3d4`）；存量 `session_*` 仍合法，API / 书签不改旧 ID；
 - `title`：默认「新会话」；**首条用户消息发出后后端自动改为消息前 20 字**；可经 PATCH 改名；
 - `modelId`：建会话时未指定则为该 provider 首个模型（与库 `selectModel` 行为一致），此处记录的是**实际生效值**；
-- `usage`：会话累计 token（来源 `conversation.usageTotal`，泵线程每轮结束后回写）；初始值 `{ "promptTokens": 0, "cachedTokens": 0, "completionTokens": 0 }`（审核 L6）；
-- `contextTokens`（v1.3 新增，可选字段）：最近一次模型调用的 prompt+completion tokens（来源 `conversation.lastTurnTokens`，泵线程终态随 usage 一并回写），用于状态栏「会话窗口剩余百分比」（§3.14）；老索引无此字段按 0 处理；
+- `usage`：会话累计 token（来源 `conversation.usageTotal`）；每个模型 step 收到合法 terminal usage 后可中间回写，泵终态再回写最终值；初始值 `{ "promptTokens": 0, "cachedTokens": 0, "completionTokens": 0 }`（审核 L6）；
+- `contextTokens`（v1.3 新增，可选字段）：最近一次模型调用的 prompt+completion tokens（来源 `conversation.lastTurnTokens`），可随模型 step 中间回写，泵终态再校准；老索引无此字段按 0 处理；
+- `lastUsage`：仍表示**最近一次完整泵流**增量，仅泵终态覆盖；中间 usage 回写不得改写该字段；
 - `updatedAt`：建会话、发消息、改名、切模型、用量回写时刷新。
 
 ### 2.2 message（历史消息 DTO，`GET /api/sessions/{id}/messages` 元素）
@@ -372,13 +376,14 @@
 ```
 
 - `gitBranch`：`git -C <workDir> rev-parse --abbrev-ref HEAD`（参数数组无 shell、timeout=2s）每次现查不缓存；非 git 仓库 / workDir 已删 / 超时 → `null`，不报错；
-- `usage` / `contextTokens` / `lastUsage`：**单一数据源为 sessions 索引**（泵线程先回写索引后放流结束哨兵，前端在 SSE 连接关闭后刷新必然拿到新值）；
-  - `usage`：**会话累计** token（OpenAI 原生语义，`promptTokens` 含 `cachedTokens` 子集）；状态栏 `↑↓⚡` 自 statusBar v1.3 起读此字段并前端减法归一化（`↑=max(0, promptTokens−cachedTokens)`、`↓=completionTokens`、`⚡=cachedTokens`，三者互不重叠、↑+⚡=总输入，对齐 pi footer）；
-  - `lastUsage`：**最近一轮（最近一次泵流）token 增量**，与写入 `usageTurns` 的 delta 同口径；字段保留，状态栏自 statusBar v1.3 起不再使用（v1.5 的「↑↓⚡ 应读此字段」指引已反转）。
+- `usage` / `contextTokens` / `lastUsage`：**单一数据源为 sessions 索引**；
+  - `usage`：**会话累计** token（OpenAI 原生语义，`promptTokens` 含 `cachedTokens` 子集）；每个模型 step 合法 terminal usage 后可中间回写，使流中 `GET status` 与 SSE `usageUpdate` 看到最新累计。状态栏 `↑↓⚡` 自 statusBar v1.3 起读此字段并前端减法归一化（`↑=max(0, promptTokens−cachedTokens)`、`↓=completionTokens`、`⚡=cachedTokens`，三者互不重叠、↑+⚡=总输入，对齐 pi footer）；
+  - `lastUsage`：**最近一轮（最近一次完整泵流）token 增量**，与写入 `usageTurns` 的 delta 同口径；**仅泵终态覆盖**，中间回写必须传 `lastUsage=null`。字段保留，状态栏自 statusBar v1.3 起不再使用（v1.5 的「↑↓⚡ 应读此字段」指引已反转）。
     - 读路径：优先 sessions 索引的 `lastUsage`；**索引缺该字段时回退** `usageTurns` 中该 sessionId `ORDER BY id DESC LIMIT 1`（保证进程重启 / 升级前会话仍能显示最近增量，而非全 0）；
     - 会话从未产生过任何 usageTurns 时为全 0；
-  - `contextTokens`：最近一次模型调用的 `promptTokens + completionTokens`（窗口占用估计，迭代二 §3.6）；
-- `cost`：usageTurns 按 sessionId 聚合、逐 turn 按其记录的 `providerId/modelId` 套 models.yaml 当前价求和（公式同 §3.10）——**会话累计费用**；泵流进行中落后一轮属预期；
+  - `contextTokens`：最近一次模型调用的 `promptTokens + completionTokens`（窗口占用估计，迭代二 §3.6），可随模型 step 中间回写；
+- `cost`：usageTurns 按 sessionId 聚合、逐 turn 按其记录的 `providerId/modelId` 套 models.yaml **查询时当前价**求和（公式同 §3.10）——**会话累计费用**。流中 SSE `usageUpdate.cost` 是泵级 liveCost（db 基线 + 本泵累计 delta，不写盘）；关闭后本接口为权威校准。本地 abort SSE **不是**持久化完成信号：本窗口 stop 须等 `POST /api/chat/stop` 完成尝试后再发权威 GET；
+- `usageTurns.providerId/modelId`：记录该泵启动时固化的实际 adapter `configProviderId/model`，不受流中 `/model` 改写 sessions 索引影响；
 - `contextWindow`：当前会话模型在 models.yaml 的 `contextWindow`；**yaml 缺失/损坏/模型无该字段 → `null` 且 cost 按 0 计，不影响其余字段**；
 - `contextUsedPercent`（v1.5）：**使用率** `clamp((contextTokens/contextWindow) × 100, 0, 100)` 保留 1 位小数；`contextWindow` 为 `null` 时该字段为 `null`。
   - **破坏性变更**：原 `contextRemainingPercent`（剩余率 `(1 − contextTokens/contextWindow)×100`）已移除，前端须改读 `contextUsedPercent`；
@@ -694,6 +699,7 @@
 | `toolCallStart` | `{ "toolCall": {"id","toolName","arguments"}, "preview": "path=/xx" }` | 工具进入执行 |
 | `toolCallEnd` | `{ "toolResult": {"toolCallId","toolName","isError","content","details"} }` | 工具完成；**拒绝路径会出现无配对 Start 的孤儿 End**（isError=true） |
 | `retryNotice` | `{ "message": "...", "attempt": 1, "retryAfterMs": 1000, "status": "waiting" }` | 非终态。模型调用连接建立期失败重试通知（v1.8 新增）；attempt 为第几次重试，retryAfterMs 为下次重试倒计时毫秒，status=waiting 为退避心跳；前端在消息下方显示「重试中」提示块，后续 textDelta/reasoningDelta/completed/error 到达时清除 |
+| `usageUpdate` | `{ "usage": {"promptTokens","cachedTokens","completionTokens"}, "stepUsage": {同三字段}, "contextTokens": 1793, "cost": 0.000286 }` | **非终态**（v1.19）。每个模型调用收到含标准输入/输出计数的完整 terminal usage 并 append 成功后恰好一条。`usage` 为会话累计 camelCase；`stepUsage` 为本 step 增量；`contextTokens` 为 `lastTurnTokens`。Core `usageUpdateEvent` 与 Web `usageUpdateDto` 映射为同一 SSE 事件名；正常 Web 路径带 `cost`（liveCost，初始化失败可为 `null`），Core 安全网帧无 `cost`。空/不完整/非法 usage 不发此事件。stopping 可忽略，由 closed 权威 refresh 校准 |
 | `confirmationRequired` | `{ "confirmationId": "confirm_...", "reason": "删除类命令需确认", "commandPreview": "rm -rf /tmp/x", "toolCall": {"id","toolName","arguments"} }` | **终态**。弹确认框；用 toolCall 先建「待确认」卡片 |
 | `completed` | `{ "message": "完整回复全文" }` | **终态**。message 与已拼接的 textDelta 全文一致（前端可直接用拼接结果，不必替换） |
 | `error` | `{ "message": "...", "errorType": "..." }` | **终态**。errorType 取值见下 |
@@ -706,10 +712,10 @@
 **典型事件序列**：
 
 ```
-纯文本：      textDelta* → completed
-免确认工具：  textDelta* → toolCallStart → toolCallEnd → textDelta* → completed
-需确认批准：  textDelta* → confirmationRequired ‖（新流）toolCallStart → toolCallEnd → textDelta* → completed
-需确认拒绝：  textDelta* → confirmationRequired ‖（新流）toolCallEnd(孤儿,isError=true) → textDelta* → completed
+纯文本：      textDelta* → usageUpdate → completed
+免确认工具：  textDelta* → usageUpdate → toolCallStart → toolCallEnd → textDelta* → usageUpdate → completed
+需确认批准：  textDelta* → usageUpdate → confirmationRequired ‖（新流）toolCallStart → toolCallEnd → textDelta* → usageUpdate → completed
+需确认拒绝：  textDelta* → usageUpdate → confirmationRequired ‖（新流）toolCallEnd(孤儿,isError=true) → textDelta* → usageUpdate → completed
 模型错误：    textDelta* → error
 ```
 
@@ -722,6 +728,7 @@
 - 200：`{ "stopped": true }`（置停止标志成功）或 `{ "stopped": false }`（该会话无活跃流，幂等不报错）；
 - 404：会话不存在；
 - **语义（webAppPlan §4.3-H1）**：非即时。SSE 连接在泵线程跑到下一个事件/当前 step 结束后关闭；停止后前端立即停渲染并给半截消息加「已中断」标记；半截文本不落 jsonl，刷新即消失；
+- **本地 abort ≠ 持久化完成（v1.19）**：本窗口 `abort()` 会使 SSE `done` 先于 `_recordUsage` resolve；前端须把 stop POST Promise 挂在本流上，UI 立即收口，权威 status GET 等 POST 完成尝试后再发（失败仍允许 best-effort GET，不宣称落账成功）；
 - **stopped 广播（v1.7）**：停止生效时泵向**所有订阅者**广播 `error` 帧（`errorType: "stopped"`）作为终态——停止发起方处于「停止中」态仅记录终态；其他 attach 窗口按「已中断」标记 + 静默回空闲处理。
 
 ### 4.5 POST /api/chat/attach —— 回放式重连（v1.7 新增，multiWindowStreamingPlan）
@@ -747,6 +754,7 @@ streamResume（首帧，必到）→ 泵 history 压缩回放（连续同类 tex
 ```
 [空闲] --发消息 POST stream--> [流式中]（输入禁用，按钮变停止）
 [流式中] --textDelta/reasoningDelta--> 增量渲染
+[流式中] --usageUpdate--> 只重绘状态栏，不迁移 phase
 [流式中] --toolCallStart/End--> 工具卡片更新（含 dangling 归位，见下）
 [流式中] --completed--> [空闲]（刷新会话列表：title/usage/updatedAt 已变）
 [流式中] --error(pendingConfirmationExists)--> GET pending --> [待确认]（重弹框）
