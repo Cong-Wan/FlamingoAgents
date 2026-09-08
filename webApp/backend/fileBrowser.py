@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-08-17
+Version: 1.4
+Date: 2026-09-07
 Description: workDir 文件浏览纯函数层（迭代二方案 §3.8）：is_relative_to 路径拘禁、目录列举（目录在前、单条目 stat 失败跳过、
             截断标记）、文本文件读取（二进制校验）；OSError 统一转 RuntimeError 中文消息走 400 透传，不落 fallback 500。
             v1.1 取消 maxFileBytes 单文件大小限制，readTextFile 不再校验文件大小，listDir 中 attachable 始终为 true。
@@ -11,18 +11,17 @@ Description: workDir 文件浏览纯函数层（迭代二方案 §3.8）：is_re
             v1.3（workDirPickerPlan §2.1）：新增 listAbsDirs--服务器绝对路径列目录，供新建会话 workDir 补全（无会话无 workDir，
             不走 resolveInside 拘禁）；expanduser、仅目录（follow_symlinks）、写死滤 dot 目录、单条目失败跳过、
             全量 name.lower() 排序后再截 maxEntries（刻意与 listDir 的物理序 early-break 不同，避免前缀匹配丢项）。
+            v1.4（fileMentionPathOnlyPlan）：buildAttachmentMessage 改为仅校验路径并输出真实绝对路径清单，不读正文、不解包、
+            不递归目录；删除 expandDirAttachment 与个数/内容预算常量；readTextFile 预览行为不变。
 '''
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
-maxTotalBytes = 1024 * 1024    # 附件合计上限
-maxAttachments = 8             # 单次附件个数上限
 maxEntries = 500               # 目录单层列举上限
-maxDirExpandFiles = 100        # 目录附件展开文件数上限
-attachmentCloseTag = '</attachment>'
 
 
 def resolveInside(workDir: str, relPath: str | None) -> Path:
@@ -105,99 +104,29 @@ def listAbsDirs(absPath: str) -> dict:
     return {'path': str(target), 'entries': [{'name': name, 'type': 'dir'} for name in names[:maxEntries]], 'truncated': truncated}
 
 
-def expandDirAttachment(workDir: str, relPath: str) -> dict:
-    # 目录附件展开（fileMentionFixPlan §3.3）：递归为「相对路径+内容」文本块。
-    # 安全：逐条目 resolve + is_relative_to 拦符号链接逃逸；visited（目录 realpath 集合，整树共享）防环防重复。
-    base = Path(workDir).resolve()
-    root = resolveInside(workDir, relPath)
-    if not root.is_dir():
-        raise RuntimeError(f'不是目录：{relPath}')
-    chunks = []
-    visited = set()
-    state = {'totalBytes': 0, 'fileCount': 0, 'skipped': 0, 'truncated': False}
-
-    def walk(directory: Path, prefix: str) -> None:
-        if state['truncated']:
-            return
-        realKey = str(directory.resolve())
-        if realKey in visited:
-            return
-        visited.add(realKey)
-        try:
-            with os.scandir(directory) as iterator:
-                children = sorted(iterator, key=lambda child: (not child.is_dir(follow_symlinks=True), child.name.lower()))
-        except OSError:
-            state['skipped'] += 1
-            return
-        for child in children:
-            if state['truncated']:
-                return
-            childRel = f'{prefix}/{child.name}' if prefix else child.name
-            try:
-                resolved = Path(child.path).resolve()
-                if not resolved.is_relative_to(base):
-                    state['skipped'] += 1  # 符号链接越出 workDir：跳过，不泄露
-                    continue
-                if resolved.is_dir():
-                    walk(resolved, childRel)
-                    continue
-                if not resolved.is_file():
-                    state['skipped'] += 1
-                    continue
-                if state['fileCount'] >= maxDirExpandFiles or state['totalBytes'] >= maxTotalBytes:
-                    state['truncated'] = True
-                    return
-                raw = resolved.read_bytes()
-            except OSError:
-                state['skipped'] += 1
-                continue
-            if b'\x00' in raw:
-                state['skipped'] += 1
-                continue
-            state['totalBytes'] += len(raw)
-            state['fileCount'] += 1
-            chunks.append(f'{childRel}:\n{raw.decode("utf-8", errors="replace")}')  # 解码与 readTextFile 对齐
-
-    walk(root, relPath)
-    if state['fileCount'] == 0:
-        raise RuntimeError(f'目录附件为空或无可读文本文件：{relPath}')
-    notes = []
-    if state['truncated']:
-        notes.append(f'[目录附件已截断：最多展开 {maxDirExpandFiles} 个文件或 {maxTotalBytes // 1024 // 1024}MB]')
-    if state['skipped']:
-        notes.append(f'[跳过 {state["skipped"]} 个二进制或不可读文件]')
-    content = '\n\n'.join(chunks)
-    if notes:
-        content += '\n\n' + '\n'.join(notes)
-    return {'content': content, 'totalBytes': state['totalBytes']}
-
-
 def buildAttachmentMessage(text: str, workDir: str, attachments: list[dict]) -> str:
-    # chat/stream 附件拼接（方案 §3.7）：校验路径/个数/合计大小/标记冲突，拼成 <attachment path="..."> 块。
-    # type='dir' 走目录展开（v1.2）；type 缺省按 file，旧调用零影响。
-    if len(attachments) > maxAttachments:
-        raise RuntimeError(f'附件个数超限（>{maxAttachments}）。')
-    blocks = []
-    totalBytes = 0
+    # chat/stream 路径引用拼接（fileMentionPathOnlyPlan）：只校验位置，输出真实绝对路径清单，不读正文。
+    encodedPaths = []
     for item in attachments:
-        relPath = item.get('path') if isinstance(item, dict) else None
-        if not isinstance(relPath, str) or not relPath.strip():
+        if not isinstance(item, dict):
+            raise RuntimeError('附件必须是对象。')
+        relPath = item.get('path')
+        if not isinstance(relPath, str) or relPath == '':
             raise RuntimeError('附件 path 必须是非空字符串。')
-        relPath = relPath.strip()
-        if isinstance(item, dict) and item.get('type') == 'dir':
-            dirInfo = expandDirAttachment(workDir, relPath)
-            content = dirInfo['content']
-            size = dirInfo['totalBytes']
-        else:
-            fileInfo = readTextFile(workDir, relPath)
-            content = fileInfo['content']
-            size = fileInfo['size']
-        if attachmentCloseTag in content:
-            raise RuntimeError(f'文件内容含附件标记 {attachmentCloseTag}，无法作为附件：{relPath}')
-        totalBytes += size
-        if totalBytes > maxTotalBytes:
-            raise RuntimeError(f'附件合计大小超限（>{maxTotalBytes // 1024 // 1024}MB）。')
-        blocks.append(f'<attachment path="{relPath}">\n{content}\n</attachment>')
-    parts = [text] if text else []
-    parts.extend(blocks)
-    return '\n\n'.join(parts)
+        if '\x00' in relPath:
+            raise RuntimeError('附件 path 含非法空字符。')
+        try:
+            target = resolveInside(workDir, relPath)
+            if not target.exists():
+                raise RuntimeError(f'路径不存在：{relPath}')
+            if not target.is_file() and not target.is_dir():
+                raise RuntimeError(f'不是文件或目录：{relPath}')
+        except OSError as error:
+            raise RuntimeError(f'路径不存在或不可访问：{relPath}（{error}）')
+        encodedPaths.append(json.dumps(str(target), ensure_ascii=False))
+    if not encodedPaths:
+        return text
+    lines = ['引用路径（仅提供位置，未读取内容）：']
+    lines.extend(f'- {path}' for path in encodedPaths)
+    block = '\n'.join(lines)
+    return f'{text}\n\n{block}' if text else block

@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.3
-Date: 2026-08-14
+Version: 1.4
+Date: 2026-09-07
 Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须为行首/空白（防 user@example.com 误触发），
              目录下钻、文件名过滤、attachable:false 置灰；选中文件生成 chip（输入框上方），发送时随 attachments 提交。
              键盘拦截与 slashCommand 同约（capture 阶段，§4.3）。
@@ -10,6 +10,7 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
              v1.3（fileMentionFixPlan）：①↑↓ 移动高亮后面板滚动跟随（补抄 slashCommand scrollActiveIntoView）；
              ②文件夹可选为附件——目录行尾加「选中」按钮（stopPropagation 防冒泡下钻），键盘 Enter=选中/Tab=下钻；
              chip 带 type（📄/📁 区分），getAttachments 返回 { path, type }。
+             v1.4（fileMentionPathOnlyPlan）：chip 仅为路径引用、去掉 8 个上限；选中仍不预读内容。
 */
 (function () {
   'use strict';
@@ -168,7 +169,7 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
       el.className = 'attachment-chip';
       var label = document.createElement('span');
       label.textContent = (chip.type === 'dir' ? '📁 ' : '📄 ') + chip.path;
-      label.title = chip.path;
+      label.title = chip.path + '（仅路径引用，不预读内容）';
       var remove = document.createElement('button');
       remove.className = 'attachment-chip-remove';
       remove.textContent = '✕';
@@ -189,10 +190,6 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
   function addChip(path, type) {
     for (var i = 0; i < chips.length; i++) {
       if (chips[i].path === path) return; // 去重
-    }
-    if (chips.length >= 8) {
-      if (window.toast) window.toast('附件最多 8 个');
-      return;
     }
     chips.push({ path: path, type: type === 'dir' ? 'dir' : 'file' });
     renderChips();

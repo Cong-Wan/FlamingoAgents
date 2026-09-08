@@ -1,6 +1,6 @@
 /*
 Author: wilbur
-Version: 1.21
+Version: 1.22
 Date: 2026-09-07
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
@@ -47,6 +47,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              v1.19（toolArgsCollapsePlan）：工具入参复用出参折叠交互，统一长内容判据，支持限高滚动及展开全部。
              v1.20 消费 usageUpdate；streamPost 绑定 session+stream+connectionId；latestBound 守卫 closed 空闲特例；本地 stop 等 POST 后再权威刷新。
              v1.21 attach preInit 外层身份守卫，缓冲回放走绑定 connection。
+             v1.22（fileMentionPathOnlyPlan）：当轮附件 chip tooltip 标明仅路径引用。
 */
 (function () {
   'use strict';
@@ -401,7 +402,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         var chip = document.createElement('span');
         chip.className = 'attachment-chip static';
         chip.textContent = (attachment.type === 'dir' ? '📁 ' : '📄 ') + attachment.path;
-        chip.title = attachment.path;
+        chip.title = attachment.path + '（仅路径引用，不预读内容）';
         chipRow.appendChild(chip);
       });
       bubble.appendChild(chipRow);

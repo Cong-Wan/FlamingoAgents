@@ -2,9 +2,9 @@
 
 <!--
 Author: wilbur
-Version: 1.0
+Version: 1.1
 Date: 2026-09-07
-Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history.
+Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history. v1.1：Web @ 改为仅路径引用，不预读文件内容。
 -->
 
 ## 现状能力
@@ -24,7 +24,7 @@ Description: Documents centralized session storage under ~/.flamingo and explici
 - **现代化对话界面**：流式逐字输出、思维链折叠、工具调用卡片（结果可折叠内滚动预览）、**工具确认框**（批准/拒绝续跑）；
 - **随时停止**：停止按钮 fire-and-forget 即时 abort，工具执行一并中断，多窗口间停止状态静默同步；
 - **多窗口并行流式**：同会话多标签页 attach 回放式重连，互不抢流；
-- **文件树与 @ 附件**：侧栏文件树浏览/读文件；输入框 `@` 唤起文件面板，目录可下钻也可整体选为附件（chip 📄/📁 区分，后端递归展开目录为文本块）；
+- **文件树与 @ 路径引用**：侧栏文件树浏览/读文件；输入框 `@` 唤起文件面板，目录可下钻也可整体选为引用（chip 📄/📁 区分）。发送时只把校验后的绝对路径交给模型，不预读内容、不解包；读取由 Agent 按需使用工具完成。能 `@` 不等于能在预览里打开该文件；
 - **斜杠命令**：`/new` 新会话、`/model` 会话内切换模型、`/skill:` 技能 chip（发送时拼技能正文，气泡不显示全文）；
 - **状态栏**：当前模型 / 最近一轮增量 tokens / 上下文使用率；
 - **会话管理**：每会话绑定独立 workDir（不存在可探测后创建）、历史持久化、重命名/删除；

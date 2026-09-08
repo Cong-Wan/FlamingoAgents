@@ -1,7 +1,7 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.23
+> Version: 1.24
 > Date: 2026-09-07
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 9 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
@@ -107,7 +107,7 @@
 { "kind": "user", "content": "阅读 @/xx 文件并总结", "timestamp": "..." }
 ```
 
-- **user content 可能含附件块标记（v1.3）**：`@文件` 发送的消息由后端拼接为 `<attachment path="相对路径">\n<文件全文>\n</attachment>` 块附在原文之后（§4.1）；前端回放时应将该块渲染为折叠 chip，path 需做字符集校验（仅 `[A-Za-z0-9_\-./]`）防手输伪造；
+- **user content 的 @ 引用（v1.24）**：新发送的 `@` 由后端拼为路径清单（§4.1），不含文件正文。历史消息仍可能含 v1.3 的 `<attachment path="相对路径">\n<文件全文>\n</attachment>` 块；前端回放旧块时应折叠为 chip，path 需做字符集校验（仅 `[A-Za-z0-9_\-./]`）防手输伪造；
 
 ```json
 {
@@ -416,17 +416,18 @@
 }
 ```
 
-- 排序：目录在前、文件在后，各自按名称（小写）排序；`attachable = size ≤ 512KB`（@面板置灰依据）；目录无 size/attachable 字段；
+- 排序：目录在前、文件在后，各自按名称（小写）排序；文件带 `size` 与 `attachable: true`（当前实现不按大小置灰；@ 引用也不再按 512KB 过滤）；目录无 size/attachable 字段；
 - **不屏蔽任何文件**：dotfiles（含 `.env`）与 `.git/` 全部照常返回（用户明示，凭证暴露风险由使用者自负）；
 - 单层超过 500 条截断并 `truncated: true`；单条目 stat 失败（坏符号链接/竞态删除）跳过该条目；
 - 400：路径越出 workDir（resolve + `Path.is_relative_to` 拘禁）、path 不是目录、目录不存在/不可读（OSError 统一转中文 400，不落 500）；404：会话不存在。
 
-### 3.17 GET /api/sessions/{sessionId}/fileContent —— 读文件内容（v1.3 新增，预览与@附件共用）
+### 3.17 GET /api/sessions/{sessionId}/fileContent —— 读文件内容（v1.3 新增，仅预览）
 
 请求：`GET .../fileContent?path=<相对路径>`（空 path → 400）
 
 - 200：`{ "path": "src/a.py", "size": 1234, "content": "<utf-8 文本>" }`（`errors='replace'` 解码）；
-- 400：路径越拘禁 / 不是文件 / 超过 512KB / 含 NUL 字节（二进制）/ 不存在或不可读；404：会话不存在。
+- 400：路径越拘禁 / 不是文件 / 含 NUL 字节（二进制）/ 不存在或不可读；404：会话不存在。
+- **与 @ 引用无关**：`@` 发送不走本端点；能引用不等于能预览。
 
 ### 3.18 POST /api/models/importPi —— 预览用户上传的 pi models.json（不写盘、不读盘）
 
@@ -668,9 +669,9 @@
 }
 ```
 
-- `attachments`（v1.3 新增，可选）：`@文件` 引用数组，≤ 8 个、合计 ≤ 1MB；每个 path 走与 §3.17 相同的拘禁/大小/文本校验，文件内容含 `</attachment>` 字面量 → 400 指明文件名；任一失败整请求 400；
-- **附件拼接（后端完成，落 jsonl 与发模型的是同一最终文本，resume 上下文一致）**：`<原文>\n\n<attachment path="...">\n<文件全文>\n</attachment>`（多块顺序追加）；
-- 标题口径：原文前 20 字；**纯附件发送（原文为空）时取第一个附件名前 20 字（含 `📄 ` 前缀）**。
+- `attachments`（v1.3 新增，可选；v1.24 语义改为路径引用）：`@` 引用数组，**无个数/内容大小产品上限**；每个 path 走 workDir 拘禁，目标必须是普通文件或目录；不读正文、不按 MIME/NUL/结束标记拒绝。空串、非字符串、path 含 NUL、越界或目标不存在 → 400；任一失败整请求 400；
+- **路径拼接（后端完成，落 jsonl 与发模型的是同一最终文本，resume 上下文一致）**：原文（可空）后追加 `引用路径（仅提供位置，未读取内容）：` 及逐行 JSON 字符串化的真实绝对路径；
+- 标题口径：原文前 20 字；**纯引用发送（原文为空）时取第一个附件名前 20 字（含 `📄 ` 前缀）**。
 
 预检（失败走 REST 错误，不开流）：sessionId 非法 → 400；会话不存在 → 404；**`message` trim 后为空且 `attachments` 为空 → 400**（v1.3 放宽：纯附件可发）；该会话有活跃流 → 409。
 
@@ -744,7 +745,7 @@ streamResume（首帧，必到）→ 泵 history 压缩回放（连续同类 tex
 ```
 
 - `streamResume.data.baseCount`：**泵启动前** `GET messages` 口径的消息条数（水位线）。前端重进会话时先全量渲染历史，attach 成功后以 `messages.slice(0, baseCount)` 截断重渲染，本次流已落盘的尾巴由回放事件重建——不丢不重；
-- `streamResume.data.userMessage`：本次流的用户消息最终文本（含附件块拼接，与落盘一致）；confirm 续跑流为 `null`——此时 `baseCount` 之后的 user 消息（queued 用户消息）需前端从 messages 补渲染；
+- `streamResume.data.userMessage`：本次流的用户消息最终文本（含路径引用拼接，与落盘一致）；confirm 续跑流为 `null`——此时 `baseCount` 之后的 user 消息（queued 用户消息）需前端从 messages 补渲染；
 - 多订阅者：同一会话允许任意多个 attach 与原始流并存（多窗口同步观看）；停止/终态向全体广播；
 - waitingConfirm 不是活跃流（泵在 confirmationRequired 终态已结束）→ attach 返 404，待确认恢复仍走 §3.8 GET pending；
 - 泵结束后随即注销，迟到 attach 只能命中「已关闭未注销」的极小竞态窗口——此时回放含终态帧，前端按终态正常收尾。

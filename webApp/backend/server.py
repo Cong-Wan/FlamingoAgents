@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.15
-Date: 2026-09-02
-Description: FastAPI application and authenticated REST/SSE routes. v1.14 adds no-store subscription model-candidate discovery with credential-generation race rejection and structured secret-free errors. v1.15 prints traceback in fallbackErrorHandler so pre-stream 500s leave a stderr stack.
+Version: 1.16
+Date: 2026-09-07
+Description: FastAPI application and authenticated REST/SSE routes. v1.14 adds no-store subscription model-candidate discovery with credential-generation race rejection and structured secret-free errors. v1.15 prints traceback in fallbackErrorHandler so pre-stream 500s leave a stderr stack. v1.16：chat/stream 附件注释改为路径引用，调用仍走 buildAttachmentMessage。
 '''
 
 from __future__ import annotations
@@ -569,7 +569,7 @@ def chatStream(body: dict = Body(...)):
         raise HTTPException(status_code=400, detail='message 与 attachments 不能同时为空。')
     session = requireSession(sessionId)
     if attachments:
-        # 后端拼接附件块（迭代二 §3.7）：落 jsonl 与发模型的都是拼接后文本，resume 上下文一致。
+        # 后端拼接路径引用（仅位置，不读内容）：落 jsonl 与发模型的都是拼接后文本，resume 上下文一致。
         cleanMessage = fileBrowser.buildAttachmentMessage(cleanMessage, session['workDir'], attachments)
     agentInstance = agentManager.getAgent(sessionId)
     stream = agentInstance.runUserMessageStream(cleanMessage, sessionId)
