@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.5
-Date: 2026-08-14
+Version: 1.6
+Date: 2026-09-08
 Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册表（/model 切换当前会话模型、/new 同目录新开会话），
              capture 阶段键盘拦截（§4.3，先于 chatView 的 Enter→send）；不命中指令按普通文本发送。
              另暴露 window.toast 轻提示（供 fileMention/fileExplorer 复用）。
@@ -10,6 +10,7 @@ Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册
              v1.3：页面加载/登录后拉一次技能列表常驻；/skill:名 并入同一套前缀过滤；选中后异步回填正文（会话守卫、不改 runItem）。
              v1.4：code review 修订——skill 项前缀过滤对 name 做 toLowerCase（白名单允许大写）；fillSkill 回填前检查输入框仍为空，防慢网覆盖草稿。
              v1.5：导出 reloadSkills；fillSkill 改为 pinSkillChip（#attachmentChips 蓝色 chip，不再灌 textarea）；window.skillChip {get,clear,pin}。
+             v1.6：/model 切换后刷新图片上传能力。
 */
 (function () {
   'use strict';
@@ -143,6 +144,7 @@ Description: 「/」快捷指令面板（迭代二方案 §4.4）：指令注册
       await window.sidebarView.refresh(); // 同步 appStore.sessions，syncTopbar 才读得到新 modelId
       window.chatView.syncTopbar();
       window.statusBar.refresh();
+      if (window.imageInput) window.imageInput.refreshCapability();
     } catch (error) {
       if (error.status === 409) {
         // 索引已是新模型，本轮仍跑旧模型（§3.3 语义）

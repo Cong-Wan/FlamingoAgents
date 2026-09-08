@@ -1,15 +1,15 @@
 '''
 Author: wilbur
-Version: 1.4
-Date: 2026-09-01
-Description: Loads model configuration without mutating process environment. v1.4 adds ChatGPT Codex/xAI Responses APIs, api-key/oauth auth types, canonical auth providers, optional OAuth apiKey, reasoning metadata, and xAI API key fallback while preserving old openai-completions defaults.
+Version: 1.5
+Date: 2026-09-08
+Description: Loads model configuration without mutating process environment. v1.4 adds ChatGPT Codex/xAI Responses APIs, api-key/oauth auth types, canonical auth providers, optional OAuth apiKey, reasoning metadata, and xAI API key fallback while preserving old openai-completions defaults. v1.5（imageInputPlan §3.1）新增 inputTypes 透传与派生 supportsImageInput；缺省 ['text']，YAML 显式 input 时校验列表与枚举。
 '''
 
 from __future__ import annotations
 
 import os
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -34,10 +34,15 @@ class modelConfig:
     configProviderId: str | None = None
     authProvider: str | None = None
     reasoning: bool = False
+    inputTypes: list[str] = field(default_factory=lambda: ['text'])
 
     def __post_init__(self) -> None:
         if self.configProviderId is None:
             self.configProviderId = self.provider
+
+    @property
+    def supportsImageInput(self) -> bool:
+        return 'image' in (self.inputTypes or [])
 
 
 @dataclass
@@ -150,6 +155,14 @@ def loadModelConfigFromYaml(
     if streamValue is not None and not isinstance(streamValue, bool):
         raise RuntimeError(f'provider {providerId} 模型 {selectedModelId} 的 stream 必须是布尔值。')
 
+    inputTypes = selectedModel.get('input')
+    if inputTypes is not None:
+        if not isinstance(inputTypes, list) or not all(isinstance(item, str) for item in inputTypes):
+            raise RuntimeError(f'provider {providerId} 模型 {selectedModelId} 的 input 必须是字符串数组。')
+        invalidInputs = [item for item in inputTypes if item not in ('text', 'image')]
+        if invalidInputs:
+            raise RuntimeError(f'provider {providerId} 模型 {selectedModelId} 的 input 仅允许 text/image：{invalidInputs}')
+
     headers = parseHeaders(providerConfig.get('headers'), selectedModel.get('headers'), providerId, selectedModelId)
 
     api = selectedModel.get('api') or providerConfig.get('api')
@@ -177,7 +190,7 @@ def loadModelConfigFromYaml(
         debugConsole.debug(
             f'从 YAML 加载模型配置 provider={providerId} model={selectedModelId} '
             f'baseUrl={baseUrl} api={api} auth={authType} '
-            f'thinking={thinking} reasoningEffort={reasoningEffort} stream={streamValue}'
+            f'thinking={thinking} reasoningEffort={reasoningEffort} stream={streamValue} input={inputTypes}'
         )
     return resolvedModelConfig(
         config=modelConfig(
@@ -194,6 +207,7 @@ def loadModelConfigFromYaml(
             reasoning=reasoning,
             stream=streamValue if streamValue is not None else True,
             headers=headers,
+            inputTypes=list(inputTypes) if isinstance(inputTypes, list) else ['text'],
         ),
         apiKey=apiKey,
     )

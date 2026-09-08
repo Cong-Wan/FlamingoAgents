@@ -1,25 +1,38 @@
 '''
 Author: wilbur
-Version: 1.16
-Date: 2026-09-07
-Description: FastAPI application and authenticated REST/SSE routes. v1.14 adds no-store subscription model-candidate discovery with credential-generation race rejection and structured secret-free errors. v1.15 prints traceback in fallbackErrorHandler so pre-stream 500s leave a stderr stack. v1.16：chat/stream 附件注释改为路径引用，调用仍走 buildAttachmentMessage。
+Version: 1.17
+Date: 2026-09-08
+Description: FastAPI application and authenticated REST/SSE routes. v1.14 adds no-store subscription model-candidate discovery with credential-generation race rejection and structured secret-free errors. v1.15 prints traceback in fallbackErrorHandler so pre-stream 500s leave a stderr stack. v1.16：chat/stream 附件注释改为路径引用，调用仍走 buildAttachmentMessage。v1.17（imageInputPlan）：chat/stream 支持 images 与 @ 图片快照、有界请求体、图片读取端点、删除会话时清理图片目录。
 '''
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import traceback
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from flamingoAgents.core.imageInput import (
+    checkMessageImageBudget,
+    decodeImageBase64,
+    imageInputError,
+    imageRefPattern,
+    loadImageByRef,
+    maxChatBodyBytes,
+    sessionImagesDir,
+    validateImageBytes,
+)
+from flamingoAgents.core.types import inputImage
 from flamingoAgents.models.modelConfig import loadModelConfigFromYaml
 from flamingoAgents.models.subscriptionModels import discoverSubscriptionModels, modelDiscoveryError
 from flamingoAgents.utils.logPaths import resolveSessionLogDir
@@ -82,6 +95,63 @@ def requireSession(sessionId: str) -> dict:
     if session is None:
         raise HTTPException(status_code=404, detail=f'会话不存在：{sessionId}')
     return session
+
+
+def mapImageError(error: imageInputError):
+    status = 413 if error.errorType == 'imageBudgetExceeded' else 400
+    raise HTTPException(status_code=status, detail=str(error))
+
+
+async def readBoundedJson(request: Request, maxBytes: int) -> dict:
+    chunks = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > maxBytes:
+            raise HTTPException(status_code=413, detail=f'请求体超过 {maxBytes // 1024 // 1024}MiB 上限。')
+        chunks.append(chunk)
+    raw = b''.join(chunks)
+    if not raw:
+        raise HTTPException(status_code=400, detail='请求体不是合法 JSON 或结构不符。')
+    try:
+        parsed = json.loads(raw.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail='请求体不是合法 JSON 或结构不符。')
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail='请求体不是合法 JSON 或结构不符。')
+    return parsed
+
+
+def parseUploadedImages(rawImages) -> list[inputImage]:
+    uploaded = []
+    for index, item in enumerate(rawImages):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f'images[{index}] 必须是对象。')
+        name = item.get('name') if isinstance(item.get('name'), str) and item.get('name') else f'image-{index + 1}'
+        data = item.get('data')
+        if not isinstance(data, str):
+            raise HTTPException(status_code=400, detail=f'images[{index}].data 必须是字符串。')
+        try:
+            raw, mimeType, size = decodeImageBase64(data, name)
+        except imageInputError as error:
+            mapImageError(error)
+        uploaded.append(inputImage(name=name, mimeType=mimeType, data=raw, bytes=size))
+    return uploaded
+
+
+def collectMentionImages(workDir: str, attachments: list) -> list[inputImage]:
+    collected = []
+    for item in attachments:
+        if not fileBrowser.isImageAttachment(item):
+            continue
+        relPath = item['path']
+        try:
+            raw = fileBrowser.readImageAttachment(workDir, relPath)
+            mimeType, size = validateImageBytes(raw, relPath)
+        except imageInputError as error:
+            mapImageError(error)
+        collected.append(inputImage(name=Path(relPath).name, mimeType=mimeType, data=raw, bytes=size))
+    return collected
 
 
 def sseResponse(pump, meta=None) -> StreamingResponse:
@@ -327,6 +397,21 @@ def getFileContent(sessionId: str, path: str = ''):
     return fileBrowser.readTextFile(session['workDir'], path)
 
 
+@authedApi.get('/sessions/{sessionId}/images/{ref}')
+def getSessionImage(sessionId: str, ref: str):
+    checkSessionId(sessionId)
+    requireSession(sessionId)
+    if not imageRefPattern.fullmatch(ref):
+        raise HTTPException(status_code=404, detail='图片不存在。')
+    session = requireSession(sessionId)
+    logPath = resolveSessionLogDir('webData', Path(session['workDir'])) / f'{sessionId}.jsonl'
+    try:
+        raw, mimeType = loadImageByRef(logPath, ref)
+    except imageInputError:
+        raise HTTPException(status_code=404, detail='图片不存在。')
+    return Response(content=raw, media_type=mimeType)
+
+
 @authedApi.patch('/sessions/{sessionId}')
 def renameSession(sessionId: str, body: dict = Body(...)):
     checkSessionId(sessionId)
@@ -351,6 +436,11 @@ def deleteSession(sessionId: str):
         logPath.unlink(missing_ok=True)
     except OSError as error:
         print(f'warning: 删除会话日志失败 {logPath}: {error}')
+    imagesDir = sessionImagesDir(logPath)
+    try:
+        shutil.rmtree(imagesDir, ignore_errors=True)
+    except OSError as error:
+        print(f'warning: 删除会话图片目录失败 {imagesDir}: {error}')
     agentManager.dropAgent(sessionId)
     return {'ok': True}
 
@@ -555,27 +645,52 @@ def importPiModels(body: dict = Body(...)):
 
 
 @authedApi.post('/chat/stream')
-def chatStream(body: dict = Body(...)):
+async def chatStream(request: Request):
+    body = await readBoundedJson(request, maxChatBodyBytes)
+    return await asyncio.to_thread(chatStreamSync, body)
+
+
+def chatStreamSync(body: dict):
     sessionId = checkSessionId(body.get('sessionId') if isinstance(body, dict) else None)
     requireSession(sessionId)
     message = body.get('message')
     if not isinstance(message, str):
         raise HTTPException(status_code=400, detail='message 必须是字符串。')
-    attachments = body.get('attachments') or []
-    if not isinstance(attachments, list):
+    attachments = body.get('attachments') if 'attachments' in body else []
+    if attachments is None or not isinstance(attachments, list):
         raise HTTPException(status_code=400, detail='attachments 必须是数组。')
+    if 'images' in body:
+        rawImages = body.get('images')
+        if not isinstance(rawImages, list):
+            raise HTTPException(status_code=400, detail='images 必须是数组。')
+    else:
+        rawImages = []
+    uploadedImages = parseUploadedImages(rawImages)
     cleanMessage = message.strip()
-    if not cleanMessage and not attachments:
+    if not cleanMessage and not attachments and not uploadedImages:
         raise HTTPException(status_code=400, detail='message 与 attachments 不能同时为空。')
     session = requireSession(sessionId)
     if attachments:
         # 后端拼接路径引用（仅位置，不读内容）：落 jsonl 与发模型的都是拼接后文本，resume 上下文一致。
         cleanMessage = fileBrowser.buildAttachmentMessage(cleanMessage, session['workDir'], attachments)
     agentInstance = agentManager.getAgent(sessionId)
-    stream = agentInstance.runUserMessageStream(cleanMessage, sessionId)
+    supportsImage = bool(getattr(getattr(agentInstance.modelAdapter, 'config', None), 'supportsImageInput', False))
+    if uploadedImages and not supportsImage:
+        raise HTTPException(status_code=400, detail='当前模型不支持图片输入。')
+    mentionImages = collectMentionImages(session['workDir'], attachments) if supportsImage else []
+    outgoingImages = uploadedImages + mentionImages
+    if outgoingImages:
+        try:
+            checkMessageImageBudget(outgoingImages)
+        except imageInputError as error:
+            mapImageError(error)
+    userImagesMeta: list[dict] = []
+    stream = agentInstance.runUserMessageStream(
+        cleanMessage, sessionId, images=outgoingImages, committedImages=userImagesMeta,
+    )
     # baseCount 水位线（multiWindowStreamingPlan §4.3）：生成器惰性，appendUserMessage 在泵线程首次迭代才发生，采样必然先于写盘。
     baseCount = len(historyView.loadMessages(sessionId))
-    streamMeta = {'baseCount': baseCount, 'userMessage': cleanMessage}
+    streamMeta = {'baseCount': baseCount, 'userMessage': cleanMessage, 'userImages': userImagesMeta}
     pump = agentManager.startStream(sessionId, agentInstance, stream, meta=streamMeta)
     if pump is None:
         # 宽容闸（stopResponsivenessPlan §4.1.A）：旧泵已 stopping 且会话锁空闲，
@@ -596,6 +711,8 @@ def chatStream(body: dict = Body(...)):
     if not titleSource and attachments:
         firstPath = attachments[0].get('path') if isinstance(attachments[0], dict) else ''
         titleSource = f'📄 {firstPath}'
+    if not titleSource and uploadedImages:
+        titleSource = uploadedImages[0].name
     sessionStore.setDefaultTitle(sessionId, titleSource[:20])
     sessionStore.touchSession(sessionId)
     return sseResponse(pump)
@@ -616,7 +733,7 @@ def chatConfirm(body: dict = Body(...)):
     baseCount = len(historyView.loadMessages(sessionId))
     pump = agentManager.startStream(
         sessionId, agentInstance, stream,
-        meta={'baseCount': baseCount, 'userMessage': None},
+        meta={'baseCount': baseCount, 'userMessage': None, 'userImages': []},
     )
     if pump is None:
         raise HTTPException(status_code=409, detail='该会话已有活跃流，请稍后再试。')

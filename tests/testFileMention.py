@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.0
+Version: 1.1
 Date: 2026-09-07
-Description: Accepts path-only @ references: no content inline, no count cap, archives allowed, preview NUL behavior unchanged.
+Description: Accepts path-only @ references: no content inline, no count cap, archives allowed, preview NUL behavior unchanged. v1.1 兼容 runUserMessageStream 的 images 关键字参数。
 '''
 
 from __future__ import annotations
@@ -222,8 +222,9 @@ def testPathOnlyArchiveHttpReachesAgent(archivePath: Path, monkeypatch: pytest.M
     def fakeGetAgent(_sessionId: str):
         agent = Mock()
 
-        def runUserMessageStream(message, _sid):
+        def runUserMessageStream(message, _sid, **_kwargs):
             captured['message'] = message
+            captured['images'] = _kwargs.get('images')
             return iter([])
 
         agent.runUserMessageStream.side_effect = runUserMessageStream

@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.5
-Date: 2026-09-07
+Version: 1.6
+Date: 2026-09-08
 Description: 库事件 dataclass → SSE 文本帧（ensure_ascii=False 单行 JSON），以及只消费订阅队列的 SSE 生成器（15s 空闲发 keep-alive 注释帧）。
             v1.1 多窗口并行（multiWindowStreamingPlan §4.2）：sseGen 签名改 (eventQueue, meta, pump)——attach 订阅首发
             streamResume 帧（baseCount/userMessage）；finally 经 pump.unsubscribe 反注册死订阅。
@@ -9,6 +9,7 @@ Description: 库事件 dataclass → SSE 文本帧（ensure_ascii=False 单行 J
             v1.3 非客户端断开的 sseGen 异常经 pump.logSseGenError 落盘后再 re-raise。
             v1.4 logSseGenError 失败不得盖掉真正的生成器异常。
             v1.5 永久编码 Core usageUpdateEvent 与 Web usageUpdateDto 为同一 usageUpdate SSE；DTO 固定定义于此。
+            v1.6（imageInputPlan）：encodeResumeFrame 增加 userImages（缺省 []）。
 '''
 
 from __future__ import annotations
@@ -109,7 +110,11 @@ def encodeSse(event) -> str:
 def encodeResumeFrame(meta: dict) -> str:
     # attach 订阅首帧（multiWindowStreamingPlan §4.2）：baseCount=泵启动前消息水位线；userMessage=本次流用户消息（confirm 流为 None）。
     payload = json.dumps(
-        {'baseCount': meta.get('baseCount', 0), 'userMessage': meta.get('userMessage')},
+        {
+            'baseCount': meta.get('baseCount', 0),
+            'userMessage': meta.get('userMessage'),
+            'userImages': meta.get('userImages') or [],
+        },
         ensure_ascii=False,
     )
     return f'event: streamResume\ndata: {payload}\n\n'

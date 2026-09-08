@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.2
-Date: 2026-09-07
-Description: Node assert coverage for statusUsage helpers and statusBar/chatView deferred races (usageRevision, stop POST, latestBound, confirm reuse, attach identity). v1.2 R7 equal-usage pending revision, rootPath/nodeHarness camelCase.
+Version: 1.3
+Date: 2026-09-08
+Description: Node assert coverage for statusUsage helpers and statusBar/chatView deferred races (usageRevision, stop POST, latestBound, confirm reuse, attach identity). v1.2 R7 equal-usage pending revision, rootPath/nodeHarness camelCase. v1.3 同步 chatView/styles cache-bust 到 1.23/1.20。
 '''
 
 from __future__ import annotations
@@ -906,7 +906,7 @@ def testIndexCacheBustOrder() -> None:
     index = (rootPath / 'webApp/frontend/index.html').read_text(encoding='utf-8')
     usagePos = index.find('src="/static/js/statusUsage.js?v=1.1"')
     barPos = index.find('src="/static/js/statusBar.js?v=1.6"')
-    chatPos = index.find('src="/static/js/chatView.js?v=1.21"')
-    stylesPos = index.find('href="/static/styles.css?v=1.19"')
+    chatPos = index.find('src="/static/js/chatView.js?v=1.23"')
+    stylesPos = index.find('href="/static/styles.css?v=1.22"')
     assert usagePos != -1 and barPos != -1 and chatPos != -1 and stylesPos != -1
     assert usagePos < barPos < chatPos

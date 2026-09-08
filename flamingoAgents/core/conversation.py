@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.12
-Date: 2026-09-01
-Description: Maintains and resumes per-session JSONL conversations. v1.12 persists JSON-safe assistant/toolCall providerData for Responses opaque replay, restores malformed/legacy values as empty objects, and keeps reasoning display text separate from model content.
+Version: 1.13
+Date: 2026-09-08
+Description: Maintains and resumes per-session JSONL conversations. v1.12 persists JSON-safe assistant/toolCall providerData for Responses opaque replay, restores malformed/legacy values as empty objects, and keeps reasoning display text separate from model content. v1.13（imageInputPlan）：userMessage 可选 images 引用字段、严格 JSONL 恢复、损坏 images 明确报错。
 '''
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from threading import RLock
 
+from flamingoAgents.core.imageInput import imageRefMeta, restoreImagesFromEvent
 from flamingoAgents.core.types import chatMessage, pendingConfirm, toolCall, toolResult
 from flamingoAgents.utils.jsonl import jsonlLog
 
@@ -44,7 +45,7 @@ class conversation:
         return pending
 
     def _resumeFromLog(self) -> None:
-        events = self.logger.readEvents()
+        events = self.logger.readEvents(strict=True)
         openCallIds: list[str] = []
         for event in events:
             eventType = event.get('type')
@@ -60,7 +61,11 @@ class conversation:
                 continue
             if eventType == 'userMessage':
                 self._closeOrphanToolCalls(openCallIds)
-                self.messages.append(chatMessage(role='user', content=event.get('content', '')))
+                self.messages.append(chatMessage(
+                    role='user',
+                    content=event.get('content', ''),
+                    images=restoreImagesFromEvent(event.get('images')),
+                ))
             elif eventType == 'assistantMessage':
                 self._closeOrphanToolCalls(openCallIds)
                 toolCalls = [
@@ -146,11 +151,15 @@ class conversation:
         self.logger.logEvent({'type': 'systemMessage', 'content': content})
         self.messages.append(chatMessage(role='system', content=content))
 
-    def appendUserMessage(self, content: str) -> None:
+    def appendUserMessage(self, content: str, images=None) -> None:
+        storedImages = list(images or [])
         if self.debugConsole:
-            self.debugConsole.debug(f'记录 userMessage chars={len(content)}')
-        self.logger.logEvent({'type': 'userMessage', 'content': content})
-        self.messages.append(chatMessage(role='user', content=content))
+            self.debugConsole.debug(f'记录 userMessage chars={len(content)} images={len(storedImages)}')
+        event = {'type': 'userMessage', 'content': content}
+        if storedImages:
+            event['images'] = [imageRefMeta(image) for image in storedImages]
+        self.logger.logEvent(event)
+        self.messages.append(chatMessage(role='user', content=content, images=storedImages))
 
     def appendAssistantMessage(self, message: chatMessage, responsePayload: dict) -> None:
         message.providerData = normalizeProviderData(message.providerData)

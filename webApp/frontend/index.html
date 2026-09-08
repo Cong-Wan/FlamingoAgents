@@ -1,8 +1,8 @@
 <!--
 Author: wilbur
-Version: 1.16
-Date: 2026-09-07
-Description: FlamingoAgents native Web UI shell. v1.16 cache-busts statusUsage.js?v=1.1, statusBar.js?v=1.6, chatView.js?v=1.21 for live-usage R7 pending revision.
+Version: 1.19
+Date: 2026-09-08
+Description: FlamingoAgents native Web UI shell. v1.19 加号为入口，悬停/点击弹出二级菜单再上传图片；styles.css?v=1.22。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -12,7 +12,7 @@ Description: FlamingoAgents native Web UI shell. v1.16 cache-busts statusUsage.j
   <title>FlamingoAgents</title>
   <link rel="icon" type="image/png" href="/static/flamingo.png">
   <link rel="stylesheet" href="/static/vendor/highlight-theme.min.css">
-  <link rel="stylesheet" href="/static/styles.css?v=1.19">
+  <link rel="stylesheet" href="/static/styles.css?v=1.22">
 </head>
 <body>
   <!-- 登录门：无 token 或任意请求 401 时全屏遮罩 -->
@@ -64,7 +64,26 @@ Description: FlamingoAgents native Web UI shell. v1.16 cache-busts statusUsage.j
           </div>
           <footer class="composer">
             <div id="attachmentChips" class="attachment-chips hidden"></div>
+            <div id="imageDrafts" class="image-drafts hidden"></div>
             <div class="composer-row">
+              <div class="composer-attach" id="imageAddWrap">
+                <input id="imageFileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp" multiple>
+                <button id="imageAddButton" class="image-add-button" type="button" title="添加" disabled aria-label="添加" aria-haspopup="menu" aria-expanded="false" aria-controls="imageAddMenu">
+                  <svg class="image-add-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path class="image-add-plus" d="M12 5v14M5 12h14"/>
+                  </svg>
+                </button>
+                <div id="imageAddMenu" class="image-add-menu hidden" role="menu">
+                  <button type="button" id="imageUploadMenuItem" class="image-add-menu-item" role="menuitem" disabled>
+                    <svg class="image-add-menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <rect x="3.5" y="5.5" width="17" height="13" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.7"/>
+                      <path d="M5 16.2l4.2-4.4 2.6 2.5 3.2-3.8 4.5 5.7H5z" fill="currentColor"/>
+                      <circle cx="15.4" cy="9.1" r="1.35" fill="currentColor"/>
+                    </svg>
+                    上传图片
+                  </button>
+                </div>
+              </div>
               <div class="composer-input-wrap">
                 <textarea id="composerInput" class="composer-input" rows="1"
                           placeholder="输入消息，Enter 发送，Shift+Enter 换行；/ 指令，/skill:名 引用技能，@ 引用文件" disabled></textarea>
@@ -287,9 +306,10 @@ Description: FlamingoAgents native Web UI shell. v1.16 cache-busts statusUsage.j
   <script src="/static/js/statusUsage.js?v=1.1"></script>
   <script src="/static/js/statusBar.js?v=1.6"></script>
   <script src="/static/js/slashCommand.js"></script>
-  <script src="/static/js/fileMention.js"></script>
+  <script src="/static/js/fileMention.js?v=1.5"></script>
   <script src="/static/js/fileExplorer.js"></script>
-  <script src="/static/js/chatView.js?v=1.21"></script>
+  <script src="/static/js/imageInput.js?v=1.2"></script>
+  <script src="/static/js/chatView.js?v=1.23"></script>
   <script src="/static/js/subscriptionModels.js"></script>
   <script src="/static/js/settingsView.js"></script>
   <script src="/static/js/skillsView.js"></script>

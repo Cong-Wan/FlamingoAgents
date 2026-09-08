@@ -2,9 +2,9 @@
 
 <!--
 Author: wilbur
-Version: 1.1
-Date: 2026-09-07
-Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history. v1.1：Web @ 改为仅路径引用，不预读文件内容。
+Version: 1.2
+Date: 2026-09-08
+Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history. v1.1：Web @ 改为仅路径引用，不预读文件内容。v1.2：模型勾选 image 后支持图片输入（上传落盘 + @ 图片快照，请求体 data URL）。
 -->
 
 ## 现状能力
@@ -25,6 +25,7 @@ Description: Documents centralized session storage under ~/.flamingo and explici
 - **随时停止**：停止按钮 fire-and-forget 即时 abort，工具执行一并中断，多窗口间停止状态静默同步；
 - **多窗口并行流式**：同会话多标签页 attach 回放式重连，互不抢流；
 - **文件树与 @ 路径引用**：侧栏文件树浏览/读文件；输入框 `@` 唤起文件面板，目录可下钻也可整体选为引用（chip 📄/📁 区分）。发送时只把校验后的绝对路径交给模型，不预读内容、不解包；读取由 Agent 按需使用工具完成。能 `@` 不等于能在预览里打开该文件；
+- **图片输入**：模型配置勾选 `image` 后，可通过按钮/粘贴/拖入发送 PNG/JPEG/WebP（单张 5MiB、单条最多 4 张）。图片落在会话日志旁的 `{sessionId}.images/`，JSONL 只记引用；`@` 到图片文件时先确认存在再快照编码进模型请求。未勾选 image 时上传图会被拒绝，`@` 图片回退为路径引用；
 - **斜杠命令**：`/new` 新会话、`/model` 会话内切换模型、`/skill:` 技能 chip（发送时拼技能正文，气泡不显示全文）；
 - **状态栏**：当前模型 / 最近一轮增量 tokens / 上下文使用率；
 - **会话管理**：每会话绑定独立 workDir（不存在可探测后创建）、历史持久化、重命名/删除；

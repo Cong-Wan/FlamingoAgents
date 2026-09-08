@@ -1,16 +1,18 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-08-19
+Version: 1.4
+Date: 2026-09-08
 Description: 会话 jsonl 事件 → GET messages 的 UI 消息 DTO：过滤 systemMessage/modelError/timings，usage 按契约 §2.2-M1 嵌套字段归一化，tool.details 原样透传。
             v1.1 随包改名调整 import（webApp.backend.*）。v1.2（fixPlan Phase2）：assistant DTO 透传 event.reasoning（非空才带，供前端 thinking 历史渲染）。
             v1.3 按 sessions 索引 workDir 定位 ~/.flamingo/logs/webData/<folder>/{sessionId}.jsonl；不存在则直接返回 []（不构造 jsonlLog，零 mkdir）。
+            v1.4（imageInputPlan）：user DTO 增加 images 引用元数据（无 base64）；严格读取 JSONL。
 '''
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from flamingoAgents.core.imageInput import imageRefMeta, restoreImagesFromEvent
 from flamingoAgents.utils.jsonl import jsonlLog
 from flamingoAgents.utils.logPaths import resolveSessionLogDir
 
@@ -39,16 +41,18 @@ def loadMessages(sessionId: str) -> list[dict]:
     logPath = resolveSessionLogDir('webData', Path(meta['workDir'])) / f'{sessionId}.jsonl'
     if not logPath.exists():
         return []
-    events = jsonlLog(logPath).readEvents()
+    events = jsonlLog(logPath).readEvents(strict=True)
     messages: list[dict] = []
     for event in events:
         eventType = event.get('type')
         timestamp = event.get('timestamp')
         if eventType == 'userMessage':
+            images = [imageRefMeta(image) for image in restoreImagesFromEvent(event.get('images'))]
             messages.append({
                 'kind': 'user',
                 'content': event.get('content', ''),
                 'timestamp': timestamp,
+                'images': images,
             })
         elif eventType == 'assistantMessage':
             toolCalls = [

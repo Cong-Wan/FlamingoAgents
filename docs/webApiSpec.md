@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.24
-> Date: 2026-09-07
+> Version: 1.25
+> Date: 2026-09-08
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 9 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -665,15 +665,19 @@
 {
   "sessionId": "session_0bcd11873ded",
   "message": "用户消息",
-  "attachments": [{ "path": "src/main.py" }]
+  "attachments": [{ "path": "src/main.py" }],
+  "images": [{ "name": "shot.png", "mimeType": "image/png", "data": "<base64 无前缀>" }]
 }
 ```
 
 - `attachments`（v1.3 新增，可选；v1.24 语义改为路径引用）：`@` 引用数组，**无个数/内容大小产品上限**；每个 path 走 workDir 拘禁，目标必须是普通文件或目录；不读正文、不按 MIME/NUL/结束标记拒绝。空串、非字符串、path 含 NUL、越界或目标不存在 → 400；任一失败整请求 400；
+- `images`（v1.25 可选）：上传图片数组，元素 `{name,mimeType,data}`（data 为无 data URL 前缀的 base64）。模型未勾选 image → 400。单张 5MiB / 单条 4 张 / 合计 10MiB / 请求体 16MiB；超限 413。PNG/JPEG/WebP，其它格式 400。
+- `@` 图片（v1.25）：attachments 中扩展名为 png/jpg/jpeg/webp 的普通文件，在模型勾选 image 时额外读取快照并进入 images 通道（路径清单仍保留）；未勾选 image 时只走路径引用。
 - **路径拼接（后端完成，落 jsonl 与发模型的是同一最终文本，resume 上下文一致）**：原文（可空）后追加 `引用路径（仅提供位置，未读取内容）：` 及逐行 JSON 字符串化的真实绝对路径；
-- 标题口径：原文前 20 字；**纯引用发送（原文为空）时取第一个附件名前 20 字（含 `📄 ` 前缀）**。
+- 标题口径：原文前 20 字；**纯引用发送（原文为空）时取第一个附件名前 20 字（含 `📄 ` 前缀）**；纯图片发送取第一张图片名。
+- GET `/api/sessions/{sessionId}/images/{ref}`（v1.25）：鉴权后返回会话图片文件；ref 必须匹配 `img-<12位hex>.(png|jpg|webp)`，越权 404。
 
-预检（失败走 REST 错误，不开流）：sessionId 非法 → 400；会话不存在 → 404；**`message` trim 后为空且 `attachments` 为空 → 400**（v1.3 放宽：纯附件可发）；该会话有活跃流 → 409。
+预检（失败走 REST 错误，不开流）：sessionId 非法 → 400；会话不存在 → 404；**`message` trim 后为空且 `attachments` 为空且 `images` 为空 → 400**；该会话有活跃流 → 409。
 
 通过后返回 `text/event-stream`，事件序列见 §4.3。
 

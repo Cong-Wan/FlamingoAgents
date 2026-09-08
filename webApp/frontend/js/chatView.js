@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.22
-Date: 2026-09-07
+Version: 1.23
+Date: 2026-09-08
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
@@ -48,6 +48,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              v1.20 消费 usageUpdate；streamPost 绑定 session+stream+connectionId；latestBound 守卫 closed 空闲特例；本地 stop 等 POST 后再权威刷新。
              v1.21 attach preInit 外层身份守卫，缓冲回放走绑定 connection。
              v1.22（fileMentionPathOnlyPlan）：当轮附件 chip tooltip 标明仅路径引用。
+             v1.23（imageInputPlan）：发送/历史/attach 渲染用户图片；失败恢复图片草稿。
 */
 (function () {
   'use strict';
@@ -388,8 +389,47 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     return '/skill:' + match[1] + (match[2] ? '\n' + match[2] : '');
   }
 
+  function openLightbox(src, alt) {
+    var mask = document.createElement('div');
+    mask.className = 'image-lightbox';
+    var img = document.createElement('img');
+    img.src = src;
+    img.alt = alt || '图片';
+    mask.appendChild(img);
+    mask.addEventListener('click', function () {
+      if (mask.parentNode) mask.parentNode.removeChild(mask);
+    });
+    document.body.appendChild(mask);
+  }
+
+  function appendUserImages(bubble, images) {
+    if (!images || images.length === 0) return;
+    var row = document.createElement('div');
+    row.className = 'user-image-row';
+    var sessionId = window.appStore.currentSessionId;
+    images.forEach(function (image) {
+      var img = document.createElement('img');
+      img.className = 'user-image-thumb';
+      img.alt = image.name || '图片';
+      if (image.objectUrl) {
+        img.src = image.objectUrl;
+      } else if (image.ref && sessionId && window.imageInput) {
+        window.imageInput.loadThumb(sessionId, image.ref).then(function (url) {
+          img.src = url;
+        }).catch(function () {
+          img.alt = (image.name || '图片') + '（加载失败）';
+        });
+      }
+      img.addEventListener('click', function () {
+        if (img.src) openLightbox(img.src, image.name);
+      });
+      row.appendChild(img);
+    });
+    bubble.appendChild(row);
+  }
+
   // sentAttachments：本次发送的 chip 列表（仅显示路径）；为空则按历史消息解析 attachment 块
-  function appendUserMessage(content, sentAttachments) {
+  function appendUserMessage(content, sentAttachments, sentImages) {
     var row = document.createElement('div');
     row.className = 'msg msg-user';
     var bubble = document.createElement('div');
@@ -418,6 +458,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       }
       appendTextSegment(bubble, last > 0 ? content.slice(last).trim() : content);
     }
+    appendUserImages(bubble, sentImages);
     row.appendChild(bubble);
     messageListEl.appendChild(row);
     scrollToBottom();
@@ -641,7 +682,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var lastAssistant = null;
     messages.forEach(function (msg) {
       if (msg.kind === 'user') {
-        appendUserMessage(msg.content);
+        appendUserMessage(msg.content, null, msg.images);
       } else if (msg.kind === 'assistant') {
         lastAssistant = appendAssistantHistory(msg, toolResults, pending);
       }
@@ -757,6 +798,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       sendButton.classList.remove('stop');
     }
     syncStreamIndicator();
+    if (window.imageInput) window.imageInput.syncButton();
   }
 
   // 回答结束后光标回落输入框（composerFocusShortcutPlan §3.2）：仅聊天页可见、输入框可用、无弹层时聚焦
@@ -1034,6 +1076,13 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         return;
       }
     }
+    if (meta.fromSend && (error.status === 400 || error.status === 413) && lastUserSend
+        && lastUserSend.sessionId === window.appStore.currentSessionId) {
+      composerInput.value = lastUserSend.composerText || '';
+      autoResize();
+      if (window.fileMention) window.fileMention.restoreChips(lastUserSend.attachments);
+      if (window.imageInput) window.imageInput.restoreDrafts(lastUserSend.imageDrafts);
+    }
     lastUserSend = null;
     showError(error.message);
     goIdle();
@@ -1060,16 +1109,20 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var isRetry = !!options.retry && options.payload;
     var text;
     var attachments;
+    var imagePayload = [];
     if (isRetry) {
       if (window.appStore.stream !== null) return;
       text = options.payload.text;
       attachments = options.payload.attachments || [];
+      imagePayload = options.payload.images || [];
     } else {
       if (sendButton.disabled) return; // await 期间挡双击/连按 Enter
       var chip = window.skillChip && window.skillChip.get();
       var userText = composerInput.value.trim();
       attachments = window.fileMention.getAttachments();
-      if (!chip && !userText && attachments.length === 0) return; // D8：纯附件可发；chip 单独也可发
+      imagePayload = window.imageInput ? window.imageInput.payload() : [];
+      var imageDisplay = window.imageInput ? window.imageInput.displayImages() : [];
+      if (!chip && !userText && attachments.length === 0 && imagePayload.length === 0) return; // D8：纯附件可发；chip 单独也可发
       if (chip) window.skillChip.clear(); // 同步定界：先摘 chip，防双击重复取
       composerInput.value = '';
       autoResize();
@@ -1110,13 +1163,29 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
           : userText;
         displayText = '/skill:' + chip.name + (userText ? '\n' + userText : '');
       }
-      if (!wireText && attachments.length === 0) {
+      if (!wireText && attachments.length === 0 && imagePayload.length === 0) {
         sendButton.disabled = false;
         return;
       }
-      appendUserMessage(displayText, attachments);
+      if (window.imageInput && !window.imageInput.supportsImage()) {
+        var mentionHasImage = attachments.some(function (item) {
+          return window.imageInput.isImagePath(item.path);
+        });
+        if (mentionHasImage && window.toast) {
+          window.toast('当前模型不支持图片，@ 图片将以路径引用发送');
+        }
+      }
+      appendUserMessage(displayText, attachments, imageDisplay);
       window.fileMention.clearChips();
-      lastUserSend = { text: wireText, attachments: attachments };
+      if (window.imageInput) window.imageInput.clearDrafts(false);
+      lastUserSend = {
+        sessionId: sessionId,
+        text: wireText,
+        composerText: userText,
+        attachments: attachments,
+        images: imagePayload,
+        imageDrafts: imageDisplay
+      };
       text = wireText;
     }
 
@@ -1134,6 +1203,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
     var body = { sessionId: sessionId, message: text };
     if (attachments.length > 0) body.attachments = attachments;
+    if (imagePayload.length > 0) body.images = imagePayload;
     var connectionId = bindConnection(streamState);
     var handle = window.sse.streamPost('/api/chat/stream', body, function (event, data) {
       onBoundEvent(sessionId, streamState, connectionId, event, data);
@@ -1271,8 +1341,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     // baseCount 水位线截断：本次流已落盘的尾巴由事件回放重建，不丢不重（§3.1）
     var baseCount = Math.min(meta.baseCount || 0, messages.length);
     renderHistory(messages.slice(0, baseCount), null);
-    if (meta.userMessage) {
-      appendUserMessage(meta.userMessage); // 历史渲染同构（ATTACHMENT_RE 解析附件块）
+    if (typeof meta.userMessage === 'string') {
+      appendUserMessage(meta.userMessage, null, meta.userImages); // 历史渲染同构（ATTACHMENT_RE 解析附件块）
     } else {
       // confirm 流（userMessage=null）可能中途落盘 queued 用户消息（agent.py driveConfirmation）：
       // baseCount 之后的 user 消息不在回放事件里，需补渲染（位置近似，§6-E13 已声明）
@@ -1309,6 +1379,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       window.chatView.syncTopbar();
       updateComposer();
       window.fileMention.resetForSession();
+      if (window.imageInput) window.imageInput.resetForSession();
       if (window.skillChip) window.skillChip.clear();
       window.fileExplorer.open();
       try {
@@ -1340,6 +1411,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       window.statusBar.hide();
       window.fileExplorer.hide();
       window.fileMention.resetForSession();
+      if (window.imageInput) window.imageInput.resetForSession();
       if (window.skillChip) window.skillChip.clear();
       updateComposer();
     },

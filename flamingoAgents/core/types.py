@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.9
-Date: 2026-09-07
-Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.8 adds JSON-only providerData to chatMessage/toolCall for Responses opaque item persistence and replay while preserving empty defaults for old sessions. v1.9 adds usageUpdateEvent for per-model-call live usage without Web pricing fields.
+Version: 1.10
+Date: 2026-09-08
+Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.8 adds JSON-only providerData to chatMessage/toolCall for Responses opaque item persistence and replay while preserving empty defaults for old sessions. v1.9 adds usageUpdateEvent for per-model-call live usage without Web pricing fields. v1.10（imageInputPlan §3.2）新增 inputImage 与 chatMessage.images（default []，仅 user 消息使用）及 runResult.errorType，供图片输入链路使用。
 '''
 
 from __future__ import annotations
@@ -25,6 +25,15 @@ class toolCall:
 
 
 @dataclass
+class inputImage:
+    name: str
+    mimeType: str
+    data: bytes = b''          # 入口传入原始字节；恢复历史时为空，构造请求前按 ref 加载
+    ref: str = ''              # 落盘后生成的存储文件名（img-<12位hex>.<ext>）
+    bytes: int = 0             # 原始字节数
+
+
+@dataclass
 class chatMessage:
     role: messageRole
     content: str
@@ -32,6 +41,7 @@ class chatMessage:
     toolCallId: str | None = None
     name: str | None = None
     providerData: dict[str, Any] = field(default_factory=dict)
+    images: list[inputImage] = field(default_factory=list)  # 仅 user 消息携带（imageInputPlan）
 
 
 @dataclass
@@ -66,6 +76,7 @@ class runResult:
     reason: str | None = None
     commandPreview: str | None = None
     toolCall: toolCall | None = None
+    errorType: str | None = None  # errorEvent.errorType 透传（imageInputPlan §3.2）
 
 
 @dataclass

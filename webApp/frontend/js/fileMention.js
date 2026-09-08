@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.4
-Date: 2026-09-07
+Version: 1.5
+Date: 2026-09-08
 Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须为行首/空白（防 user@example.com 误触发），
              目录下钻、文件名过滤、attachable:false 置灰；选中文件生成 chip（输入框上方），发送时随 attachments 提交。
              键盘拦截与 slashCommand 同约（capture 阶段，§4.3）。
@@ -11,6 +11,7 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
              ②文件夹可选为附件——目录行尾加「选中」按钮（stopPropagation 防冒泡下钻），键盘 Enter=选中/Tab=下钻；
              chip 带 type（📄/📁 区分），getAttachments 返回 { path, type }。
              v1.4（fileMentionPathOnlyPlan）：chip 仅为路径引用、去掉 8 个上限；选中仍不预读内容。
+             v1.5（imageInputPlan）：restoreChips 供发送失败恢复草稿。
 */
 (function () {
   'use strict';
@@ -259,6 +260,14 @@ Description: 「@」文件引用面板（迭代二方案 §4.5）：@ 前必须�
     },
     clearChips: function () {
       chips = [];
+      renderChips();
+    },
+    restoreChips: function (items) {
+      chips = [];
+      (items || []).forEach(function (item) {
+        if (!item || !item.path) return;
+        chips.push({ path: item.path, type: item.type === 'dir' ? 'dir' : 'file' });
+      });
       renderChips();
     },
     resetForSession: function () {

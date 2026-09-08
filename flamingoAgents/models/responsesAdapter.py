@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.4
-Date: 2026-09-02
-Description: Adapts Flamingo messages/tools to ChatGPT Codex and xAI Responses SSE, including dynamic auth, safe opaque replay, terminal-authoritative item merging, usage normalization, stop, and one zero-output OAuth 401 refresh retry. v1.2 always persists/replays reasoning.summary（empty list if none）so OpenAI Responses does not 400 missing input[n].summary. v1.3 attaches stack-local stream diagnosis on connect/firstByte/streamRead/decode/streamEnd, records authRefresh only on failed 401 refresh, and writes success timings with sawDone. v1.4 connect diag assignment cannot replace the original modelRequestError.
+Version: 1.5
+Date: 2026-09-08
+Description: Adapts Flamingo messages/tools to ChatGPT Codex and xAI Responses SSE, including dynamic auth, safe opaque replay, terminal-authoritative item merging, usage normalization, stop, and one zero-output OAuth 401 refresh retry. v1.2 always persists/replays reasoning.summary（empty list if none）so OpenAI Responses does not 400 missing input[n].summary. v1.3 attaches stack-local stream diagnosis on connect/firstByte/streamRead/decode/streamEnd, records authRefresh only on failed 401 refresh, and writes success timings with sawDone. v1.4 connect diag assignment cannot replace the original modelRequestError. v1.5（imageInputPlan）：user 消息含图时追加 input_image，无图保持原 input_text 形状。
 '''
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import urllib.request
 from email.utils import parsedate_to_datetime
 from typing import Any, Iterator
 
+from flamingoAgents.core.imageInput import imageDataUrl, requireImageCapability
 from flamingoAgents.core.types import chatMessage, finalChunk, modelInterruptedError, reasoningChunk, textChunk, toolCall
 from flamingoAgents.models.chatCompletions import (
     applyHeaderDiag,
@@ -67,6 +68,7 @@ class responsesAdapter:
         tools: list[dict[str, Any]],
         sessionId: str | None = None,
     ) -> dict[str, Any]:
+        requireImageCapability(self.config, messages)
         cleanSessionId = (sessionId or '')[:64] or None
         systemMessages = [message.content for message in messages if message.role == 'system' and message.content]
         inputItems = self.convertMessages(messages)
@@ -127,10 +129,18 @@ class responsesAdapter:
                     converted.append({'role': 'system', 'content': message.content})
                 continue
             if message.role == 'user':
-                converted.append({
-                    'role': 'user',
-                    'content': [{'type': 'input_text', 'text': message.content}],
-                })
+                if message.images:
+                    parts: list[dict[str, Any]] = []
+                    if message.content:
+                        parts.append({'type': 'input_text', 'text': message.content})
+                    for image in message.images:
+                        parts.append({'type': 'input_image', 'image_url': imageDataUrl(image)})
+                    converted.append({'role': 'user', 'content': parts})
+                else:
+                    converted.append({
+                        'role': 'user',
+                        'content': [{'type': 'input_text', 'text': message.content}],
+                    })
                 continue
             if message.role == 'assistant':
                 exactItems = self._exactReplayItems(message, pairedCallIds)

@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.10
-Date: 2026-09-07
-Description: Model editor with independent subscription discovery, non-overwrite guarded merge, account-epoch flights, and per-open revision commits. v1.10 presents live ChatGPT Codex model sync and OpenAI catalog filtering reports.
+Version: 1.11
+Date: 2026-09-08
+Description: Model editor with independent subscription discovery, non-overwrite guarded merge, account-epoch flights, and per-open revision commits. v1.10 presents live ChatGPT Codex model sync and OpenAI catalog filtering reports. v1.11 image 勾选说明为「支持图片输入」。
 */
 (function () {
   'use strict';
@@ -723,7 +723,7 @@ Description: Model editor with independent subscription discovery, non-overwrite
         markDirty();
       });
       label.appendChild(checkbox);
-      label.appendChild(document.createTextNode(kind));
+      label.appendChild(document.createTextNode(kind === 'image' ? 'image（支持图片输入）' : kind));
       checksWrap.appendChild(label);
     });
     body.appendChild(makeField('input', checksWrap));
@@ -887,6 +887,7 @@ Description: Model editor with independent subscription discovery, non-overwrite
       await window.api.putModels(modelConfig);
       window.sidebarView.invalidateModelConfig();
       window.alert('已保存。config/models.yaml 已更新（原文件备份为 models.yaml.bak）。');
+      if (window.imageInput) window.imageInput.refreshCapability();
       await window.settingsView.open(); // 重新拉取，拿到最新脱敏状态
     } catch (error) {
       showError(error.message);

@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.20
-Date: 2026-09-02
-Description: Adapts internal messages/tools to OpenAI-compatible Chat Completions. v1.19 adds stack-local stream diagnosis: modelRequestError.diag, connect/firstByte/streamRead/decode stages, response-header whitelist, and success timings including sawDone. v1.20 swallows mergeErrorDiag failures so diagnosis cannot replace the original modelRequestError.
+Version: 1.21
+Date: 2026-09-08
+Description: Adapts internal messages/tools to OpenAI-compatible Chat Completions. v1.19 adds stack-local stream diagnosis: modelRequestError.diag, connect/firstByte/streamRead/decode stages, response-header whitelist, and success timings including sawDone. v1.20 swallows mergeErrorDiag failures so diagnosis cannot replace the original modelRequestError. v1.21（imageInputPlan）：user 消息含图时转为 image_url 多模态 content，无图保持原字符串形状。
 '''
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import Any, Iterator
 
+from flamingoAgents.core.imageInput import imageDataUrl, requireImageCapability
 from flamingoAgents.core.types import chatMessage, finalChunk, modelInterruptedError, reasoningChunk, textChunk, toolCall
 from flamingoAgents.models.modelAuth import modelAuth
 from flamingoAgents.models.modelConfig import modelConfig
@@ -203,6 +204,7 @@ class chatCompletionsAdapter:
                 pass
 
     def buildRequestPayload(self, messages: list[chatMessage], tools: list[dict[str, Any]], stream: bool) -> dict[str, Any]:
+        requireImageCapability(self.config, messages)
         requestPayload: dict[str, Any] = {
             'model': self.config.model,
             'messages': [self.convertMessage(message) for message in messages],
@@ -565,6 +567,13 @@ class chatCompletionsAdapter:
                 'tool_call_id': message.toolCallId,
                 'content': message.content,
             }
+        if message.role == 'user' and message.images:
+            parts: list[dict[str, Any]] = []
+            if message.content:
+                parts.append({'type': 'text', 'text': message.content})
+            for image in message.images:
+                parts.append({'type': 'image_url', 'image_url': {'url': imageDataUrl(image)}})
+            return {'role': 'user', 'content': parts}
         content = message.content
         # 仅请求构造：无 toolCalls 的空 assistant 发 '.'，避免 provider 400；不写回 message。
         if message.role == 'assistant' and not message.toolCalls and not (content or '').strip():

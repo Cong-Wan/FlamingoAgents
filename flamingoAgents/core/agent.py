@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.22
-Date: 2026-09-07
-Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.21 writes modelRequestStart per attempt and merges adapter diag plus attempt/willRetry/backoffMs into modelError without changing retry semantics. v1.22 yields usageUpdateEvent after each model step with legal terminal usage, using an outer-step value-copied baseline.
+Version: 1.23
+Date: 2026-09-08
+Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.21 writes modelRequestStart per attempt and merges adapter diag plus attempt/willRetry/backoffMs into modelError without changing retry semantics. v1.22 yields usageUpdateEvent after each model step with legal terminal usage, using an outer-step value-copied baseline. v1.23（imageInputPlan）：keyword-only images、锁内预算/落盘/hydration、unsupportedImageInput、同步 errorType 透传、错误请求脱敏。
 '''
 
 from __future__ import annotations
@@ -15,13 +15,23 @@ from typing import Any, Callable, Iterator
 from uuid import uuid4
 
 from flamingoAgents.core.conversation import conversation
+from flamingoAgents.core.imageInput import (
+    checkMessageImageBudget,
+    hydrateMessageImages,
+    imageInputError,
+    imageRefMeta,
+    redactImageData,
+    requireImageCapability,
+    storeImages,
+    validateImageBytes,
+)
 from flamingoAgents.core.ports import modelAdapterPort
-from flamingoAgents.utils.logPaths import newSessionId
 from flamingoAgents.core.types import (
     completedEvent,
     confirmationRequiredEvent,
     errorEvent,
     finalChunk,
+    inputImage,
     modelInterruptedError,
     pendingConfirm,
     reasoningChunk,
@@ -38,6 +48,7 @@ from flamingoAgents.core.types import (
     toolResult,
     usageUpdateEvent,
 )
+from flamingoAgents.utils.logPaths import newSessionId
 from flamingoAgents.tools.toolDefinition import toolDefinition
 from flamingoAgents.tools.toolPolicy import evaluateToolCall
 from flamingoAgents.tools.toolRegistry import toolRegistry
@@ -96,14 +107,15 @@ class agent:
 
     # ---------- 事件流 API（docs/streamOutputPlan.md §6.3） ----------
 
-    def runUserMessageStream(self, message: str, sessionId: str) -> Iterator:
+    def runUserMessageStream(self, message: str, sessionId: str, *, images=None, committedImages=None) -> Iterator:
         cleanMessage = message.strip()
-        if not cleanMessage:
+        incomingImages = list(images or [])
+        if not cleanMessage and not incomingImages:
             yield errorEvent(message='消息不能为空。', errorType='emptyMessage')
             return
         terminal = None
         with self.getSessionLock(sessionId):
-            for event in self.driveUserMessage(sessionId, cleanMessage):
+            for event in self.driveUserMessage(sessionId, cleanMessage, incomingImages, committedImages):
                 if isinstance(event, terminalEventTypes):
                     terminal = event
                     break
@@ -123,7 +135,7 @@ class agent:
         if terminal is not None:
             yield terminal
 
-    def driveUserMessage(self, sessionId: str, cleanMessage: str) -> Iterator:
+    def driveUserMessage(self, sessionId: str, cleanMessage: str, incomingImages=None, committedImages=None) -> Iterator:
         # 调用前提：已持有会话锁。
         if self.hasPendingConfirmation(sessionId):
             yield errorEvent(
@@ -138,7 +150,35 @@ class agent:
         if found is not None:
             calls, position = found
             yield from self.closeUnfinishedToolCalls(currentConversation, calls, position, 'preflightRepair')
-        currentConversation.appendUserMessage(cleanMessage)
+        storedImages = []
+        try:
+            requireImageCapability(
+                getattr(self.modelAdapter, 'config', None),
+                currentConversation.messages,
+                extraImages=incomingImages,
+            )
+            if incomingImages:
+                prepared = []
+                for image in incomingImages:
+                    raw = image.data if isinstance(image.data, (bytes, bytearray)) else b''
+                    if not raw:
+                        raise imageInputError(f'图片数据为空：{image.name}')
+                    mimeType, size = validateImageBytes(raw, image.name)
+                    prepared.append(inputImage(
+                        name=image.name or 'image',
+                        mimeType=mimeType,
+                        data=bytes(raw),
+                        bytes=size,
+                    ))
+                checkMessageImageBudget(prepared)
+                storedImages = storeImages(currentConversation.logger.logPath, prepared)
+                if committedImages is not None:
+                    committedImages.clear()
+                    committedImages.extend(imageRefMeta(image) for image in storedImages)
+        except imageInputError as error:
+            yield errorEvent(message=str(error), errorType=error.errorType)
+            return
+        currentConversation.appendUserMessage(cleanMessage, images=storedImages)
         yield from self.driveModelLoop(sessionId)
 
     def driveConfirmation(self, sessionId: str, confirmationId: str, approved: bool) -> Iterator:
@@ -217,6 +257,11 @@ class agent:
                         })
                     except Exception:
                         pass
+                    try:
+                        hydrateMessageImages(currentConversation.logger.logPath, currentConversation.messages)
+                    except imageInputError as error:
+                        yield errorEvent(message=str(error), errorType=error.errorType)
+                        return
                     for chunk in self.modelAdapter.completeStream(
                         currentConversation.messages,
                         modelTools,
@@ -238,6 +283,9 @@ class agent:
                         raise RuntimeError('模型流式响应缺少最终结果。')
                     break
                 except modelInterruptedError:
+                    return
+                except imageInputError as error:
+                    yield errorEvent(message=str(error), errorType=error.errorType)
                     return
                 except Exception as error:
                     statusCode = getattr(error, 'statusCode', None)
@@ -393,10 +441,12 @@ class agent:
         sessionId: str | None = None,
         onDelta: Callable[[str], None] | None = None,
         onReasoning: Callable[[str], None] | None = None,
+        *,
+        images=None,
     ) -> runResult:
         # sessionId 必须包装层预生成：事件流不带 sessionId，否则耗尽后无从构造 runResult。
         realSessionId = sessionId or self.createSessionId()
-        stream = self.runUserMessageStream(message, realSessionId)
+        stream = self.runUserMessageStream(message, realSessionId, images=images)
         try:
             terminal = None
             for event in stream:
@@ -445,7 +495,12 @@ class agent:
                 toolCall=terminal.toolCall,
             )
         if isinstance(terminal, errorEvent):
-            return runResult(sessionId=sessionId, status='error', message=terminal.message)
+            return runResult(
+                sessionId=sessionId,
+                status='error',
+                message=terminal.message,
+                errorType=terminal.errorType,
+            )
         return runResult(sessionId=sessionId, status='error', message='事件流未产生终态事件。')
 
     def safeCallback(self, callback: Callable[[str], None] | None, text: str) -> None:
@@ -567,7 +622,7 @@ class agent:
         }
         requestPayload = getattr(error, 'requestPayload', None)
         if isinstance(requestPayload, dict):
-            event['request'] = requestPayload
+            event['request'] = redactImageData(requestPayload)
         statusCode = getattr(error, 'statusCode', None)
         if isinstance(statusCode, int):
             event['status'] = statusCode

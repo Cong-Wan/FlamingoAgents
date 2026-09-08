@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.4
-Date: 2026-09-07
+Version: 1.5
+Date: 2026-09-08
 Description: workDir 文件浏览纯函数层（迭代二方案 §3.8）：is_relative_to 路径拘禁、目录列举（目录在前、单条目 stat 失败跳过、
             截断标记）、文本文件读取（二进制校验）；OSError 统一转 RuntimeError 中文消息走 400 透传，不落 fallback 500。
             v1.1 取消 maxFileBytes 单文件大小限制，readTextFile 不再校验文件大小，listDir 中 attachable 始终为 true。
@@ -13,6 +13,7 @@ Description: workDir 文件浏览纯函数层（迭代二方案 §3.8）：is_re
             全量 name.lower() 排序后再截 maxEntries（刻意与 listDir 的物理序 early-break 不同，避免前缀匹配丢项）。
             v1.4（fileMentionPathOnlyPlan）：buildAttachmentMessage 改为仅校验路径并输出真实绝对路径清单，不读正文、不解包、
             不递归目录；删除 expandDirAttachment 与个数/内容预算常量；readTextFile 预览行为不变。
+            v1.5（imageInputPlan）：新增 isImageAttachment / readImageAttachment，@ 图片按扩展名识别并以单张 5MiB 上限读取；路径清单行为不变。
 '''
 
 from __future__ import annotations
@@ -21,7 +22,10 @@ import json
 import os
 from pathlib import Path
 
+from flamingoAgents.core.imageInput import imageInputError, maxImageBytes
+
 maxEntries = 500               # 目录单层列举上限
+imageSuffixes = {'.png', '.jpg', '.jpeg', '.webp'}
 
 
 def resolveInside(workDir: str, relPath: str | None) -> Path:
@@ -102,6 +106,37 @@ def listAbsDirs(absPath: str) -> dict:
     names.sort(key=str.lower)
     truncated = len(names) > maxEntries
     return {'path': str(target), 'entries': [{'name': name, 'type': 'dir'} for name in names[:maxEntries]], 'truncated': truncated}
+
+
+def isImageAttachment(item: dict) -> bool:
+    if not isinstance(item, dict) or item.get('type') == 'dir':
+        return False
+    relPath = item.get('path')
+    if not isinstance(relPath, str) or relPath == '':
+        return False
+    return Path(relPath).suffix.lower() in imageSuffixes
+
+
+def readImageAttachment(workDir: str, relPath: str) -> bytes:
+    target = resolveInside(workDir, relPath)
+    try:
+        if not target.is_file():
+            raise RuntimeError(f'不是文件：{relPath}')
+        size = target.stat().st_size
+        if size > maxImageBytes:
+            raise imageInputError(
+                f'图片超过单张大小上限 {maxImageBytes // 1024 // 1024}MiB：{relPath}',
+                'imageBudgetExceeded',
+            )
+        raw = target.read_bytes()
+    except OSError as error:
+        raise RuntimeError(f'路径不存在或不可访问：{relPath}（{error}）')
+    if len(raw) > maxImageBytes:
+        raise imageInputError(
+            f'图片超过单张大小上限 {maxImageBytes // 1024 // 1024}MiB：{relPath}',
+            'imageBudgetExceeded',
+        )
+    return raw
 
 
 def buildAttachmentMessage(text: str, workDir: str, attachments: list[dict]) -> str:

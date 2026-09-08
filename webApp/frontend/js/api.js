@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.8
-Date: 2026-09-01
-Description: Authenticated fetch wrapper for Web APIs. v1.8 adds POST subscription model-candidate discovery while preserving credential-secret-free login/status/task calls.
+Version: 1.9
+Date: 2026-09-08
+Description: Authenticated fetch wrapper for Web APIs. v1.8 adds POST subscription model-candidate discovery while preserving credential-secret-free login/status/task calls. v1.9 新增 getSessionImage（鉴权 blob，不把 token 放 URL）。
 */
 (function () {
   'use strict';
@@ -137,6 +137,21 @@ Description: Authenticated fetch wrapper for Web APIs. v1.8 adds POST subscripti
     },
     getFileContent: function (sessionId, path) {
       return request('/api/sessions/' + encodeURIComponent(sessionId) + '/fileContent?path=' + encodeURIComponent(path));
+    },
+    getSessionImage: async function (sessionId, ref) {
+      var resp = await fetch('/api/sessions/' + encodeURIComponent(sessionId) + '/images/' + encodeURIComponent(ref), {
+        headers: {
+          'Authorization': window.appStore.token ? ('Bearer ' + window.appStore.token) : '',
+          'Accept': 'image/*'
+        }
+      });
+      if (resp.status === 401) {
+        window.appStore.clearToken();
+        onUnauthorized();
+        throw buildError(401, '未认证或 token 已失效');
+      }
+      if (!resp.ok) throw buildError(resp.status, '图片加载失败');
+      return resp.blob();
     },
     getSkills: function () { return request('/api/skills'); },
     getSkillBody: function (name) {
