@@ -2,9 +2,9 @@
 
 <!--
 Author: wilbur
-Version: 1.2
+Version: 1.3
 Date: 2026-09-08
-Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history. v1.1：Web @ 改为仅路径引用，不预读文件内容。v1.2：模型勾选 image 后支持图片输入（上传落盘 + @ 图片快照，请求体 data URL）。
+Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history. v1.1：Web @ 改为仅路径引用，不预读文件内容。v1.2：模型勾选 image 后支持图片输入（上传落盘 + @ 图片快照，请求体 data URL）。v1.3（configHomePlan）：运行时配置迁到 ~/.flamingo/config/，项目 config/ 仅保留模板与说明。
 -->
 
 ## 现状能力
@@ -16,8 +16,8 @@ Description: Documents centralized session storage under ~/.flamingo and explici
 - **子代理 askSubAgent**：以 function call 形式把子任务派给独立子代理会话，可指定 `provider/model`、独立 workDir 与 system prompt，超时透传（默认 600s，上限 3600s），子代理输出经 JSON stdout 回收——多 plan 并发的编排地基；
 - **会话持久化与恢复**：jsonl 原子日志，进程重启后自动 resume（含 system prompt 前缀恢复，provider 缓存可命中）；
 - **用量统计**：每会话累计 prompt/cached/completion tokens；
-- **多 provider 模型配置**：`config/models.yaml` 集中管理多家 Coding Plan，`createAgent(providerId=..., modelId=...)` 按需装配，支持 thinking/reasoningEffort/stream 等模型能力声明。
-- **Skill**：加载 `config/skills/<name>/SKILL.md`，新建 agent 时把 name/description/location 注入 system prompt（位于「当前时间」之前）；resume 不重注。Web 技能页支持**按模板结构化编辑保存**（frontmatter name/description/disable + 正文），保存仅影响下次新建会话。**入口文件名必须是大写 `SKILL.md`**（对齐 Agent Skills 规范）；小写 `skill.md` 不会被加载。
+- **多 provider 模型配置**：`~/.flamingo/config/models.yaml` 集中管理多家 Coding Plan，`createAgent(providerId=..., modelId=...)` 按需装配，支持 thinking/reasoningEffort/stream 等模型能力声明。
+- **Skill**：加载 `~/.flamingo/config/skills/<name>/SKILL.md`，新建 agent 时把 name/description/location 注入 system prompt（位于「当前时间」之前）；resume 不重注。Web 技能页支持**按模板结构化编辑保存**（frontmatter name/description/disable + 正文），保存仅影响下次新建会话。**入口文件名必须是大写 `SKILL.md`**（对齐 Agent Skills 规范）；小写 `skill.md` 不会被加载。
 
 ### `webApp/` —— Web 程序（单用户、局域网）
 
@@ -29,7 +29,7 @@ Description: Documents centralized session storage under ~/.flamingo and explici
 - **斜杠命令**：`/new` 新会话、`/model` 会话内切换模型、`/skill:` 技能 chip（发送时拼技能正文，气泡不显示全文）；
 - **状态栏**：当前模型 / 最近一轮增量 tokens / 上下文使用率；
 - **会话管理**：每会话绑定独立 workDir（不存在可探测后创建）、历史持久化、重命名/删除；
-- **模型配置页**：整页表单直接编辑 `models.yaml`（与 CLI 共用同一份配置，apiKey 脱敏回显），支持粘贴 **models.json 一键转换导入**（纯转换不落盘）；
+- **模型配置页**：整页表单直接编辑 `~/.flamingo/config/models.yaml`（与 CLI 共用同一份配置，apiKey 脱敏回显），支持粘贴 **models.json 一键转换导入**（纯转换不落盘）；
 - **用量统计**：token 卡片 + 时/天/月粒度图表（每模型独立配色）+ 费用估算（按 plan 价格配置）；
 - **安全**：静态 Bearer Token 认证、SSE 流式、原生 HTML/CSS/JS 前端（无框架无构建）。
 
@@ -45,7 +45,7 @@ webApp/backend（FastAPI，单 worker）
 flamingoAgents 纯库（事件流 + 工具 + jsonl 日志）
    │
    ▼
-各家 Coding Plan 端点（config/models.yaml 统一配置）
+各家 Coding Plan 端点（~/.flamingo/config/models.yaml 统一配置）
 ```
 
 关键设计：**库与 Web 完全解耦**——`flamingoAgents` 不知道 Web 的存在，CLI（`askModel.py`）和 Web 共用同一个库。
@@ -65,8 +65,10 @@ flamingoAgents 纯库（事件流 + 工具 + jsonl 日志）
 > **会话索引也统一存入家目录**：Web 运行时读写 `~/.flamingo/logs/webData/sessions.json`，不再向仓库 `webData/` 写数据。新索引不存在时，首次读取会校验并复制尚存的仓库 `webData/sessions.json`，旧文件保留；新索引存在（包括空列表）时始终以新索引为准，不自动合并旧数据。确认新位置的索引和历史均可读取后，才清理旧目录。已删除的旧索引不会仅凭 JSONL 自动重建；损坏/不可读的索引会报错，不当空索引覆盖。升级后需重启 Web 服务，同一用户家目录只运行一个 Web 服务实例。
 
 ```bash
-# 1. 配置模型（复制示例，填入各家 Coding Plan 的 key）
-cp config/models.example.yaml config/models.yaml
+# 1. 运行自动初始化 tools.yaml / systemPrompt.md / skills/ 到 ~/.flamingo/config/
+#    models.yaml 不会自动生成：参照模板手动配置（或用 Web 设置页）
+mkdir -p ~/.flamingo/config
+cp config/models.example.yaml ~/.flamingo/config/models.yaml   # 再按需删减 provider、填入真实 key
 
 # 2. CLI 方式跑一轮对话
 uv run python askModel.py
@@ -91,7 +93,7 @@ uv run python -m webApp.backend.sessionRecovery \
 
 ## ChatGPT / xAI 订阅登录
 
-FlamingoAgents 原生支持 ChatGPT Plus/Pro 的 Codex Responses 与 SuperGrok/X Premium 的 xAI Responses，不依赖 pi/Node 运行时。CLI 登录与模型配置相互独立；可登录后复制 `config/models.example.yaml` 的订阅 Provider。Web 用户无需预先创建 Provider，可直接在模型设置页顶部登录并生成模型配置候选：
+FlamingoAgents 原生支持 ChatGPT Plus/Pro 的 Codex Responses 与 SuperGrok/X Premium 的 xAI Responses，不依赖 pi/Node 运行时。CLI 登录与模型配置相互独立；可登录后把 `config/models.example.yaml` 中的订阅 Provider 抄进 `~/.flamingo/config/models.yaml`。Web 用户无需预先创建 Provider，可直接在模型设置页顶部登录并生成模型配置候选：
 
 ```bash
 # ChatGPT：本机浏览器 PKCE（远程环境可粘贴回调 URL/code）
@@ -108,9 +110,9 @@ uv run python modelLogin.py status
 uv run python modelLogin.py logout xai
 ```
 
-Web 模型设置页顶部始终显示独立的“订阅账户”。ChatGPT 登录后只读请求固定的 `https://chatgpt.com/backend-api/codex/models?client_version=0.153.4`，同步当前账户中官方标记为可见的 Codex 模型（包括 GPT-6）；隐藏或缺少必要元数据的模型会带原因跳过。xAI 登录后只读请求固定的 `https://api.x.ai/v1/models`，并把实时 ID 与内置 Responses 元数据取交集。候选只加入浏览器编辑区，用户点击“保存”后才写 `models.yaml`；目录结果不保证每次调用一定成功。
+Web 模型设置页顶部始终显示独立的“订阅账户”。ChatGPT 登录后只读请求固定的 `https://chatgpt.com/backend-api/codex/models?client_version=0.153.4`，同步当前账户中官方标记为可见的 Codex 模型（包括 GPT-6）；隐藏或缺少必要元数据的模型会带原因跳过。xAI 登录后只读请求固定的 `https://api.x.ai/v1/models`，并把实时 ID 与内置 Responses 元数据取交集。候选只加入浏览器编辑区，用户点击“保存”后才写 `~/.flamingo/config/models.yaml`；目录结果不保证每次调用一定成功。
 
-OAuth 凭据仅写入 `~/.flamingo/auth.json`（目录 0700、文件 0600），不会进入 `models.yaml`、浏览器响应或会话 JSONL；Access Token 到期前自动刷新。ChatGPT 与 xAI 模型发现均遵循标准 `HTTPS_PROXY/NO_PROXY`、禁止全部 HTTP 重定向、限制响应大小；401 只进行一次带 stale-token 并发保护的刷新重试。
+OAuth 凭据仅写入 `~/.flamingo/auth.json`（目录 0700、文件 0600），不会进入 `~/.flamingo/config/models.yaml`、浏览器响应或会话 JSONL；Access Token 到期前自动刷新。ChatGPT 与 xAI 模型发现均遵循标准 `HTTPS_PROXY/NO_PROXY`、禁止全部 HTTP 重定向、限制响应大小；401 只进行一次带 stale-token 并发保护的刷新重试。
 
 Responses 会把多轮继续所需的加密 reasoning/item ID 以白名单字段写入会话 JSONL；它们不是 Access/Refresh Token，但会话日志仍应按敏感数据保护。
 
@@ -121,8 +123,9 @@ flamingoAgents/      # 纯库：core（事件流 Agent）/ models（适配器）
 webApp/
   backend/           # FastAPI：SSE 桥接、会话索引、用量 SQLite、模型配置读写
   frontend/          # 原生 HTML/CSS/JS（vendor: marked + DOMPurify + Chart.js）
-config/              # models.yaml（多 provider 密钥配置）/ tools.yaml / systemPrompt.md / skills/<name>/SKILL.md
+config/              # 模板与说明：models.example.yaml / tools.yaml / systemPrompt.md（见 config/README.md）
 docs/                # 契约与手册（见下）；方案与事故报告归入 docs/plan/
+~/.flamingo/config/  # 运行时配置：models.yaml / tools.yaml / systemPrompt.md / skills/<name>/SKILL.md
 ~/.flamingo/logs/    # 全部会话运行数据（不依赖仓库 webData/）
   usage.db           # 用量统计
   webData/           # sessions.json 索引 + <workDir映射目录>/*.jsonl 正文

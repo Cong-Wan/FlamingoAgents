@@ -1,21 +1,21 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-09-01
-Description: Reads and atomically merges config/models.yaml for Web settings. v1.3 supports three model APIs and api-key/oauth auth, keeps credentials separate, validates canonical subscription combinations, and preserves legacy auth defaults and apiKey masking.
+Version: 1.4
+Date: 2026-09-08
+Description: Reads and atomically merges the user models.yaml for Web settings. v1.3 supports three model APIs and api-key/oauth auth, keeps credentials separate, validates canonical subscription combinations, and preserves legacy auth defaults and apiKey masking. v1.4（configHomePlan P3）：modelsYamlPath 切换到 configPaths.userModelsPath（~/.flamingo/config/models.yaml），readRawYaml 文件缺失时返回空文档（GET /models 空 providers 引导配置，方案 §4.3）而非报错。
 '''
 
 from __future__ import annotations
 
 import os
 import shutil
-from pathlib import Path
 
 import yaml
 
 from flamingoAgents.models.modelConfig import validateApiAuth
+from flamingoAgents.utils.configPaths import userModelsPath
 
-modelsYamlPath = Path(__file__).resolve().parents[2] / 'config' / 'models.yaml'
+modelsYamlPath = userModelsPath
 backupPath = modelsYamlPath.with_suffix('.yaml.bak')
 
 keepPlaceholder = '__KEEP__'
@@ -26,8 +26,9 @@ allowedThinkingTypes = {'enabled', 'disabled'}
 
 
 def readRawYaml() -> dict:
+    # 文件缺失返回空文档（configHomePlan §4.3）：设置页是引导配置的入口，GET /models 呈空 providers 而非报错。
     if not modelsYamlPath.exists():
-        raise RuntimeError('config/models.yaml 不存在。')
+        return {}
     try:
         raw = yaml.safe_load(modelsYamlPath.read_text(encoding='utf-8'))
     except yaml.YAMLError as error:
@@ -238,8 +239,8 @@ def mergeProvider(requestProvider: dict, existingProvider) -> dict:
 
 def writeModelsConfig(body: dict) -> None:
     validateBody(body)
-    # yaml 缺失时以空文档为基底创建（审核 L5）；语法错误沿用 GET 的 400 口径。
-    raw = readRawYaml() if modelsYamlPath.exists() else {}
+    # yaml 缺失时 readRawYaml 返回空文档，天然以空基底创建（审核 L5）；语法错误沿用 GET 的 400 口径。
+    raw = readRawYaml()
     rawProviders = raw.get('providers')
     existingProviders = rawProviders if isinstance(rawProviders, dict) else {}
     mergedProviders = {

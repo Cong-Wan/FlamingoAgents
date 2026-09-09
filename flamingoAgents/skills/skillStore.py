@@ -1,12 +1,13 @@
 '''
 Author: wilbur
-Version: 1.4
-Date: 2026-08-17
+Version: 1.5
+Date: 2026-09-08
 Description: 只读扫描 config/skills/<name>/SKILL.md（大写，对齐 Agent Skills 规范），解析 frontmatter，生成注入 system prompt 的 XML 片段。
             v1.1：loadSkills 新增可选 debugConsole 参数（门控 debug 输出，不再无条件 print）。
             v1.2：目录只有大写 SKILL.md 时补 debug 提示（Linux 大小写敏感会静默加载不到）；删除残留 datetime import。
             v1.3：入口文件名由小写 skill.md 改为大写 SKILL.md（用户决定，对齐官方规范）；只对 skill.md 补 debug 提示。
             v1.4：formatSkillsXml 指引改 if/else——已注入 <injected_skill> 则禁 read location，否则 read；if/else 各管各的相对路径解析根（dir 属性 vs location 所在目录）。
+            v1.5（configHomePlan P2）：默认技能目录切到 ~/.flamingo/config/skills/。
 '''
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from pathlib import Path
 
 import yaml
 
+from flamingoAgents.utils.configPaths import userSkillsDir
+
 
 @dataclass
 class Skill:
@@ -28,7 +31,7 @@ class Skill:
     disabled: bool
 
 
-defaultSkillsDir = Path(__file__).resolve().parents[2] / 'config' / 'skills'
+defaultSkillsDir = userSkillsDir
 
 skillNamePattern = re.compile(r'^[A-Za-z0-9_-]+$')
 

@@ -1,10 +1,11 @@
 /*
 Author: wilbur
-Version: 1.2
-Date: 2026-08-14
+Version: 1.3
+Date: 2026-09-08
 Description: 「技能」展示页（与模型配置平级）：打开时 GET /api/skills 一次渲染卡片列表。
              v1.1：render 加 renderSeq 序号守卫，防快速进出时晚到的响应叠加旧卡片。
              v1.2：卡片加「编辑」；弹层按模板结构化编辑（Esc 栈接入）；保存后刷新列表并 reloadSkills。
+             v1.3（configHomePlan P4）：空列表提示改为 ~/.flamingo/config/skills/。
 */
 (function () {
   'use strict';
@@ -31,7 +32,7 @@ Description: 「技能」展示页（与模型配置平级）：打开时 GET /a
       if (skills.length === 0) {
         var empty = document.createElement('div');
         empty.className = 'skills-empty';
-        empty.textContent = 'config/skills/ 下暂无技能';
+        empty.textContent = '~/.flamingo/config/skills/ 下暂无技能';
         listEl.appendChild(empty);
         return;
       }

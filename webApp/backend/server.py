@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.17
+Version: 1.18
 Date: 2026-09-08
-Description: FastAPI application and authenticated REST/SSE routes. v1.14 adds no-store subscription model-candidate discovery with credential-generation race rejection and structured secret-free errors. v1.15 prints traceback in fallbackErrorHandler so pre-stream 500s leave a stderr stack. v1.16：chat/stream 附件注释改为路径引用，调用仍走 buildAttachmentMessage。v1.17（imageInputPlan）：chat/stream 支持 images 与 @ 图片快照、有界请求体、图片读取端点、删除会话时清理图片目录。
+Description: FastAPI application and authenticated REST/SSE routes. v1.14 adds no-store subscription model-candidate discovery with credential-generation race rejection and structured secret-free errors. v1.15 prints traceback in fallbackErrorHandler so pre-stream 500s leave a stderr stack. v1.16：chat/stream 附件注释改为路径引用，调用仍走 buildAttachmentMessage。v1.17（imageInputPlan）：chat/stream 支持 images 与 @ 图片快照、有界请求体、图片读取端点、删除会话时清理图片目录。v1.18（configHomePlan P3）：会话创建与切模型预检 400 文案更新为无可用模型指引（~/.flamingo/config/models.yaml + 模板参照）。
 '''
 
 from __future__ import annotations
@@ -269,7 +269,7 @@ def createSession(body: dict = Body(...)):
     # 处理顺序（审核中 6）：先 providerId/modelId 预检（失败 400 不留孤儿目录），再处理目录。
     # 预检（审核 M3/M4）：yaml 缺失时库会静默回退环境变量配置，必须 Web 层先行拦截。
     if not modelConfigStore.modelsYamlPath.exists():
-        raise HTTPException(status_code=400, detail='config/models.yaml 不存在。')
+        raise HTTPException(status_code=400, detail='无可用模型：~/.flamingo/config/models.yaml 不存在，请参照 config/models.example.yaml 手动配置或用设置页配置。')
     resolved = loadModelConfigFromYaml(providerId=providerId, modelId=modelId or None)
     if workPath.is_dir():
         # 行为变更（审核中 9）：已存在目录除 is_dir 外增加可读写进入校验。
@@ -371,7 +371,7 @@ def updateSessionModel(sessionId: str, body: dict = Body(...)):
     providerId = providerId.strip()
     modelId = modelId.strip()
     if not modelConfigStore.modelsYamlPath.exists():
-        raise HTTPException(status_code=400, detail='config/models.yaml 不存在。')
+        raise HTTPException(status_code=400, detail='无可用模型：~/.flamingo/config/models.yaml 不存在，请参照 config/models.example.yaml 手动配置或用设置页配置。')
     loadModelConfigFromYaml(providerId=providerId, modelId=modelId)  # 预检，失败 RuntimeError → 400
     session = sessionStore.updateSessionModel(sessionId, providerId, modelId)
     if session is None:

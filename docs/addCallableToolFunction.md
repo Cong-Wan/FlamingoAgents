@@ -72,7 +72,7 @@ builtinFactories: dict[str, Callable[[list[permissionRule]], toolDefinition]] = 
 }
 ```
 
-在 `config/tools.yaml` 启用：
+在 `~/.flamingo/config/tools.yaml` 启用（模板在项目 `config/tools.yaml`，首次运行自动拷贝）：
 
 ```yaml
 enabledTools:
@@ -100,7 +100,7 @@ uv run python askModel.py    # 让模型读一段触发 currentTime 的 prompt
 写 Python callable
   -> 写 createXTool factory
   -> 注册到 createBuiltinTools 的 factory map
-  -> 在 config/tools.yaml 的 enabledTools 中启用
+  -> 在 ~/.flamingo/config/tools.yaml 的 enabledTools 中启用
   -> 如需权限确认，在 toolPermissions 中配置规则
 ```
 
@@ -117,7 +117,7 @@ uv run python askModel.py    # 让模型读一段触发 currentTime 的 prompt
 | `flamingoAgents/tools/toolRegistry.py` | 按 name 去重注册 tool definition |
 | `flamingoAgents/tools/toolRuntime.py` | 通用 executor：校验参数、检查权限、调用 `execute()`、包装 `toolResult` |
 | `flamingoAgents/tools/toolConfig.py` | 解析 `enabledTools` 和 `toolPermissions` |
-| `config/tools.yaml` | 决定启用哪些工具、哪些需要权限确认 |
+| `~/.flamingo/config/tools.yaml` | 决定启用哪些工具、哪些需要权限确认（模板在项目 `config/tools.yaml`） |
 
 新增工具的代码改动集中在 `builtinTools.py` 和 `tools.yaml`，不要往其他文件塞业务逻辑。
 
@@ -186,7 +186,7 @@ factory 把函数、schema、description、permissions、preview 绑成一个 `t
 
 ### 5. 在配置中启用
 
-在 `config/tools.yaml` 的 `enabledTools` 加入工具名。不需要权限确认的工具，无需在 `toolPermissions` 下配置。
+在 `~/.flamingo/config/tools.yaml` 的 `enabledTools` 加入工具名。不需要权限确认的工具，无需在 `toolPermissions` 下配置。
 
 ## Permissions
 

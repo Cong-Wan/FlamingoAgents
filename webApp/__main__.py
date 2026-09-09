@@ -1,10 +1,11 @@
 '''
 Author: wilbur
-Version: 1.2
-Date: 2026-08-07
+Version: 1.3
+Date: 2026-09-08
 Description: 启动入口：校验 FLAMINGO_WEB_TOKEN（未设置则报错退出），读 FLAMINGO_WEB_HOST/PORT，单 worker 起 uvicorn。
             v1.1 随包改名 flamingoWeb → webApp 调整为从 webApp.backend.server 导入 app。
             v1.2 迭代一（方案 §11.4）：uvicorn 启动前调用 usageStore.initUsageDb()（建表 + 空表时从 jsonl 一次性回填历史用量）。
+            v1.3（configHomePlan P3）：main() 在 import server 之前调用 ensureUserConfig()，Web 启动链完成用户配置目录初始化（不放 server.py 模块级，避免 pytest 收集阶段副作用）。
 '''
 
 import os
@@ -12,8 +13,11 @@ import sys
 
 import uvicorn
 
+from flamingoAgents.utils.configPaths import ensureUserConfig
+
 
 def main() -> None:
+    ensureUserConfig()
     token = os.environ.get('FLAMINGO_WEB_TOKEN', '')
     if not token:
         print('启动失败：未设置环境变量 FLAMINGO_WEB_TOKEN（静态 Bearer Token 强制显式配置）。', file=sys.stderr)

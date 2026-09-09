@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.7
-Date: 2026-09-01
-Description: Pure-library Agent assembly factory. v1.7 dispatches openai-completions to the unchanged static-key adapter and ChatGPT/xAI Responses APIs to the dynamic auth Responses adapter.
+Version: 1.8
+Date: 2026-09-08
+Description: Pure-library Agent assembly factory. v1.7 dispatches openai-completions to the unchanged static-key adapter and ChatGPT/xAI Responses APIs to the dynamic auth Responses adapter. v1.8（configHomePlan P2）：默认系统提示词路径切到 ~/.flamingo/config/systemPrompt.md；createAgent 开头调用 ensureUserConfig() 完成用户配置目录初始化。
 '''
 
 from __future__ import annotations
@@ -18,11 +18,12 @@ from flamingoAgents.models.responsesAdapter import responsesAdapter
 from flamingoAgents.skills import defaultSkillsDir, formatSkillsXml, loadSkills
 from flamingoAgents.tools.builtinTools import createBuiltinTools
 from flamingoAgents.tools.toolConfig import loadToolSettings
+from flamingoAgents.utils.configPaths import ensureUserConfig, userSystemPromptPath
 from flamingoAgents.utils.debug import debugConsole
 from flamingoAgents.utils.logPaths import ensureSessionLogDir
 
 
-defaultSystemPromptPath = Path(__file__).resolve().parents[1] / 'config' / 'systemPrompt.md'
+defaultSystemPromptPath = userSystemPromptPath
 
 
 def createAgent(
@@ -40,6 +41,7 @@ def createAgent(
     modelId: str | None = None,
     skillsDir: str | Path | None = None,
 ) -> agent:
+    ensureUserConfig()
     workDirPath = Path(workDir).resolve()
     printer = debugConsole(debug)
     resolvedLogDir = Path(logDir).resolve() if logDir else ensureSessionLogDir('cliData', workDirPath)

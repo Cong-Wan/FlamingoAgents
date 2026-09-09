@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.5
+Version: 1.6
 Date: 2026-09-08
-Description: Loads model configuration without mutating process environment. v1.4 adds ChatGPT Codex/xAI Responses APIs, api-key/oauth auth types, canonical auth providers, optional OAuth apiKey, reasoning metadata, and xAI API key fallback while preserving old openai-completions defaults. v1.5（imageInputPlan §3.1）新增 inputTypes 透传与派生 supportsImageInput；缺省 ['text']，YAML 显式 input 时校验列表与枚举。
+Description: Loads model configuration without mutating process environment. v1.4 adds ChatGPT Codex/xAI Responses APIs, api-key/oauth auth types, canonical auth providers, optional OAuth apiKey, reasoning metadata, and xAI API key fallback while preserving old openai-completions defaults. v1.5（imageInputPlan §3.1）新增 inputTypes 透传与派生 supportsImageInput；缺省 ['text']，YAML 显式 input 时校验列表与枚举。v1.6（configHomePlan P2）：默认路径切到 ~/.flamingo/config/models.yaml；文件缺失时报无可用模型（含模板指引），删除环境变量回退（loadModelConfigFromEnv，方案 D3）。
 '''
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from flamingoAgents.utils.configPaths import modelsExamplePath, userModelsPath
 
 allowedApis = frozenset({'openai-completions', 'openai-responses', 'openai-codex-responses'})
 allowedAuthTypes = frozenset({'api-key', 'oauth'})
@@ -51,7 +53,7 @@ class resolvedModelConfig:
     apiKey: str | None
 
 
-defaultModelConfigPath = Path(__file__).resolve().parents[2] / 'config' / 'models.yaml'
+defaultModelConfigPath = userModelsPath
 
 
 def loadModelConfig(
@@ -61,44 +63,13 @@ def loadModelConfig(
     debugConsole=None,
 ) -> resolvedModelConfig:
     path = Path(configPath) if configPath is not None else defaultModelConfigPath
-    if path.exists():
-        return loadModelConfigFromYaml(providerId=providerId, modelId=modelId, configPath=path, debugConsole=debugConsole)
-    return loadModelConfigFromEnv(debugConsole=debugConsole)
-
-
-def loadModelConfigFromEnv(debugConsole=None) -> resolvedModelConfig:
-    model = os.getenv('FLAMINGO_AGENTS_MODEL', '').strip()
-    baseUrl = os.getenv('FLAMINGO_AGENTS_BASE_URL', '').strip()
-    apiKey = os.getenv('FLAMINGO_AGENTS_API_KEY', '').strip()
-    apiKeyEnv = os.getenv('FLAMINGO_AGENTS_API_KEY_ENV', 'OPENAI_API_KEY').strip()
-    if not apiKey and apiKeyEnv:
-        apiKey = os.getenv(apiKeyEnv, '').strip()
-
-    missingFields = []
-    if not model:
-        missingFields.append('FLAMINGO_AGENTS_MODEL')
-    if not baseUrl:
-        missingFields.append('FLAMINGO_AGENTS_BASE_URL')
-    if not apiKey:
-        missingFields.append(apiKeyEnv or 'FLAMINGO_AGENTS_API_KEY')
-    if missingFields:
-        raise RuntimeError(f'模型配置缺失：{", ".join(missingFields)}')
-
-    if debugConsole:
-        debugConsole.debug(f'从环境变量加载模型配置 model={model} baseUrl={baseUrl}')
-    return resolvedModelConfig(
-        config=modelConfig(
-            provider='openaiCompatible',
-            configProviderId='openaiCompatible',
-            model=model,
-            baseUrl=baseUrl,
-            apiType='openai-completions',
-            authType='api-key',
-            authProvider=None,
-            supportsToolCalling=True,
-        ),
-        apiKey=apiKey,
-    )
+    if not path.exists():
+        # configHomePlan D3：未配置 models 直接报无可用模型，不静默回退、不自动拷模板。
+        raise RuntimeError(
+            f'无可用模型：{path} 不存在。请参照模板 {modelsExamplePath} 手动创建，'
+            f'或在 Web 设置页配置后保存。'
+        )
+    return loadModelConfigFromYaml(providerId=providerId, modelId=modelId, configPath=path, debugConsole=debugConsole)
 
 
 def loadModelConfigFromYaml(

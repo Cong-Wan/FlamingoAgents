@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.5
-Date: 2026-08-13
+Version: 1.6
+Date: 2026-09-08
 Description: SDK 入口：可编程调用 runSdk() 或 CLI 单独运行，传入 provider/model、systemPrompt、userPrompt、validTools、workDir；
              事件流逐字打印并返回完整正文；需确认工具直接拒绝（非交互）；validTools 不传则不挂任何工具。
              v1.1 新增：venv 自举（相对脚本位置定位 .venv/bin/python 重执行，跨机器迁移零配置）；
@@ -10,6 +10,7 @@ Description: SDK 入口：可编程调用 runSdk() 或 CLI 单独运行，传入
              v1.3 变更：--system 默认读取 config/systemPrompt.md，除非显式传入纯文本或其它文件路径。
              v1.4 变更：--model 帮助示例改为 kimi/k3。
              v1.5 变更：maxModelSteps 改为 -1，子代理不再被 20 步硬截断。
+             v1.6（configHomePlan P2）：--system 默认读取 ~/.flamingo/config/systemPrompt.md（改用库统一常量）；默认分支先 ensureUserConfig() 再读，修复新机器首跑时序问题。
 '''
 
 import argparse
@@ -37,6 +38,7 @@ from flamingoAgents import (
     toolCallEndEvent,
     toolCallStartEvent,
 )
+from flamingoAgents.utils.configPaths import ensureUserConfig, userSystemPromptPath
 
 
 def consumeStream(stream, chunks: list[str], out=None) -> str | None:
@@ -71,12 +73,13 @@ def consumeStream(stream, chunks: list[str], out=None) -> str | None:
 
 
 projectDir = Path(__file__).resolve().parent
-defaultSystemPromptPath = projectDir / 'config' / 'systemPrompt.md'
+defaultSystemPromptPath = userSystemPromptPath
 
 
 def resolveSystemPrompt(systemPrompt: str | None) -> str:
-    # --system 智能识别：未传则读默认 config/systemPrompt.md；传入存在的文件路径则读取内容；否则按纯文本返回。
+    # --system 智能识别：未传则读默认 ~/.flamingo/config/systemPrompt.md（先 ensure 兼容新机器首跑）；传入存在的文件路径则读取内容；否则按纯文本返回。
     if systemPrompt is None:
+        ensureUserConfig()
         return defaultSystemPromptPath.read_text(encoding='utf-8')
     candidate = Path(systemPrompt).expanduser()
     if candidate.is_file():
@@ -124,7 +127,7 @@ def runSdk(
 def parseArgs() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='FlamingoAgents SDK 入口。')
     parser.add_argument('--model', required=True, help='provider/model，如 kimi/k3')
-    parser.add_argument('--system', default=None, help='系统提示词：纯文本，或存在的文件路径（如 .md 文件）则读取其内容；不传则默认 config/systemPrompt.md')
+    parser.add_argument('--system', default=None, help='系统提示词：纯文本，或存在的文件路径（如 .md 文件）则读取其内容；不传则默认 ~/.flamingo/config/systemPrompt.md')
     parser.add_argument('--prompt', required=True, help='用户提示词')
     parser.add_argument('--tools', default='', help='逗号分隔的工具白名单，不传则不挂工具')
     parser.add_argument('--work-dir', default=None, help='工作目录，默认项目根目录')

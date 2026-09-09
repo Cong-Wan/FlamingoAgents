@@ -1,8 +1,8 @@
 <!--
 Author: wilbur
-Version: 1.19
+Version: 1.20
 Date: 2026-09-08
-Description: FlamingoAgents native Web UI shell. v1.19 加号为入口，悬停/点击弹出二级菜单再上传图片；styles.css?v=1.22。
+Description: FlamingoAgents native Web UI shell. v1.19 加号为入口，悬停/点击弹出二级菜单再上传图片；styles.css?v=1.22。v1.20（configHomePlan P4）：模型配置/技能页说明改为 ~/.flamingo/config/...。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -112,7 +112,7 @@ Description: FlamingoAgents native Web UI shell. v1.19 加号为入口，悬停/
       <section id="settingsPage" class="page hidden">
         <header class="topbar"><span class="topbar-title">模型配置</span></header>
         <div class="page-body settings-body">
-          <div class="settings-notice">与 CLI 共用 <code>config/models.yaml</code>，保存后立即生效（已建会话下次发消息时按新配置重建）。</div>
+          <div class="settings-notice">与 CLI 共用 <code>~/.flamingo/config/models.yaml</code>，保存后立即生效（已建会话下次发消息时按新配置重建）。</div>
           <section class="subscription-accounts-section">
             <div class="subscription-accounts-title">订阅账户</div>
             <div class="field-hint subscription-accounts-hint">登录与 Provider 配置相互独立；模型发现只加入当前编辑区，仍需点击页面底部“保存”。目录候选不保证最终账户权益或调用成功。</div>
@@ -150,7 +150,7 @@ Description: FlamingoAgents native Web UI shell. v1.19 加号为入口，悬停/
       <section id="skillsPage" class="page hidden">
         <header class="topbar"><span class="topbar-title">技能</span></header>
         <div class="page-body">
-          <div class="settings-notice">展示并编辑 <code>config/skills/</code> 下的技能（每个技能一个文件夹 + 一个 <code>SKILL.md</code>）。保存后下次新建会话生效；改名会同步重命名技能文件夹（附属文件随文件夹迁移）。</div>
+          <div class="settings-notice">展示并编辑 <code>~/.flamingo/config/skills/</code> 下的技能（每个技能一个文件夹 + 一个 <code>SKILL.md</code>）。保存后下次新建会话生效；改名会同步重命名技能文件夹（附属文件随文件夹迁移）。</div>
           <div id="skillsList" class="skills-list"></div>
         </div>
       </section>

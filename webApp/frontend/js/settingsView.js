@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.11
+Version: 1.12
 Date: 2026-09-08
-Description: Model editor with independent subscription discovery, non-overwrite guarded merge, account-epoch flights, and per-open revision commits. v1.10 presents live ChatGPT Codex model sync and OpenAI catalog filtering reports. v1.11 image 勾选说明为「支持图片输入」。
+Description: Model editor with independent subscription discovery, non-overwrite guarded merge, account-epoch flights, and per-open revision commits. v1.10 presents live ChatGPT Codex model sync and OpenAI catalog filtering reports. v1.11 image 勾选说明为「支持图片输入」。v1.12（configHomePlan P4）：保存提示改为 ~/.flamingo/config/models.yaml。
 */
 (function () {
   'use strict';
@@ -886,7 +886,7 @@ Description: Model editor with independent subscription discovery, non-overwrite
     try {
       await window.api.putModels(modelConfig);
       window.sidebarView.invalidateModelConfig();
-      window.alert('已保存。config/models.yaml 已更新（原文件备份为 models.yaml.bak）。');
+      window.alert('已保存。~/.flamingo/config/models.yaml 已更新（原文件备份为 models.yaml.bak）。');
       if (window.imageInput) window.imageInput.refreshCapability();
       await window.settingsView.open(); // 重新拉取，拿到最新脱敏状态
     } catch (error) {

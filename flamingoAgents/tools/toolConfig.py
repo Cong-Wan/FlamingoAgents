@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.2
-Date: 2026-07-09
-Description: Loads tool schemas (name/description/parameters) and embedded permission rules from a single YAML config (version 3). Schemas are declarative; executable handlers remain in builtinTools.py.
+Version: 1.3
+Date: 2026-09-08
+Description: Loads tool schemas (name/description/parameters) and embedded permission rules from a single YAML config (version 3). Schemas are declarative; executable handlers remain in builtinTools.py. v1.3（configHomePlan P2）：默认路径切到 ~/.flamingo/config/tools.yaml（模板在项目 config/，首次运行自动拷贝）。
 '''
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from typing import Any, Pattern
 import yaml
 
 from flamingoAgents.tools.toolDefinition import permissionRule
+from flamingoAgents.utils.configPaths import userToolsPath
 
 
 @dataclass
@@ -30,7 +31,7 @@ class toolSettings:
     toolSchemas: list[toolSchemaSpec]
 
 
-defaultToolsConfigPath = Path(__file__).resolve().parents[2] / 'config' / 'tools.yaml'
+defaultToolsConfigPath = userToolsPath
 
 
 def loadToolSettings(configPath: str | Path | None = None, debugConsole=None) -> toolSettings:
