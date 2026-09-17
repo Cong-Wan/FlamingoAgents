@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.25
-> Date: 2026-09-08
+> Version: 1.26
+> Date: 2026-09-15
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 9 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -31,6 +31,7 @@
 > v1.23：落地逐模型调用 usageUpdate 的 sessions 中间回写、liveCost 与本地 abort 校准语义。
 > v1.21：会话索引也迁至 `~/.flamingo/logs/webData/sessions.json`；新索引缺失时复制尚存的仓库旧索引，之后统一在家目录读写；索引损坏显式报错而非返回空历史。
 > v1.22：历史读取兼容旧 JSON 事件数组及其后续 JSONL 追加；提供显式 sessionRecovery 工具重建已删除索引，DTO 与日常新建写入格式不变。
+> v1.26（chatUxImprovePlan）：§2.2 新增 `kind:error`；终态 `modelError`（`willRetry` 非 true）下发，重试中仍不下发；`request`/traceback/diag 不下发。
 
 ---
 
@@ -101,7 +102,7 @@
 
 ### 2.2 message（历史消息 DTO，`GET /api/sessions/{id}/messages` 元素）
 
-三种 `kind`，按 jsonl 顺序下发（systemMessage 不下发）：
+四种 `kind`，按 jsonl 顺序下发（systemMessage 不下发）：
 
 ```json
 { "kind": "user", "content": "阅读 @/xx 文件并总结", "timestamp": "..." }
@@ -138,7 +139,18 @@
 - `assistant.toolCalls` 可能为空数组（纯文本回复）；
 - **`assistant.usage` 归一化映射表（审核 M1，嵌套取值，前后端必须一致）**：`promptTokens ← usage.prompt_tokens`；`cachedTokens ← usage.prompt_tokens_details.cached_tokens`（**嵌套字段**，缺省 0）；`completionTokens ← usage.completion_tokens`；usage 缺失/非对象 → 整个字段为 `null`；
 - **`tool.details` 原样透传**（审核 H2，与 SSE `toolCallEnd.toolResult.details` 同口径）。渲染规则：`details.reason == "userRejectedApproval"`（即 `blocked: true`）→ 呈现「**被拒绝**」；其余 `isError=true` → 呈现「失败」。不得靠匹配 content 文案判别；
-- **jsonl 事件过滤口径（审核 M2）**：`systemMessage`、`modelError` 不下发；`assistantMessage.timings` 不下发；
+```json
+{
+  "kind": "error",
+  "content": "模型调用失败（已重试3次）：...",
+  "errorType": "modelRequestError",
+  "attempt": 4,
+  "timestamp": "..."
+}
+```
+
+- **`kind:error`（v1.26）**：来源 jsonl 终态 `modelError`（`willRetry` 非 true；缺省当终态）。`content` 与 SSE `error` 文案同构：`模型调用失败（已重试N次）：{message}`，`N = max(0, attempt-1)`（jsonl `attempt` 为 1-based）。**不下发** `request` / traceback / 诊断字段。旧客户端忽略未知 kind → 兼容。
+- **jsonl 事件过滤口径（审核 M2，v1.26 修订）**：`systemMessage` 不下发；**终态 `modelError` 下发为 `kind:error`**；重试中的 `modelError`（`willRetry === true`）仍不下发；`assistantMessage.timings` 不下发；
 - 前端配对规则：`assistant.toolCalls[].id` ↔ 后续 `tool.toolCallId`；**末尾未配对的 toolCalls = dangling（中断未完成），渲染置灰卡片**——但需先经 §3.8 pending 接口识别：**pending 中的 toolCall 不按 dangling 渲染，而是重弹确认框**（审核 H1）。
 
 ### 2.3 usage（用量汇总，`GET /api/usage` 响应）

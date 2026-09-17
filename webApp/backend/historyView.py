@@ -1,11 +1,12 @@
 '''
 Author: wilbur
-Version: 1.4
-Date: 2026-09-08
-Description: 会话 jsonl 事件 → GET messages 的 UI 消息 DTO：过滤 systemMessage/modelError/timings，usage 按契约 §2.2-M1 嵌套字段归一化，tool.details 原样透传。
+Version: 1.5
+Date: 2026-09-15
+Description: 会话 jsonl 事件 → GET messages 的 UI 消息 DTO：过滤 systemMessage/重试中 modelError/timings，usage 按契约 §2.2-M1 嵌套字段归一化，tool.details 原样透传。
             v1.1 随包改名调整 import（webApp.backend.*）。v1.2（fixPlan Phase2）：assistant DTO 透传 event.reasoning（非空才带，供前端 thinking 历史渲染）。
             v1.3 按 sessions 索引 workDir 定位 ~/.flamingo/logs/webData/<folder>/{sessionId}.jsonl；不存在则直接返回 []（不构造 jsonlLog，零 mkdir）。
             v1.4（imageInputPlan）：user DTO 增加 images 引用元数据（无 base64）；严格读取 JSONL。
+            v1.5（chatUxImprovePlan）：终态 modelError（willRetry 非 true）下发 kind=error，文案对齐 SSE；request/traceback/diag 不下发。
 '''
 
 from __future__ import annotations
@@ -86,5 +87,22 @@ def loadMessages(sessionId: str) -> list[dict]:
                 'details': event.get('details') or {},
                 'timestamp': timestamp,
             })
-        # systemMessage / modelError 不下发（契约 §2.2-M2）；assistantMessage.timings 不下发。
+        elif eventType == 'modelError':
+            # 终态失败下发 kind=error；重试中的 willRetry=true 仍不下发（契约 §2.2-M2）。
+            if event.get('willRetry') is True:
+                continue
+            rawMessage = event.get('message') or ''
+            try:
+                attemptNum = int(event.get('attempt') or 1)
+            except (TypeError, ValueError):
+                attemptNum = 1
+            retries = max(0, attemptNum - 1)
+            messages.append({
+                'kind': 'error',
+                'content': f'模型调用失败（已重试{retries}次）：{rawMessage}',
+                'errorType': event.get('errorType') or '',
+                'attempt': attemptNum,
+                'timestamp': timestamp,
+            })
+        # systemMessage 不下发；重试中 modelError 已跳过；assistantMessage.timings 不下发。
     return messages

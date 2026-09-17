@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.23
-Date: 2026-09-08
+Version: 1.24
+Date: 2026-09-15
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
@@ -49,6 +49,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              v1.21 attach preInit 外层身份守卫，缓冲回放走绑定 connection。
              v1.22（fileMentionPathOnlyPlan）：当轮附件 chip tooltip 标明仅路径引用。
              v1.23（imageInputPlan）：发送/历史/attach 渲染用户图片；失败恢复图片草稿。
+             v1.24（chatUxImprovePlan）：助手文字复制；历史 kind=error 红块；↑ 召回气泡原文（send push + reloadSession 灌入，不进 renderHistory）。
 */
 (function () {
   'use strict';
@@ -558,10 +559,43 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     }
   }
 
+  function attachMessageCopy(bodyEl, rawText) {
+    if (!bodyEl) return;
+    var existing = bodyEl.querySelector('.msg-copy-btn');
+    if (!rawText) {
+      if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+      return;
+    }
+    if (existing) {
+      existing._rawMarkdown = rawText;
+      return;
+    }
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'msg-copy-btn';
+    btn.textContent = '复制';
+    btn._rawMarkdown = rawText;
+    btn.addEventListener('click', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      var copyFn = window.copyText;
+      var done = copyFn ? copyFn(btn._rawMarkdown) : Promise.reject(new Error('copyText missing'));
+      done.then(function () {
+        btn.textContent = '已复制';
+        setTimeout(function () { btn.textContent = '复制'; }, 1500);
+      }).catch(function () {
+        btn.textContent = '复制失败';
+        setTimeout(function () { btn.textContent = '复制'; }, 1500);
+      });
+    });
+    bodyEl.appendChild(btn);
+  }
+
   // 终态高亮：只重渲 contentEl，不碰 bodyEl 上的 thinking / 工具卡 / retry / interrupted / inline error
   function renderFinal(step) {
     if (!step || !step.live || !step.live.contentEl || !step.textBuf) return;
     window.renderMarkdown(step.live.contentEl, step.textBuf, { breaks: true, highlight: true });
+    attachMessageCopy(step.live.bodyEl, step.textBuf);
   }
 
   // delta 只进 buffer，每帧最多一次 DOM 写；scroll 合入 paint 回调末尾
@@ -680,13 +714,36 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     });
 
     var lastAssistant = null;
+    var lastKind = null;
     messages.forEach(function (msg) {
       if (msg.kind === 'user') {
         appendUserMessage(msg.content, null, msg.images);
+        lastKind = 'user';
       } else if (msg.kind === 'assistant') {
         lastAssistant = appendAssistantHistory(msg, toolResults, pending);
+        lastKind = 'assistant';
+      } else if (msg.kind === 'tool') {
+        lastKind = 'tool';
+      } else if (msg.kind === 'error') {
+        var bodyEl;
+        if (lastAssistant && lastAssistant.bodyEl && (lastKind === 'assistant' || lastKind === 'tool')) {
+          bodyEl = lastAssistant.bodyEl;
+        } else {
+          var shell = buildAssistantShell();
+          messageListEl.appendChild(shell.row);
+          lastAssistant = {
+            bodyEl: shell.body,
+            contentEl: null,
+            content: '',
+            thinkingEl: null,
+            thinkingSummaryEl: null,
+            thinkingContentEl: null
+          };
+          bodyEl = shell.body;
+        }
+        appendInlineErrorBlock(bodyEl, msg.content);
+        lastKind = 'error';
       }
-      // kind === 'tool' 已通过配对消费，不单独渲染
     });
     scrollToBottom();
     return lastAssistant;
@@ -704,6 +761,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     }
     shell.body.appendChild(contentEl);
     window.renderMarkdown(contentEl, msg.content || '', { breaks: true, highlight: true });
+    attachMessageCopy(shell.body, msg.content || '');
 
     (msg.toolCalls || []).forEach(function (toolCall) {
       var result = toolResults[toolCall.id];
@@ -1098,6 +1156,60 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     updateComposer();
   }
 
+  /* ---------- ↑ 召回（chatUxImprovePlan D4）：只记气泡原文；不进 renderHistory / attach ---------- */
+  var INPUT_HISTORY_MAX = 100;
+  var inputHistoryBySession = {};
+  var recallBrowse = null;
+  var recallDraft = '';
+
+  function inputHistoryList(sessionId) {
+    if (!sessionId) return [];
+    if (!inputHistoryBySession[sessionId]) inputHistoryBySession[sessionId] = [];
+    return inputHistoryBySession[sessionId];
+  }
+
+  function recallTextFromUserContent(content) {
+    var text = userBubbleText(content || '');
+    ATTACHMENT_RE.lastIndex = 0;
+    text = text.replace(ATTACHMENT_RE, '');
+    return String(text || '').replace(/^\s+|\s+$/g, '');
+  }
+
+  function pushInputHistory(sessionId, text) {
+    if (!sessionId || !text) return;
+    var list = inputHistoryList(sessionId);
+    if (list.length && list[list.length - 1] === text) return;
+    list.push(text);
+    if (list.length > INPUT_HISTORY_MAX) list.splice(0, list.length - INPUT_HISTORY_MAX);
+  }
+
+  function rebuildInputHistory(sessionId, messages) {
+    var list = [];
+    (messages || []).forEach(function (msg) {
+      if (msg.kind !== 'user') return;
+      var text = recallTextFromUserContent(msg.content);
+      if (!text) return;
+      if (list.length && list[list.length - 1] === text) return;
+      list.push(text);
+    });
+    if (list.length > INPUT_HISTORY_MAX) list = list.slice(-INPUT_HISTORY_MAX);
+    if (sessionId) inputHistoryBySession[sessionId] = list;
+    if (recallBrowse && recallBrowse.sessionId === sessionId) recallBrowse = null;
+  }
+
+  function applyRecallValue(value) {
+    composerInput.value = value;
+    autoResize();
+    var end = composerInput.value.length;
+    composerInput.selectionStart = end;
+    composerInput.selectionEnd = end;
+  }
+
+  function resetRecallBrowse() {
+    recallBrowse = null;
+    recallDraft = '';
+  }
+
   /* ---------- 发消息 / 确认 / 停止 ---------- */
 
   async function send(options) {
@@ -1186,6 +1298,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         images: imagePayload,
         imageDrafts: imageDisplay
       };
+      pushInputHistory(sessionId, displayText);
+      resetRecallBrowse();
       text = wireText;
     }
 
@@ -1278,6 +1392,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var messages = results[0].messages || [];
     var pending = results[1] ? results[1].pending : null;
     var lastAssistant = renderHistory(messages, pending);
+    rebuildInputHistory(sessionId, messages);
     if (pending) {
       enterWaitingConfirm(pending, lastAssistant);
     } else {
@@ -1369,6 +1484,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
   window.chatView = {
     open: async function (sessionId) {
       clearLatestBound();
+      resetRecallBrowse();
       window.appStore.currentSessionId = sessionId;
       window.statusBar.resetForSession(sessionId);
       stickToBottom = true;
@@ -1398,6 +1514,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
     showEmpty: function () {
       clearLatestBound();
+      resetRecallBrowse();
       window.appStore.currentSessionId = null;
       window.statusBar.resetForSession(null);
       stickToBottom = true;
@@ -1460,9 +1577,50 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       send();
+      return;
+    }
+    if (event.isComposing || event.keyCode === 229) return;
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+    var sessionId = window.appStore.currentSessionId;
+    var list = inputHistoryList(sessionId);
+    if (event.key === 'ArrowUp') {
+      if (!recallBrowse) {
+        if (composerInput.value !== '') return;
+        if (!list.length) return;
+        event.preventDefault();
+        recallDraft = composerInput.value;
+        recallBrowse = { sessionId: sessionId, index: list.length - 1 };
+        applyRecallValue(list[recallBrowse.index]);
+        return;
+      }
+      if (recallBrowse.sessionId !== sessionId) {
+        recallBrowse = null;
+        return;
+      }
+      event.preventDefault();
+      if (recallBrowse.index > 0) {
+        recallBrowse.index -= 1;
+        applyRecallValue(list[recallBrowse.index]);
+      }
+      return;
+    }
+    if (!recallBrowse || recallBrowse.sessionId !== sessionId) return;
+    event.preventDefault();
+    if (recallBrowse.index < list.length - 1) {
+      recallBrowse.index += 1;
+      applyRecallValue(list[recallBrowse.index]);
+    } else {
+      recallBrowse = null;
+      applyRecallValue(recallDraft);
     }
   });
-  composerInput.addEventListener('input', autoResize);
+  composerInput.addEventListener('input', function () {
+    autoResize();
+    if (!recallBrowse) return;
+    var sessionId = window.appStore.currentSessionId;
+    var list = inputHistoryList(sessionId);
+    if (composerInput.value !== list[recallBrowse.index]) recallBrowse = null;
+  });
 
   document.getElementById('confirmApprove').addEventListener('click', function () { confirm(true); });
   document.getElementById('confirmReject').addEventListener('click', function () { confirm(false); });

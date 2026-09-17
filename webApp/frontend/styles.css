@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.22
-Date: 2026-09-08
-Description: FlamingoAgents native Web styles. v1.19 enlarges tool input/output previews and aligns their collapsible line height. v1.20 图片草稿缩略图与用户气泡图片。v1.22 加号入口与上传图片二级菜单。
+Version: 1.24
+Date: 2026-09-15
+Description: FlamingoAgents native Web styles. v1.19 enlarges tool input/output previews and aligns their collapsible line height. v1.20 图片草稿缩略图与用户气泡图片。v1.22 加号入口与上传图片二级菜单。v1.23（chatUxImprovePlan）：代码/文字复制按钮与 mermaid 容器。v1.24：mermaid 节点文字用正文色，避免继承过浅。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -229,7 +229,7 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
   background: #ffe9ec; display: flex; align-items: center; justify-content: center;
   font-size: 17px; margin-right: 12px;
 }
-.msg-body { flex: 1; min-width: 0; font-size: 14px; line-height: 1.7; }
+.msg-body { flex: 1; min-width: 0; font-size: 14px; line-height: 1.7; position: relative; padding-right: 48px; }
 .msg-interrupted {
   display: inline-block; font-size: 12px; color: var(--warn);
   border: 1px solid var(--warn); border-radius: 999px; padding: 1px 8px; margin-top: 8px;
@@ -272,8 +272,30 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
 .markdown-content img { max-width: 100%; height: auto; border-radius: 6px; }
 .markdown-content pre {
   background: var(--gray-block); color: var(--text); border: 1px solid var(--border);
-  border-radius: 8px; padding: 12px; overflow-x: auto; font-size: 13px; margin: 10px 0;
+  border-radius: 8px; padding: 12px; padding-right: 52px; overflow-x: auto; font-size: 13px; margin: 10px 0;
+  position: relative;
 }
+.copy-btn, .msg-copy-btn {
+  position: absolute; top: 8px; right: 8px; z-index: 2;
+  border: 1px solid var(--border); background: #fff; color: var(--text-dim);
+  border-radius: 6px; padding: 2px 8px; font-size: 12px; line-height: 1.4;
+  opacity: 0; transition: opacity .15s;
+}
+.msg-copy-btn { top: 0; right: 0; }
+.markdown-content pre:hover .copy-btn,
+.copy-btn:focus-visible,
+.msg-assistant:hover .msg-copy-btn,
+.msg-copy-btn:focus-visible { opacity: 1; }
+@media (hover: none) {
+  .copy-btn, .msg-copy-btn { opacity: 1; }
+}
+.mermaid-block, .mermaid-fallback {
+  margin: 10px 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px;
+  overflow-x: auto; text-align: center; background: #fff; color: var(--text); font-size: 13px;
+}
+.mermaid-block svg { max-width: 100%; height: auto; color: var(--text); }
+.mermaid-block-error { color: var(--danger); font-size: 12px; margin-bottom: 8px; text-align: left; }
+.mermaid-fallback pre { margin: 0; text-align: left; }
 .markdown-content code { font-family: "SF Mono", Menlo, Consolas, monospace; }
 .markdown-content pre code { background: none; padding: 0; }
 .markdown-content pre code.hljs { background: transparent; padding: 0; }
