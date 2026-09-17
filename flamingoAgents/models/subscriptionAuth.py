@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-09-01
+Version: 1.1
+Date: 2026-09-14
 Description: Implements native Python OAuth login, device polling, refresh, cancellation, and concurrency-safe credential resolution for ChatGPT Codex and xAI subscriptions.
 '''
 
@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -28,7 +26,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
-from flamingoAgents.models.credentialStore import credentialStore, defaultCredentialStore, oauthCredential
+from flamingoAgents.models.credentialStore import currentUid, credentialStore, defaultCredentialStore, oauthCredential
+from flamingoAgents.utils.fileLock import lockExclusive, unlock
 
 openAiClientId = 'app_EMoamEEZ73f0CkXaXp7hrann'
 openAiAuthBaseUrl = 'https://auth.openai.com'
@@ -228,13 +227,16 @@ class callbackLease:
                 0o600,
             )
             lockStat = os.fstat(lockFd)
-            if not stat.S_ISREG(lockStat.st_mode) or lockStat.st_uid != os.getuid():
+            uid = currentUid()
+            if not stat.S_ISREG(lockStat.st_mode) or (uid is not None and lockStat.st_uid != uid):
                 os.close(lockFd)
                 self.release()
                 return False
-            os.fchmod(lockFd, 0o600)
+            fchmod = getattr(os, 'fchmod', None)
+            if fchmod is not None:
+                fchmod(lockFd, 0o600)
             try:
-                fcntl.flock(lockFd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lockExclusive(lockFd, nonBlocking=True)
             except OSError:
                 os.close(lockFd)
                 self.release()
@@ -248,7 +250,7 @@ class callbackLease:
     def release(self) -> None:
         if self.lockFd is not None:
             try:
-                fcntl.flock(self.lockFd, fcntl.LOCK_UN)
+                unlock(self.lockFd)
             finally:
                 os.close(self.lockFd)
                 self.lockFd = None

@@ -2,9 +2,9 @@
 
 <!--
 Author: wilbur
-Version: 1.3
-Date: 2026-09-08
-Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history. v1.1：Web @ 改为仅路径引用，不预读文件内容。v1.2：模型勾选 image 后支持图片输入（上传落盘 + @ 图片快照，请求体 data URL）。v1.3（configHomePlan）：运行时配置迁到 ~/.flamingo/config/，项目 config/ 仅保留模板与说明。
+Version: 1.4
+Date: 2026-09-14
+Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history. v1.1：Web @ 改为仅路径引用，不预读文件内容。v1.2：模型勾选 image 后支持图片输入（上传落盘 + @ 图片快照，请求体 data URL）。v1.3（configHomePlan）：运行时配置迁到 ~/.flamingo/config/，项目 config/ 仅保留模板与说明。v1.4：原生 Windows 可启动 Web；完整能力仍以 POSIX 为准。
 -->
 
 ## 现状能力
@@ -78,6 +78,24 @@ FLAMINGO_WEB_TOKEN=你的token uv run python -m webApp
 # 浏览器打开 http://<本机IP>:8787，输入 token 登录
 ```
 
+### Windows（PowerShell）
+
+原生 Windows 可以启动 Web 并读写 `~\.flamingo\auth.json`，**不是**完整 Windows 移植：进程组、部分路径语义、Unix 文件权限仍以 macOS/Linux 为准。需要完整 POSIX 行为时用 WSL2。
+
+```powershell
+# 1. 配置目录（models.yaml 不会自动生成）
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.flamingo\config" | Out-Null
+Copy-Item .\config\models.example.yaml "$env:USERPROFILE\.flamingo\config\models.yaml"
+# 再按需删减 provider、填入真实 key；或启动后用 Web 设置页保存
+
+# 2. 启动 Web（必须显式设置 token）
+$env:FLAMINGO_WEB_TOKEN = "你的token"
+uv run python -m webApp
+# 浏览器打开 http://127.0.0.1:8787，输入 token 登录
+```
+
+OAuth 凭据在 Windows 上依赖当前用户目录隔离，没有 Unix 的目录 0700 / 文件 0600。同一用户家目录只运行一个 Web 实例。
+
 ## 索引丢失后的显式历史恢复
 
 如果 `sessions.json` 已删除但家目录日志仍在，改路径不会自动让旧历史出现。先停止会话写入、备份日志，并通过 SQLite backup API 获取一致的 `usage.db` 副本，再运行恢复工具（`--work-dir` 可重复；必须填写真实目录，不能把日志文件夹名中的 `-` 反推成 `/`）：
@@ -112,7 +130,7 @@ uv run python modelLogin.py logout xai
 
 Web 模型设置页顶部始终显示独立的“订阅账户”。ChatGPT 登录后只读请求固定的 `https://chatgpt.com/backend-api/codex/models?client_version=0.153.4`，同步当前账户中官方标记为可见的 Codex 模型（包括 GPT-6）；隐藏或缺少必要元数据的模型会带原因跳过。xAI 登录后只读请求固定的 `https://api.x.ai/v1/models`，并把实时 ID 与内置 Responses 元数据取交集。候选只加入浏览器编辑区，用户点击“保存”后才写 `~/.flamingo/config/models.yaml`；目录结果不保证每次调用一定成功。
 
-OAuth 凭据仅写入 `~/.flamingo/auth.json`（目录 0700、文件 0600），不会进入 `~/.flamingo/config/models.yaml`、浏览器响应或会话 JSONL；Access Token 到期前自动刷新。ChatGPT 与 xAI 模型发现均遵循标准 `HTTPS_PROXY/NO_PROXY`、禁止全部 HTTP 重定向、限制响应大小；401 只进行一次带 stale-token 并发保护的刷新重试。
+OAuth 凭据仅写入 `~/.flamingo/auth.json`（POSIX 上目录 0700、文件 0600；Windows 无 Unix mode/uid，依赖用户目录隔离），不会进入 `~/.flamingo/config/models.yaml`、浏览器响应或会话 JSONL；Access Token 到期前自动刷新。ChatGPT 与 xAI 模型发现均遵循标准 `HTTPS_PROXY/NO_PROXY`、禁止全部 HTTP 重定向、限制响应大小；401 只进行一次带 stale-token 并发保护的刷新重试。
 
 Responses 会把多轮继续所需的加密 reasoning/item ID 以白名单字段写入会话 JSONL；它们不是 Access/Refresh Token，但会话日志仍应按敏感数据保护。
 

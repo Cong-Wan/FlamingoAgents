@@ -42,9 +42,10 @@ def testWritePermissionsRoundTripAndSafeRepr(tmp_path: Path) -> None:
     loaded = store.readCredential('openai-codex')
 
     assert loaded == credential
-    assert stat.S_IMODE(os.lstat(store.baseDir).st_mode) == 0o700
-    assert stat.S_IMODE(os.lstat(store.authPath).st_mode) == 0o600
-    assert stat.S_IMODE(os.lstat(store.lockPath).st_mode) == 0o600
+    if os.name != 'nt':
+        assert stat.S_IMODE(os.lstat(store.baseDir).st_mode) == 0o700
+        assert stat.S_IMODE(os.lstat(store.authPath).st_mode) == 0o600
+        assert stat.S_IMODE(os.lstat(store.lockPath).st_mode) == 0o600
     assert 'secret-access' not in repr(loaded)
     assert 'secret-refresh' not in repr(loaded)
 
@@ -77,6 +78,7 @@ def testCorruptJsonIsNotOverwritten(tmp_path: Path) -> None:
     assert store.authPath.read_text(encoding='utf-8') == '{broken'
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='符号链接拒绝仅在 POSIX 上验证')
 def testSymlinkCredentialAndLockAreRejected(tmp_path: Path) -> None:
     baseDir = tmp_path / 'authHome'
     baseDir.mkdir(mode=0o700)
@@ -96,6 +98,8 @@ def testSymlinkCredentialAndLockAreRejected(tmp_path: Path) -> None:
 
 
 def testTwoProcessesDoNotLoseDifferentProviderWrites(tmp_path: Path) -> None:
+    if 'fork' not in multiprocessing.get_all_start_methods():
+        pytest.skip('跨进程 flock 测试需要 fork')
     baseDir = str(tmp_path / 'authHome')
     context = multiprocessing.get_context('fork')
     first = context.Process(target=writeProvider, args=(baseDir, 'openai-codex', 'openai'))

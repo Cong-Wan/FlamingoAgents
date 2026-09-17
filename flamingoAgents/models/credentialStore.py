@@ -1,14 +1,13 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-09-01
-Description: Stores ChatGPT/xAI OAuth credentials in ~/.flamingo/auth.json with strict validation, stable cross-process locking, ownership/type checks, and atomic 0600 writes.
+Version: 1.1
+Date: 2026-09-14
+Description: Stores ChatGPT/xAI OAuth credentials in ~/.flamingo/auth.json with strict validation, stable cross-process locking, ownership/type checks, and atomic 0600 writes. Windows uses LockFileEx and skips POSIX uid/mode bits.
 '''
 
 from __future__ import annotations
 
 import errno
-import fcntl
 import json
 import os
 import secrets
@@ -19,7 +18,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from flamingoAgents.utils.fileLock import lockExclusive, unlock
+
 canonicalProviders = frozenset({'openai-codex', 'xai'})
+
+
+def currentUid() -> int | None:
+    getter = getattr(os, 'getuid', None)
+    return None if getter is None else getter()
+
+
+def applyFdMode(fd: int, mode: int) -> None:
+    fchmod = getattr(os, 'fchmod', None)
+    if fchmod is not None:
+        fchmod(fd, mode)
 
 
 class credentialStoreError(RuntimeError):
@@ -132,11 +144,24 @@ class credentialStore:
         typeMatches = stat.S_ISDIR(pathStat.st_mode) if expected == 'directory' else stat.S_ISREG(pathStat.st_mode)
         if not typeMatches:
             raise credentialStoreError(f'凭据路径类型非法（期望 {expected}）：{path}')
-        if pathStat.st_uid != os.getuid():
+        uid = currentUid()
+        if uid is not None and pathStat.st_uid != uid:
             raise credentialStoreError(f'凭据路径不属于当前用户：{path}')
 
     def _openFlags(self, baseFlags: int) -> int:
         return baseFlags | getattr(os, 'O_NOFOLLOW', 0)
+
+    def _syncDirectory(self) -> None:
+        try:
+            directoryFd = os.open(self.baseDir, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        except OSError:
+            if os.name == 'nt':
+                return
+            raise
+        try:
+            os.fsync(directoryFd)
+        finally:
+            os.close(directoryFd)
 
     @contextmanager
     def _locked(self, provider: str) -> Iterator[None]:
@@ -152,12 +177,12 @@ class credentialStore:
             try:
                 lockStat = os.fstat(lockFd)
                 self._validateOwnedType(self.lockPath, lockStat, expected='file')
-                os.fchmod(lockFd, 0o600)
-                fcntl.flock(lockFd, fcntl.LOCK_EX)
+                applyFdMode(lockFd, 0o600)
+                lockExclusive(lockFd)
                 yield
             finally:
                 try:
-                    fcntl.flock(lockFd, fcntl.LOCK_UN)
+                    unlock(lockFd)
                 finally:
                     os.close(lockFd)
 
@@ -209,7 +234,7 @@ class credentialStore:
                 self._openFlags(os.O_WRONLY | os.O_CREAT | os.O_EXCL),
                 0o600,
             )
-            os.fchmod(tempFd, 0o600)
+            applyFdMode(tempFd, 0o600)
             with os.fdopen(tempFd, 'wb') as tempFile:
                 tempFd = -1
                 tempFile.write(payload)
@@ -218,12 +243,11 @@ class credentialStore:
             os.replace(tempPath, self.authPath)
             authStat = os.lstat(self.authPath)
             self._validateOwnedType(self.authPath, authStat, expected='file')
-            os.chmod(self.authPath, 0o600, follow_symlinks=False)
-            directoryFd = os.open(self.baseDir, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
             try:
-                os.fsync(directoryFd)
-            finally:
-                os.close(directoryFd)
+                os.chmod(self.authPath, 0o600, follow_symlinks=False)
+            except (NotImplementedError, TypeError):
+                os.chmod(self.authPath, 0o600)
+            self._syncDirectory()
         except OSError as error:
             raise credentialStoreError(f'写入凭据文件失败：{error}') from error
         finally:
