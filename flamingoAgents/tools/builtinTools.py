@@ -1,14 +1,16 @@
 '''
 Author: wilbur
-Version: 1.7
-Date: 2026-08-13
-Description: Provides executable handlers (execute/preview) for built-in tools and a name-keyed registry mapping them to schema-driven tool definitions. Schemas and permissions come from config/tools.yaml. v1.4 adds askSubAgent: wraps sdkEntry.py as a sub-agent function call (JSON stdout parsed into toolOutput). v1.5: askSubAgent omits --system when not provided so the sub-agent falls back to the default config/systemPrompt.md. v1.6: askSubAgent timeout is a passthrough argument (default 600s, max 3600s) instead of a hardcoded 600s. v1.7（stopResponsivenessPlan L3.5）：新增 _runWithInterrupt——interruptEvent 非 None 时 subprocess 改 Popen 分片 poll，中断即 terminate/kill 并 raise modelInterruptedError，bash/askSubAgent 均接入。
+Version: 1.8
+Date: 2026-09-17
+Description: Provides executable handlers (execute/preview) for built-in tools and a name-keyed registry mapping them to schema-driven tool definitions. Schemas and permissions come from config/tools.yaml. v1.4 adds askSubAgent: wraps sdkEntry.py as a sub-agent function call (JSON stdout parsed into toolOutput). v1.5: askSubAgent omits --system when not provided so the sub-agent falls back to the default config/systemPrompt.md. v1.6: askSubAgent timeout is a passthrough argument (default 600s, max 3600s) instead of a hardcoded 600s. v1.7（stopResponsivenessPlan L3.5）：新增 _runWithInterrupt——interruptEvent 非 None 时 subprocess 改 Popen 分片 poll，中断即 terminate/kill 并 raise modelInterruptedError，bash/askSubAgent 均接入。v1.8（bashPipeHangSessionLockFixPlan）：两条路径都走有界 Popen；首领退出后 0.5s 管道宽限；TERM 后固定 sleep 再无条件 SIGKILL；close 读端后不再 communicate。
 '''
 
 from __future__ import annotations
 
 import difflib
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -156,63 +158,112 @@ def previewBashTool(arguments: dict[str, Any]) -> str:
     return str(arguments.get('command', ''))
 
 
+def _isInterrupted(context: toolContext) -> bool:
+    return context.interruptEvent is not None and context.interruptEvent.is_set()
+
+
+def _pipeText(value) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='replace')
+    return ''
+
+
+def _closeReadPipes(process: subprocess.Popen) -> None:
+    for stream in (process.stdout, process.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _signalGroup(process: subprocess.Popen, sig, fallback) -> None:
+    try:
+        os.killpg(process.pid, sig)
+    except Exception:
+        try:
+            fallback()
+        except Exception:
+            pass
+
+
+def _killProcessGroup(process: subprocess.Popen) -> None:
+    # 首领已 reap 时 wait 会立刻成功，不代表进程组已空；TERM 后固定等再无条件 SIGKILL。
+    _signalGroup(process, signal.SIGTERM, process.terminate)
+    time.sleep(0.5)
+    _signalGroup(process, getattr(signal, 'SIGKILL', signal.SIGTERM), process.kill)
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _finishStop(
+    process: subprocess.Popen,
+    reason: str,
+    command: list[str],
+    timeout: int,
+    partialOut,
+    partialErr,
+) -> None:
+    _killProcessGroup(process)
+    stdoutText = _pipeText(partialOut)
+    stderrText = _pipeText(partialErr)
+    try:
+        stdout, stderr = process.communicate(timeout=0.3)
+        stdoutText = _pipeText(stdout) or stdoutText
+        stderrText = _pipeText(stderr) or stderrText
+    except subprocess.TimeoutExpired as error:
+        stdoutText = _pipeText(error.stdout) or stdoutText
+        stderrText = _pipeText(error.stderr) or stderrText
+        _closeReadPipes(process)
+        try:
+            process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+    if reason == 'interrupt':
+        raise modelInterruptedError('用户已停止')
+    raise subprocess.TimeoutExpired(command, timeout, output=stdoutText, stderr=stderrText)
+
+
 def _runWithInterrupt(command: list[str], context: toolContext, timeout: int) -> subprocess.CompletedProcess:
-    # stopResponsivenessPlan L3.5：interruptEvent 非 None 时改 Popen 分片 poll，
-    # 置位即 terminate（0.5s 未退再 kill）并 raise modelInterruptedError；超时语义与 subprocess.run 一致。
-    if context.interruptEvent is None:
-        return subprocess.run(
-            command,
-            cwd=str(context.workDir),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+    # 有界 Popen：poll 循环查中断/deadline；首领退出后 0.5s 管道宽限；未 EOF 当超时杀组。
     process = subprocess.Popen(
         command,
         cwd=str(context.workDir),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        start_new_session=True,   # 独立进程组：terminate/kill 用 killpg 杀整组（含 bash 的子进程 sleep 等）
+        start_new_session=True,
     )
     deadline = time.monotonic() + timeout
-    while process.poll() is None:
-        if context.interruptEvent.is_set():
-            _killProcessGroup(process)
-            raise modelInterruptedError('用户已停止')
-        if time.monotonic() > deadline:
-            _killProcessGroup(process)
-            stdout, stderr = process.communicate()
-            raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
-        time.sleep(0.1)
-    stdout, stderr = process.communicate()
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-
-
-def _killProcessGroup(process: subprocess.Popen) -> None:
-    # 优先杀进程组（start_new_session=True 时 pgid=pid）；退化杀单进程。
+    partialOut = None
+    partialErr = None
     try:
-        import os
-        import signal
-        os.killpg(process.pid, signal.SIGTERM)
-    except Exception:
-        process.terminate()
-    try:
-        process.wait(0.5)
-    except subprocess.TimeoutExpired:
-        try:
-            import os
-            import signal
-            os.killpg(process.pid, signal.SIGKILL)
-        except Exception:
-            process.kill()
-        process.wait()
-    # 兜底 reap：bash 被杀后其子进程（sleep 等）可能已成孤儿，wait 防僵尸
-    try:
-        process.wait(timeout=0.1)
-    except Exception:
-        pass
+        while process.poll() is None:
+            if _isInterrupted(context):
+                _finishStop(process, 'interrupt', command, timeout, partialOut, partialErr)
+            if time.monotonic() >= deadline:
+                _finishStop(process, 'timeout', command, timeout, partialOut, partialErr)
+            time.sleep(0.1)
+        graceDeadline = time.monotonic() + 0.5
+        while True:
+            if _isInterrupted(context):
+                _finishStop(process, 'interrupt', command, timeout, partialOut, partialErr)
+            remaining = graceDeadline - time.monotonic()
+            if remaining <= 0:
+                _finishStop(process, 'timeout', command, timeout, partialOut, partialErr)
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired as error:
+                partialOut = error.stdout
+                partialErr = error.stderr
+    finally:
+        _closeReadPipes(process)
 
 
 def bashTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:
