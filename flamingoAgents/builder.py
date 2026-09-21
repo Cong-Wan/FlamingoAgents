@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.8
-Date: 2026-09-08
-Description: Pure-library Agent assembly factory. v1.7 dispatches openai-completions to the unchanged static-key adapter and ChatGPT/xAI Responses APIs to the dynamic auth Responses adapter. v1.8（configHomePlan P2）：默认系统提示词路径切到 ~/.flamingo/config/systemPrompt.md；createAgent 开头调用 ensureUserConfig() 完成用户配置目录初始化。
+Version: 1.9
+Date: 2026-09-21
+Description: Pure-library Agent assembly factory. v1.9 将 tools.yaml v4 parallelToolPool 在工具白名单过滤后取交集注入 agent。
 '''
 
 from __future__ import annotations
@@ -75,6 +75,9 @@ def createAgent(
         definitions = [definition for definition in definitions if definition.name in toolNames]
         if printer.isDebug:
             printer.debug(f'内置工具白名单生效 tools={",".join(d.name for d in definitions) or "<empty>"}')
+    enabledNames = {definition.name for definition in definitions}
+    pool = settings.parallelToolPool
+    poolNames = frozenset(name for name in pool.toolNames if name in enabledNames)
     if systemPrompt is not None and systemPrompt.strip():
         if systemPromptPath is not None and printer.isDebug:
             printer.debug('systemPrompt 直传生效，忽略 systemPromptPath。')
@@ -110,4 +113,6 @@ def createAgent(
         logDir=resolvedLogDir,
         systemPrompt=systemPromptText,
         debugConsole=printer,
+        parallelToolNames=poolNames,
+        maxParallelTools=pool.maxWorkers,
     )

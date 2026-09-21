@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.18
-Date: 2026-09-08
-Description: FastAPI application and authenticated REST/SSE routes. v1.14 adds no-store subscription model-candidate discovery with credential-generation race rejection and structured secret-free errors. v1.15 prints traceback in fallbackErrorHandler so pre-stream 500s leave a stderr stack. v1.16：chat/stream 附件注释改为路径引用，调用仍走 buildAttachmentMessage。v1.17（imageInputPlan）：chat/stream 支持 images 与 @ 图片快照、有界请求体、图片读取端点、删除会话时清理图片目录。v1.18（configHomePlan P3）：会话创建与切模型预检 400 文案更新为无可用模型指引（~/.flamingo/config/models.yaml + 模板参照）。
+Version: 1.19
+Date: 2026-09-21
+Description: FastAPI application and authenticated REST/SSE routes. v1.19 chat/stream 与 chat/confirm 在建 agent/stream 前走 Core idle gate，draining 完成后重建并透传 runEvent。
 '''
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import traceback
 from pathlib import Path
 
@@ -673,6 +674,11 @@ def chatStreamSync(body: dict):
     if attachments:
         # 后端拼接路径引用（仅位置，不读内容）：落 jsonl 与发模型的都是拼接后文本，resume 上下文一致。
         cleanMessage = fileBrowser.buildAttachmentMessage(cleanMessage, session['workDir'], attachments)
+    idleState = agentManager.waitForCoreIdle(sessionId)
+    if idleState == 'active':
+        raise HTTPException(status_code=409, detail='该会话已有活跃流，请稍后再试。')
+    if idleState == 'timeout':
+        raise HTTPException(status_code=409, detail='该会话仍在收尾，请稍后再试。')
     agentInstance = agentManager.getAgent(sessionId)
     supportsImage = bool(getattr(getattr(agentInstance.modelAdapter, 'config', None), 'supportsImageInput', False))
     if uploadedImages and not supportsImage:
@@ -685,26 +691,20 @@ def chatStreamSync(body: dict):
         except imageInputError as error:
             mapImageError(error)
     userImagesMeta: list[dict] = []
+    runEvent = threading.Event()
     stream = agentInstance.runUserMessageStream(
-        cleanMessage, sessionId, images=outgoingImages, committedImages=userImagesMeta,
+        cleanMessage, sessionId, images=outgoingImages, committedImages=userImagesMeta, runEvent=runEvent,
     )
     # baseCount 水位线（multiWindowStreamingPlan §4.3）：生成器惰性，appendUserMessage 在泵线程首次迭代才发生，采样必然先于写盘。
     baseCount = len(historyView.loadMessages(sessionId))
     streamMeta = {'baseCount': baseCount, 'userMessage': cleanMessage, 'userImages': userImagesMeta}
-    pump = agentManager.startStream(sessionId, agentInstance, stream, meta=streamMeta)
+    pump = agentManager.startStream(sessionId, agentInstance, stream, meta=streamMeta, runEvent=runEvent)
     if pump is None:
-        # 宽容闸（stopResponsivenessPlan §4.1.A）：旧泵已 stopping 且会话锁空闲，
-        # 说明收尾只差泵 finally 的毫秒级簿记 → wait(2) 后重试一次 startStream。
-        # 探测成功必须立即 release，只作空闲性读数，绝不持锁出临界区。
-        oldPump = agentManager.getActivePump(sessionId)
-        if oldPump is not None and oldPump.stopFlag.is_set():
-            sessionLock = agentInstance.getSessionLock(sessionId)
-            if sessionLock.acquire(blocking=False):
-                sessionLock.release()
-                if oldPump.doneEvent.wait(2):
-                    pump = agentManager.startStream(sessionId, agentInstance, stream, meta=streamMeta)
-        if pump is None:
-            raise HTTPException(status_code=409, detail='该会话已有活跃流，请稍后再试。')
+        try:
+            stream.close()
+        except Exception:
+            pass
+        raise HTTPException(status_code=409, detail='该会话已有活跃流，请稍后再试。')
     # 首条用户消息发出后标题自动改为前 20 字；发消息刷新 updatedAt（契约 §2.1）。
     # 纯附件发送（D8）时标题取第一个附件名，同样截断前 20 字（评审 L3）。
     titleSource = message.strip()
@@ -728,14 +728,25 @@ def chatConfirm(body: dict = Body(...)):
     approved = body.get('approved')
     if not isinstance(approved, bool):
         raise HTTPException(status_code=400, detail='approved 必须是布尔值。')
+    idleState = agentManager.waitForCoreIdle(sessionId)
+    if idleState == 'active':
+        raise HTTPException(status_code=409, detail='该会话已有活跃流，请稍后再试。')
+    if idleState == 'timeout':
+        raise HTTPException(status_code=409, detail='该会话仍在收尾，请稍后再试。')
     agentInstance = agentManager.getAgent(sessionId)
-    stream = agentInstance.continueConfirmationStream(sessionId, confirmationId, approved)
+    runEvent = threading.Event()
+    stream = agentInstance.continueConfirmationStream(sessionId, confirmationId, approved, runEvent=runEvent)
     baseCount = len(historyView.loadMessages(sessionId))
     pump = agentManager.startStream(
         sessionId, agentInstance, stream,
         meta={'baseCount': baseCount, 'userMessage': None, 'userImages': []},
+        runEvent=runEvent,
     )
     if pump is None:
+        try:
+            stream.close()
+        except Exception:
+            pass
         raise HTTPException(status_code=409, detail='该会话已有活跃流，请稍后再试。')
     sessionStore.touchSession(sessionId)
     return sseResponse(pump)

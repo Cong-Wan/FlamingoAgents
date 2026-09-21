@@ -1,9 +1,9 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-09-08
+Version: 1.1
+Date: 2026-09-21
 Description: Web 图片输入测试（imageInputPlan P2）：上传落盘、@ 图片快照、纯文本模型拒绝上传图、@ 图回退路径引用、
-             图片端点拘禁、deleteSession 清理目录、有界请求体。使用伪会话/伪 token，不碰真实数据。
+             图片端点拘禁、deleteSession 清理目录、有界请求体。v1.1 兼容 startStream 的 runEvent 关键字参数。
 '''
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ def patchSession(monkeypatch, sessionId: str, workDir: str, supportsImage: bool 
 
     agent.runUserMessageStream.side_effect = runUserMessageStream
 
-    def fakeStartStream(_sessionId, _agent, _stream, meta=None):
+    def fakeStartStream(_sessionId, _agent, _stream, meta=None, runEvent=None):
         captured['meta'] = meta
         pump = FakePump()
         pump.meta = meta or {}

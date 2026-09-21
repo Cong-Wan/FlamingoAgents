@@ -1,14 +1,16 @@
 '''
 Author: wilbur
-Version: 1.23
-Date: 2026-09-08
-Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.21 writes modelRequestStart per attempt and merges adapter diag plus attempt/willRetry/backoffMs into modelError without changing retry semantics. v1.22 yields usageUpdateEvent after each model step with legal terminal usage, using an outer-step value-copied baseline. v1.23（imageInputPlan）：keyword-only images、锁内预算/落盘/hydration、unsupportedImageInput、同步 errorType 透传、错误请求脱敏。
+Version: 1.24
+Date: 2026-09-21
+Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.24 引入批次事务账本、每流单调 runEvent、池内连续调用屏障汇合并发，以及任意 yield 关闭后的原序幂等闭合。
 '''
 
 from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Iterator
@@ -58,7 +60,37 @@ from flamingoAgents.tools.toolSchema import buildModelTools
 MODEL_RETRY_MAX_ATTEMPTS = 3        # 最多重试 3 次（即最多 4 次尝试）
 MODEL_RETRY_BACKOFF_BASE_SECONDS = 1.0
 MODEL_RETRY_BACKOFF_MAX_SECONDS = 8.0
-MODEL_RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
+MODEL_RETRY_RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
+MODEL_RETRYABLE_STATUS_CODES = MODEL_RETRY_RETRYABLE_STATUS_CODES
+CANCELLED_TOOL_CONTENTS = {
+    'userStopped': '该工具调用因用户停止未完成；停止前可能已产生文件或命令副作用。',
+    'crashRecovered': '会话恢复时发现该工具调用未完成；为避免重复副作用未重新执行，停止前可能已产生文件或命令副作用。',
+    'preflightRepair': '检测到该工具调用缺少结果（协议自愈补齐）；停止前可能已产生文件或命令副作用。',
+    'streamClosed': '该工具调用因事件流关闭未完成；关闭前可能已产生文件或命令副作用。',
+    'batchFailed': '该工具调用因批次异常未完成；异常前可能已产生文件或命令副作用。',
+}
+
+
+class conversationIntegrityError(RuntimeError):
+    pass
+
+
+@dataclass
+class toolBatchEntry:
+    index: int
+    call: toolCall
+    state: str = 'notStarted'
+    result: toolResult | None = None
+
+
+@dataclass
+class toolBatchLedger:
+    toolCalls: list[toolCall]
+    startIndex: int
+    entries: list[toolBatchEntry]
+    suspendedForConfirmation: bool = False
+    assistantPersisted: bool = False
+    finished: bool = False
 
 
 class agent:
@@ -71,6 +103,8 @@ class agent:
         systemPrompt: str,
         debugConsole=None,
         maxModelSteps: int | None = None,
+        parallelToolNames: frozenset[str] | None = None,
+        maxParallelTools: int = 1,
     ):
         self.modelAdapter = modelAdapter
         self.toolRegistry = toolRegistry(toolDefinitions, debugConsole=debugConsole)
@@ -80,23 +114,32 @@ class agent:
         self.debugConsole = debugConsole
         # None 或 <=0：不限制模型循环步数；>0：硬上限
         self.maxModelSteps = maxModelSteps
+        if isinstance(maxParallelTools, bool) or not isinstance(maxParallelTools, int) or maxParallelTools < 1 or maxParallelTools > 32:
+            raise RuntimeError('maxParallelTools 必须是整数 1..32。')
+        self.parallelToolNames = frozenset(parallelToolNames or ())
+        self.maxParallelTools = maxParallelTools
         self.conversations: dict[str, conversation] = {}
         self.sessionLocks: dict[str, RLock] = {}
         self.sessionLocksGuard = RLock()
-        # 按会话的中断事件（Task A 验收修复）：单 Event 放实例上会在「一会在飞 + 他会话新流 clear」时被误清。
-        self.interruptEvents: dict[str, threading.Event] = {}
+        self.activeRunEvents: dict[str, threading.Event] = {}
 
-    def getInterruptEvent(self, sessionId: str) -> threading.Event:
-        # 与会话锁同锁获取，保证 driveModelLoop 的 clear 与 requestStop 的 set 不会互相覆盖。
+    def registerRunEvent(self, sessionId: str, runEvent: threading.Event) -> None:
         with self.sessionLocksGuard:
-            event = self.interruptEvents.get(sessionId)
-            if event is None:
-                event = threading.Event()
-                self.interruptEvents[sessionId] = event
-            return event
+            self.activeRunEvents[sessionId] = runEvent
+
+    def unregisterRunEvent(self, sessionId: str, runEvent: threading.Event) -> None:
+        with self.sessionLocksGuard:
+            if self.activeRunEvents.get(sessionId) is runEvent:
+                self.activeRunEvents.pop(sessionId, None)
+
+    def getActiveRunEvent(self, sessionId: str) -> threading.Event | None:
+        with self.sessionLocksGuard:
+            return self.activeRunEvents.get(sessionId)
 
     def interruptActiveStreams(self, sessionId: str):
-        self.getInterruptEvent(sessionId).set()
+        event = self.getActiveRunEvent(sessionId)
+        if event is not None:
+            event.set()
         interruptFn = getattr(self.modelAdapter, 'interruptActiveStreams', None)
         if interruptFn is None:
             return
@@ -107,46 +150,114 @@ class agent:
 
     # ---------- 事件流 API（docs/streamOutputPlan.md §6.3） ----------
 
-    def runUserMessageStream(self, message: str, sessionId: str, *, images=None, committedImages=None) -> Iterator:
+    def runUserMessageStream(
+        self,
+        message: str,
+        sessionId: str,
+        *,
+        images=None,
+        committedImages=None,
+        runEvent: threading.Event | None = None,
+    ) -> Iterator:
         cleanMessage = message.strip()
         incomingImages = list(images or [])
         if not cleanMessage and not incomingImages:
             yield errorEvent(message='消息不能为空。', errorType='emptyMessage')
             return
+        ownedEvent = runEvent if runEvent is not None else threading.Event()
         terminal = None
-        with self.getSessionLock(sessionId):
-            for event in self.driveUserMessage(sessionId, cleanMessage, incomingImages, committedImages):
-                if isinstance(event, terminalEventTypes):
-                    terminal = event
-                    break
-                yield event
-        # 终态事件在锁释放之后再 yield：消费者收到时锁必然已释放（§6.4）。
-        if terminal is not None:
-            yield terminal
+        inner = None
+        try:
+            with self.getSessionLock(sessionId):
+                self.registerRunEvent(sessionId, ownedEvent)
+                try:
+                    inner = self.driveUserMessage(sessionId, cleanMessage, incomingImages, committedImages, ownedEvent)
+                    try:
+                        for event in inner:
+                            if isinstance(event, terminalEventTypes):
+                                terminal = event
+                                break
+                            yield event
+                    finally:
+                        if inner is not None:
+                            inner.close()
+                finally:
+                    self.unregisterRunEvent(sessionId, ownedEvent)
+            if self.revokeStoppedConfirmationIfNeeded(sessionId, ownedEvent, terminal):
+                return
+            if terminal is not None:
+                try:
+                    yield terminal
+                finally:
+                    self.revokeStoppedConfirmationIfNeeded(sessionId, ownedEvent, terminal)
+        except GeneratorExit:
+            self.revokeStoppedConfirmationIfNeeded(sessionId, ownedEvent, terminal)
+            raise
 
-    def continueConfirmationStream(self, sessionId: str, confirmationId: str, approved: bool) -> Iterator:
+    def continueConfirmationStream(
+        self,
+        sessionId: str,
+        confirmationId: str,
+        approved: bool,
+        *,
+        runEvent: threading.Event | None = None,
+    ) -> Iterator:
+        ownedEvent = runEvent if runEvent is not None else threading.Event()
         terminal = None
-        with self.getSessionLock(sessionId):
-            for event in self.driveConfirmation(sessionId, confirmationId, approved):
-                if isinstance(event, terminalEventTypes):
-                    terminal = event
-                    break
-                yield event
-        if terminal is not None:
-            yield terminal
+        inner = None
+        try:
+            with self.getSessionLock(sessionId):
+                self.registerRunEvent(sessionId, ownedEvent)
+                try:
+                    inner = self.driveConfirmation(sessionId, confirmationId, approved, ownedEvent)
+                    try:
+                        for event in inner:
+                            if isinstance(event, terminalEventTypes):
+                                terminal = event
+                                break
+                            yield event
+                    finally:
+                        if inner is not None:
+                            inner.close()
+                finally:
+                    self.unregisterRunEvent(sessionId, ownedEvent)
+            if self.revokeStoppedConfirmationIfNeeded(sessionId, ownedEvent, terminal):
+                return
+            if terminal is not None:
+                try:
+                    yield terminal
+                finally:
+                    self.revokeStoppedConfirmationIfNeeded(sessionId, ownedEvent, terminal)
+        except GeneratorExit:
+            self.revokeStoppedConfirmationIfNeeded(sessionId, ownedEvent, terminal)
+            raise
 
-    def driveUserMessage(self, sessionId: str, cleanMessage: str, incomingImages=None, committedImages=None) -> Iterator:
+    def driveUserMessage(
+        self,
+        sessionId: str,
+        cleanMessage: str,
+        incomingImages=None,
+        committedImages=None,
+        runEvent: threading.Event | None = None,
+    ) -> Iterator:
         # 调用前提：已持有会话锁。
+        activeEvent = runEvent if runEvent is not None else threading.Event()
         if self.hasPendingConfirmation(sessionId):
             yield errorEvent(
                 message='当前会话有待确认工具调用，请先调用 continueConfirmation。',
                 errorType='pendingConfirmationExists',
             )
             return
+        if activeEvent.is_set():
+            return
         if self.debugConsole:
             self.debugConsole.debug(f'收到用户消息 sessionId={sessionId} chars={len(cleanMessage)}')
         currentConversation = self.getConversation(sessionId)
-        found = self.findUnclosedTailCallIndex(currentConversation)
+        try:
+            found = self.findUnclosedTailCallIndex(currentConversation)
+        except conversationIntegrityError as error:
+            yield errorEvent(message=str(error), errorType='conversationIntegrityError')
+            return
         if found is not None:
             calls, position = found
             yield from self.closeUnfinishedToolCalls(currentConversation, calls, position, 'preflightRepair')
@@ -178,11 +289,20 @@ class agent:
         except imageInputError as error:
             yield errorEvent(message=str(error), errorType=error.errorType)
             return
+        if activeEvent.is_set():
+            return
         currentConversation.appendUserMessage(cleanMessage, images=storedImages)
-        yield from self.driveModelLoop(sessionId)
+        yield from self.driveModelLoop(sessionId, activeEvent)
 
-    def driveConfirmation(self, sessionId: str, confirmationId: str, approved: bool) -> Iterator:
+    def driveConfirmation(
+        self,
+        sessionId: str,
+        confirmationId: str,
+        approved: bool,
+        runEvent: threading.Event | None = None,
+    ) -> Iterator:
         # 调用前提：已持有会话锁。
+        activeEvent = runEvent if runEvent is not None else threading.Event()
         currentConversation = self.getConversation(sessionId)
         pending = currentConversation.takePending()
         if pending is None or pending.confirmationId != confirmationId:
@@ -199,33 +319,63 @@ class agent:
                 f'继续确认 sessionId={sessionId} confirmationId={confirmationId} '
                 f'approved={approved} tool={currentCall.toolName} callId={currentCall.id}'
             )
-        if approved:
-            definition = self.toolRegistry.get(currentCall.toolName)
-            preview = self.buildToolPreview(definition, currentCall) if definition else str(currentCall.arguments)
-            yield toolCallStartEvent(toolCall=currentCall, preview=preview)
-            try:
-                result = self.executeToolCall(currentCall, sessionId)
-            except modelInterruptedError:
-                yield from self.closeUnfinishedToolCalls(currentConversation, pending.toolCalls, pending.currentIndex, 'userStopped')
+        ledger = self.makeToolBatchLedger(pending.toolCalls, pending.currentIndex)
+        ledger.assistantPersisted = True
+        currentEntry = ledger.entries[0]
+        batchError = None
+        try:
+            if activeEvent.is_set():
                 return
-        else:
-            # 拒绝路径只发 End（配对不变式例外，§6.2）。
-            result = self.buildBlockedToolResult(currentCall, pending.reason)
-        currentConversation.addToolResult(result)
-        yield toolCallEndEvent(toolResult=result)
-        terminated = yield from self.driveToolBatch(sessionId, pending.toolCalls, pending.currentIndex + 1)
-        if terminated:
-            return
-        yield from self.driveModelLoop(sessionId)
+            if approved:
+                definition = self.toolRegistry.get(currentCall.toolName)
+                preview = self.buildToolPreview(definition, currentCall) if definition else str(currentCall.arguments)
+                yield toolCallStartEvent(toolCall=currentCall, preview=preview)
+                if activeEvent.is_set():
+                    return
+                try:
+                    result = self.executeToolCall(currentCall, sessionId, interruptEvent=activeEvent)
+                except modelInterruptedError:
+                    return
+                currentEntry.result = result
+                currentEntry.state = 'completed'
+                if activeEvent.is_set():
+                    return
+                currentConversation.addToolResult(result)
+                currentEntry.state = 'persisted'
+                yield toolCallEndEvent(toolResult=result)
+            else:
+                result = self.buildBlockedToolResult(currentCall, pending.reason)
+                currentEntry.result = result
+                currentConversation.addToolResult(result)
+                currentEntry.state = 'persisted'
+                yield toolCallEndEvent(toolResult=result)
+            if activeEvent.is_set():
+                return
+            terminated = yield from self.driveToolBatch(
+                sessionId,
+                pending.toolCalls,
+                pending.currentIndex + 1,
+                activeEvent,
+                ledger,
+            )
+            if terminated:
+                return
+            ledger.finished = True
+            yield from self.driveModelLoop(sessionId, activeEvent)
+        except BaseException as error:
+            batchError = error
+            raise
+        finally:
+            self.finalizeToolBatchLedger(currentConversation, ledger, activeEvent, batchError)
 
-    def driveModelLoop(self, sessionId: str) -> Iterator:
+    def driveModelLoop(self, sessionId: str, runEvent: threading.Event) -> Iterator:
         # 调用前提：已持有会话锁。承载原 continueModelLoop 逻辑。
         # maxModelSteps 为 None 或 <=0 时不限制步数。
-        interruptEvent = self.getInterruptEvent(sessionId)
-        interruptEvent.clear()
         currentConversation = self.getConversation(sessionId)
         stepIndex = 0
         while True:
+            if runEvent.is_set():
+                return
             if self.maxModelSteps is not None and self.maxModelSteps > 0 and stepIndex >= self.maxModelSteps:
                 yield errorEvent(
                     message=f'模型循环超过最大步数：{self.maxModelSteps}',
@@ -245,6 +395,8 @@ class agent:
             }
             completion = None
             for attempt in range(MODEL_RETRY_MAX_ATTEMPTS + 1):
+                if runEvent.is_set():
+                    return
                 chunkSeen = False
                 try:
                     try:
@@ -265,7 +417,7 @@ class agent:
                     for chunk in self.modelAdapter.completeStream(
                         currentConversation.messages,
                         modelTools,
-                        stopEvent=interruptEvent,
+                        stopEvent=runEvent,
                         sessionId=sessionId,
                     ):
                         if isinstance(chunk, textChunk):
@@ -278,7 +430,7 @@ class agent:
                             chunkSeen = True
                             completion = chunk.completion
                     if completion is None:
-                        if interruptEvent.is_set():
+                        if runEvent.is_set():
                             return
                         raise RuntimeError('模型流式响应缺少最终结果。')
                     break
@@ -332,7 +484,7 @@ class agent:
                         sliceSeconds = min(0.1, remaining)
                         time.sleep(sliceSeconds)
                         remaining -= sliceSeconds
-                        if interruptEvent.is_set():
+                        if runEvent.is_set():
                             return
                         yield retryNoticeEvent(
                             message=str(error),
@@ -351,6 +503,48 @@ class agent:
                 and rawUsage[key] >= 0
                 for key in ('prompt_tokens', 'completion_tokens')
             )
+            if assistantMessage.toolCalls:
+                idError = self.validateToolCallIds(assistantMessage.toolCalls)
+                if idError is not None:
+                    yield errorEvent(message=idError, errorType='invalidToolCallIds')
+                    return
+                ledger = self.makeToolBatchLedger(assistantMessage.toolCalls, 0)
+                batchError = None
+                try:
+                    currentConversation.appendAssistantMessage(assistantMessage, safePayload)
+                    ledger.assistantPersisted = True
+                    if hasTerminalUsage:
+                        usageNow = {
+                            key: int(currentConversation.usageTotal.get(key, 0) or 0)
+                            for key in usageTotalKeys
+                        }
+                        yield usageUpdateEvent(
+                            usage=usageNow,
+                            stepUsage={key: max(0, usageNow[key] - stepStart[key]) for key in usageTotalKeys},
+                            contextTokens=int(currentConversation.lastTurnTokens or 0),
+                        )
+                    if runEvent.is_set():
+                        return
+                    terminated = yield from self.driveToolBatch(
+                        sessionId,
+                        assistantMessage.toolCalls,
+                        0,
+                        runEvent,
+                        ledger,
+                    )
+                    if terminated:
+                        return
+                    ledger.finished = True
+                except BaseException as error:
+                    batchError = error
+                    raise
+                finally:
+                    self.finalizeToolBatchLedger(currentConversation, ledger, runEvent, batchError)
+                if runEvent.is_set():
+                    return
+                stepIndex += 1
+                continue
+
             currentConversation.appendAssistantMessage(assistantMessage, safePayload)
             if hasTerminalUsage:
                 usageNow = {
@@ -362,76 +556,115 @@ class agent:
                     stepUsage={key: max(0, usageNow[key] - stepStart[key]) for key in usageTotalKeys},
                     contextTokens=int(currentConversation.lastTurnTokens or 0),
                 )
-            if not assistantMessage.toolCalls:
-                if self.debugConsole:
-                    self.debugConsole.debug(f'模型循环完成 sessionId={sessionId} contentChars={len(assistantMessage.content)}')
-                yield completedEvent(message=assistantMessage.content)
-                return
+            if self.debugConsole:
+                self.debugConsole.debug(f'模型循环完成 sessionId={sessionId} contentChars={len(assistantMessage.content)}')
+            yield completedEvent(message=assistantMessage.content)
+            return
 
-            terminated = yield from self.driveToolBatch(sessionId, assistantMessage.toolCalls, 0)
-            if terminated:
-                return
-            stepIndex += 1
-
-    def driveToolBatch(self, sessionId: str, toolCalls: list[toolCall], startIndex: int) -> Iterator:
-        # 调用前提：已持有会话锁。返回 True 表示已产出终态事件（confirmationRequired）。
-        # 可执行前缀批量 Start（streamingLatencyFixPlan D2）：从 startIndex 起连续可执行（未知或免确认）的工具
-        # 先全部 yield Start，再串行 exec + End；遇需确认工具停止扩展前缀，不发 Start，直接 confirmationRequired。
+    def driveToolBatch(
+        self,
+        sessionId: str,
+        toolCalls: list[toolCall],
+        startIndex: int,
+        runEvent: threading.Event | None = None,
+        ledger: toolBatchLedger | None = None,
+    ) -> Iterator:
+        # 调用前提：已持有会话锁。返回 True 表示已产出终态事件（confirmationRequired）或批次已中断。
+        activeEvent = runEvent if runEvent is not None else threading.Event()
         currentConversation = self.getConversation(sessionId)
-        index = startIndex
-        while index < len(toolCalls):
-            # 1) 收集可执行前缀：unknown 或免确认；遇 requiresApproval 停止扩展
-            prefix: list[tuple[toolCall, toolDefinition | None]] = []
-            while index + len(prefix) < len(toolCalls):
-                call = toolCalls[index + len(prefix)]
-                definition = self.toolRegistry.get(call.toolName)
-                if definition is None:
-                    prefix.append((call, None))
-                    continue
-                decision = evaluateToolCall(definition, call, debugConsole=self.debugConsole)
-                if decision.requiresApproval:
-                    break
-                prefix.append((call, definition))
-            # 2) 前缀全部 Start（泵在每个 yield 后即 broadcast，多张卡先进入 running 语义）
-            for call, definition in prefix:
-                preview = str(call.arguments) if definition is None else self.buildToolPreview(definition, call)
-                yield toolCallStartEvent(toolCall=call, preview=preview)
-            # 3) 前缀串行 exec + End；jsonl 仍只按执行顺序写 toolResult，落盘语义不变
-            for groupOffset, (call, definition) in enumerate(prefix):
-                try:
-                    result = self.makeUnknownToolResult(call) if definition is None else self.executeToolCall(call, sessionId)
-                except modelInterruptedError:
-                    yield from self.closeUnfinishedToolCalls(currentConversation, toolCalls, index + groupOffset, 'userStopped')
+        ownsLedger = ledger is None
+        if ledger is None:
+            ledger = self.makeToolBatchLedger(toolCalls, startIndex)
+            ledger.assistantPersisted = True
+        batchError = None
+        try:
+            index = startIndex
+            while index < len(toolCalls):
+                if activeEvent.is_set():
                     return True
-                currentConversation.addToolResult(result)
-                yield toolCallEndEvent(toolResult=result)
-            index += len(prefix)
-            # 4) 下一项需确认（prefix 为空即首项需确认）：不 Start，直接终态
-            if index < len(toolCalls):
-                call = toolCalls[index]
-                definition = self.toolRegistry.get(call.toolName)
-                decision = evaluateToolCall(definition, call, debugConsole=self.debugConsole)
-                confirmationId = 'confirm_' + uuid4().hex[:12]
-                currentConversation.setPending(pendingConfirm(
-                    sessionId=sessionId,
-                    confirmationId=confirmationId,
-                    reason=decision.reason,
-                    toolCalls=toolCalls,
-                    currentIndex=index,
-                ))
-                if self.debugConsole:
-                    self.debugConsole.debug(
-                        f'工具需要确认 sessionId={sessionId} confirmationId={confirmationId} '
-                        f'tool={call.toolName} callId={call.id} permissionId={decision.permissionId}'
+                prefix: list[tuple[toolCall, toolDefinition | None]] = []
+                while index + len(prefix) < len(toolCalls):
+                    call = toolCalls[index + len(prefix)]
+                    definition = self.toolRegistry.get(call.toolName)
+                    if definition is None:
+                        prefix.append((call, None))
+                        continue
+                    decision = evaluateToolCall(definition, call, debugConsole=self.debugConsole)
+                    if decision.requiresApproval:
+                        break
+                    prefix.append((call, definition))
+                for call, definition in prefix:
+                    preview = str(call.arguments) if definition is None else self.buildToolPreview(definition, call)
+                    yield toolCallStartEvent(toolCall=call, preview=preview)
+                cursor = index
+                for segment in self.splitExecutableSegments(prefix):
+                    if activeEvent.is_set():
+                        return True
+                    entries = [self.ledgerEntry(ledger, cursor + offset) for offset in range(len(segment))]
+                    pooled = self.isPooledCall(segment[0][0], segment[0][1]) if segment else False
+                    if pooled and len(segment) >= 2:
+                        interrupted = self.executeConcurrentSegment(entries, sessionId, activeEvent)
+                        if interrupted or activeEvent.is_set():
+                            return True
+                        self.persistLedgerEntries(currentConversation, ledger, entries)
+                        for entry in entries:
+                            yield toolCallEndEvent(toolResult=entry.result)
+                    else:
+                        for offset, (call, definition) in enumerate(segment):
+                            if activeEvent.is_set():
+                                return True
+                            entry = entries[offset]
+                            try:
+                                result = (
+                                    self.makeUnknownToolResult(call)
+                                    if definition is None
+                                    else self.executeToolCall(call, sessionId, interruptEvent=activeEvent)
+                                )
+                            except modelInterruptedError:
+                                return True
+                            entry.result = result
+                            entry.state = 'completed'
+                            if activeEvent.is_set():
+                                return True
+                            currentConversation.addToolResult(result)
+                            entry.state = 'persisted'
+                            yield toolCallEndEvent(toolResult=result)
+                    cursor += len(segment)
+                index += len(prefix)
+                if activeEvent.is_set():
+                    return True
+                if index < len(toolCalls):
+                    call = toolCalls[index]
+                    definition = self.toolRegistry.get(call.toolName)
+                    decision = evaluateToolCall(definition, call, debugConsole=self.debugConsole)
+                    confirmationId = 'confirm_' + uuid4().hex[:12]
+                    currentConversation.setPending(pendingConfirm(
+                        sessionId=sessionId,
+                        confirmationId=confirmationId,
+                        reason=decision.reason,
+                        toolCalls=toolCalls,
+                        currentIndex=index,
+                    ))
+                    ledger.suspendedForConfirmation = True
+                    if self.debugConsole:
+                        self.debugConsole.debug(
+                            f'工具需要确认 sessionId={sessionId} confirmationId={confirmationId} '
+                            f'tool={call.toolName} callId={call.id} permissionId={decision.permissionId}'
+                        )
+                    yield confirmationRequiredEvent(
+                        confirmationId=confirmationId,
+                        reason=decision.reason,
+                        commandPreview=self.buildToolPreview(definition, call),
+                        toolCall=call,
                     )
-                yield confirmationRequiredEvent(
-                    confirmationId=confirmationId,
-                    reason=decision.reason,
-                    commandPreview=self.buildToolPreview(definition, call),
-                    toolCall=call,
-                )
-                return True
-        return False
+                    return True
+            return False
+        except BaseException as error:
+            batchError = error
+            raise
+        finally:
+            if ownsLedger:
+                self.finalizeToolBatchLedger(currentConversation, ledger, activeEvent, batchError)
 
     # ---------- 同步 API（事件流的薄包装，§6.5） ----------
 
@@ -513,15 +746,22 @@ class agent:
             if self.debugConsole:
                 self.debugConsole.debug(f'流式回调异常已忽略 error={type(error).__name__}: {error}')
 
-    def executeToolCall(self, call: toolCall, sessionId: str | None = None) -> toolResult:
+    def executeToolCall(
+        self,
+        call: toolCall,
+        sessionId: str | None = None,
+        interruptEvent: threading.Event | None = None,
+    ) -> toolResult:
         definition = self.toolRegistry.get(call.toolName)
         if definition is None:
             return self.makeUnknownToolResult(call)
-        interruptEvent = self.getInterruptEvent(sessionId) if sessionId else None
+        activeEvent = interruptEvent
+        if activeEvent is None and sessionId:
+            activeEvent = self.getActiveRunEvent(sessionId)
         context = toolContext(
             workDir=self.workDir,
             debugConsole=self.debugConsole,
-            interruptEvent=interruptEvent,
+            interruptEvent=activeEvent,
         )
         return executeCallableToolCall(definition, call, context)
 
@@ -557,6 +797,15 @@ class agent:
             details={'blocked': True, 'reason': 'userRejectedApproval'},
         )
 
+    def buildCancelledToolResult(self, call: toolCall, reason: str) -> toolResult:
+        return toolResult(
+            toolCallId=call.id,
+            toolName=call.toolName,
+            isError=True,
+            content=CANCELLED_TOOL_CONTENTS.get(reason, CANCELLED_TOOL_CONTENTS['streamClosed']),
+            details={'cancelled': True, 'reason': reason},
+        )
+
     def logStopRequestedOnce(self, currentConversation: conversation, phase: str, unclosedCallIds: list[str]) -> None:
         if currentConversation._stopRequestedLogged:
             return
@@ -568,27 +817,228 @@ class agent:
             'unclosedCallIds': unclosedCallIds,
         })
 
-    def closeUnfinishedToolCalls(self, currentConversation: conversation, toolCalls: list[toolCall], startIndex: int, reason: str) -> Iterator:
-        # 闭合 toolCalls[startIndex:]：每个恰写一条 cancellation toolResult + yield toolCallEndEvent；不继续模型。
-        contents = {
-            'userStopped': '该工具调用因用户停止未完成；停止前可能已产生文件或命令副作用。',
-            'crashRecovered': '会话恢复时发现该工具调用未完成；为避免重复副作用未重新执行，停止前可能已产生文件或命令副作用。',
-            'preflightRepair': '检测到该工具调用缺少结果（协议自愈补齐）；停止前可能已产生文件或命令副作用。',
-        }
-        self.logStopRequestedOnce(currentConversation, 'toolExecution', [call.id for call in toolCalls[startIndex:]])
-        for call in toolCalls[startIndex:]:
+    def makeToolBatchLedger(self, toolCalls: list[toolCall], startIndex: int) -> toolBatchLedger:
+        entries = [
+            toolBatchEntry(index=startIndex + offset, call=call)
+            for offset, call in enumerate(toolCalls[startIndex:])
+        ]
+        return toolBatchLedger(toolCalls=toolCalls, startIndex=startIndex, entries=entries)
+
+    def ledgerEntry(self, ledger: toolBatchLedger, callIndex: int) -> toolBatchEntry:
+        return ledger.entries[callIndex - ledger.startIndex]
+
+    def poolEnabled(self) -> bool:
+        return self.maxParallelTools > 1 and bool(self.parallelToolNames)
+
+    def isPooledCall(self, call: toolCall, definition: toolDefinition | None) -> bool:
+        return self.poolEnabled() and definition is not None and call.toolName in self.parallelToolNames
+
+    def splitExecutableSegments(
+        self,
+        prefix: list[tuple[toolCall, toolDefinition | None]],
+    ) -> list[list[tuple[toolCall, toolDefinition | None]]]:
+        segments: list[list[tuple[toolCall, toolDefinition | None]]] = []
+        current: list[tuple[toolCall, toolDefinition | None]] = []
+        currentPooled = False
+        for item in prefix:
+            pooled = self.isPooledCall(item[0], item[1])
+            if current and (pooled != currentPooled or not pooled):
+                segments.append(current)
+                current = []
+            current.append(item)
+            currentPooled = pooled
+        if current:
+            segments.append(current)
+        return segments
+
+    def validateToolCallIds(self, toolCalls: list[toolCall]) -> str | None:
+        seen: set[str] = set()
+        for call in toolCalls:
+            if not isinstance(call.id, str) or not call.id:
+                return '模型返回的 tool call ID 为空。'
+            if call.id in seen:
+                return f'模型返回重复的 tool call ID：{call.id}'
+            seen.add(call.id)
+        return None
+
+    def runPooledToolCall(self, call: toolCall, sessionId: str, runEvent: threading.Event) -> toolResult:
+        if runEvent.is_set():
+            raise modelInterruptedError('用户已停止')
+        return self.executeToolCall(call, sessionId, interruptEvent=runEvent)
+
+    def harvestPooledFuture(self, entry: toolBatchEntry, future) -> str | None:
+        try:
+            result = future.result()
+        except modelInterruptedError:
+            return 'interrupted'
+        except CancelledError:
+            return 'cancelled'
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as error:
             result = toolResult(
-                toolCallId=call.id,
-                toolName=call.toolName,
+                toolCallId=entry.call.id,
+                toolName=entry.call.toolName,
                 isError=True,
-                content=contents[reason],
-                details={'cancelled': True, 'reason': reason},
+                content=f'工具执行异常：{type(error).__name__}: {error}',
+                details={'exceptionType': type(error).__name__},
             )
+        entry.result = result
+        entry.state = 'completed'
+        return None
+
+    def executeConcurrentSegment(
+        self,
+        entries: list[toolBatchEntry],
+        sessionId: str,
+        runEvent: threading.Event,
+    ) -> bool:
+        executor = ThreadPoolExecutor(
+            max_workers=min(self.maxParallelTools, len(entries)),
+            thread_name_prefix='flamingoTool',
+        )
+        futures = {}
+        interrupted = False
+        try:
+            for entry in entries:
+                if runEvent.is_set():
+                    interrupted = True
+                    break
+                futures[executor.submit(self.runPooledToolCall, entry.call, sessionId, runEvent)] = entry
+            pending = set(futures)
+            while pending:
+                done, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+                for future in done:
+                    status = self.harvestPooledFuture(futures[future], future)
+                    if status == 'interrupted':
+                        interrupted = True
+                if interrupted or runEvent.is_set():
+                    for future in pending:
+                        future.cancel()
+                    interrupted = True
+            return interrupted or runEvent.is_set()
+        finally:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            for future, entry in futures.items():
+                if entry.result is None and future.done():
+                    try:
+                        self.harvestPooledFuture(entry, future)
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception:
+                        pass
+
+    def persistLedgerEntries(
+        self,
+        currentConversation: conversation,
+        ledger: toolBatchLedger,
+        entries: list[toolBatchEntry],
+    ) -> None:
+        self.assertClosedPrefix(currentConversation, ledger.toolCalls)
+        for entry in entries:
+            if entry.state == 'persisted':
+                continue
+            if entry.result is None:
+                raise RuntimeError(f'工具结果缺失，无法按原序落盘：{entry.call.id}')
+            currentConversation.addToolResult(entry.result)
+            entry.state = 'persisted'
+
+    def finalizeToolBatchLedger(
+        self,
+        currentConversation: conversation,
+        ledger: toolBatchLedger,
+        runEvent: threading.Event | None,
+        error: BaseException | None = None,
+    ) -> None:
+        if not ledger.assistantPersisted or ledger.finished or ledger.suspendedForConfirmation:
+            return
+        if error is not None and not isinstance(error, (GeneratorExit, modelInterruptedError)):
+            reason = 'batchFailed'
+        elif runEvent is not None and runEvent.is_set():
+            reason = 'userStopped'
+        else:
+            reason = 'streamClosed'
+        self.persistUnclosedResults(currentConversation, ledger, reason)
+
+    def revokeStoppedConfirmationIfNeeded(self, sessionId: str, runEvent: threading.Event, terminal) -> bool:
+        if not runEvent.is_set():
+            return False
+        confirmationId = terminal.confirmationId if isinstance(terminal, confirmationRequiredEvent) else None
+        with self.getSessionLock(sessionId):
+            pending = self.getConversation(sessionId).pending
+            if confirmationId is not None:
+                self.revokeStoppedConfirmation(sessionId, confirmationId)
+                return True
+            if terminal is None and pending is not None:
+                self.revokeStoppedConfirmation(sessionId, pending.confirmationId)
+                return True
+        return False
+
+    def revokeStoppedConfirmation(self, sessionId: str, confirmationId: str) -> None:
+        currentConversation = self.getConversation(sessionId)
+        pending = currentConversation.pending
+        if pending is None or pending.confirmationId != confirmationId:
+            return
+        currentConversation.takePending()
+        ledger = self.makeToolBatchLedger(pending.toolCalls, pending.currentIndex)
+        ledger.assistantPersisted = True
+        self.persistUnclosedResults(currentConversation, ledger, 'userStopped')
+
+    def persistUnclosedResults(
+        self,
+        currentConversation: conversation,
+        ledger: toolBatchLedger,
+        reason: str,
+    ) -> list[toolResult]:
+        prefixLen = self.assertClosedPrefix(currentConversation, ledger.toolCalls)
+        if prefixLen < ledger.startIndex:
+            raise conversationIntegrityError(
+                f'会话完整性错误：assistant tool batch 在 startIndex={ledger.startIndex} 前存在缺口。'
+            )
+        missingIds = [call.id for call in ledger.toolCalls[prefixLen:]]
+        if reason == 'userStopped' and missingIds:
+            self.logStopRequestedOnce(currentConversation, 'toolExecution', missingIds)
+        persisted: list[toolResult] = []
+        entryByIndex = {entry.index: entry for entry in ledger.entries}
+        for callIndex, call in enumerate(ledger.toolCalls):
+            if callIndex < prefixLen:
+                entry = entryByIndex.get(callIndex)
+                if entry is not None:
+                    entry.state = 'persisted'
+                continue
+            entry = entryByIndex.get(callIndex)
+            if entry is not None and entry.state == 'persisted' and entry.result is not None:
+                continue
+            if entry is not None and entry.result is not None:
+                result = entry.result
+            else:
+                result = self.buildCancelledToolResult(call, reason)
             currentConversation.addToolResult(result)
+            persisted.append(result)
+            if entry is not None:
+                entry.result = result
+                entry.state = 'persisted'
+        return persisted
+
+    def closeUnfinishedToolCalls(
+        self,
+        currentConversation: conversation,
+        toolCalls: list[toolCall],
+        startIndex: int,
+        reason: str,
+    ) -> Iterator:
+        prefixLen = self.assertClosedPrefix(currentConversation, toolCalls)
+        if prefixLen > startIndex:
+            startIndex = prefixLen
+        ledger = self.makeToolBatchLedger(toolCalls, startIndex)
+        ledger.assistantPersisted = True
+        results = self.persistUnclosedResults(currentConversation, ledger, reason)
+        for result in results:
             yield toolCallEndEvent(toolResult=result)
 
     def findUnclosedTailCallIndex(self, currentConversation: conversation) -> tuple[list[toolCall], int] | None:
-        # 找尾部最近一条带 toolCalls 的 assistant，检查其后配对；有缺口返回 (calls, 第一个未闭合下标)，完整返回 None。
         messages = currentConversation.messages
         assistantIndex = None
         for i in range(len(messages) - 1, -1, -1):
@@ -600,12 +1050,50 @@ class agent:
         if assistantIndex is None:
             return None
         calls = messages[assistantIndex].toolCalls
-        tail = messages[assistantIndex + 1:]
-        closedIds = {m.toolCallId for m in tail if m.role == 'tool' and m.toolCallId}
-        for position, call in enumerate(calls):
-            if call.id not in closedIds:
-                return (calls, position)
-        return None
+        prefixLen = self.closedPrefixLength(currentConversation, assistantIndex, calls)
+        if prefixLen == len(calls):
+            return None
+        return (calls, prefixLen)
+
+    def findAssistantIndexForCalls(self, currentConversation: conversation, toolCalls: list[toolCall]) -> int:
+        messages = currentConversation.messages
+        for i in range(len(messages) - 1, -1, -1):
+            message = messages[i]
+            if message.role == 'assistant' and message.toolCalls is toolCalls:
+                return i
+        expected = [call.id for call in toolCalls]
+        for i in range(len(messages) - 1, -1, -1):
+            message = messages[i]
+            if message.role == 'assistant' and [call.id for call in message.toolCalls] == expected:
+                return i
+        raise conversationIntegrityError('会话完整性错误：找不到对应的 assistant tool batch。')
+
+    def assertClosedPrefix(self, currentConversation: conversation, toolCalls: list[toolCall]) -> int:
+        assistantIndex = self.findAssistantIndexForCalls(currentConversation, toolCalls)
+        return self.closedPrefixLength(currentConversation, assistantIndex, toolCalls)
+
+    def closedPrefixLength(
+        self,
+        currentConversation: conversation,
+        assistantIndex: int,
+        calls: list[toolCall],
+    ) -> int:
+        closed = currentConversation.consecutiveToolMessagesAfter(assistantIndex)
+        seenIds: set[str] = set()
+        for position, message in enumerate(closed):
+            callId = message.toolCallId
+            if not isinstance(callId, str) or not callId:
+                raise conversationIntegrityError('会话完整性错误：tool result 缺少 call ID。')
+            if callId in seenIds:
+                raise conversationIntegrityError(f'会话完整性错误：重复 tool result ID {callId}。')
+            seenIds.add(callId)
+            if position >= len(calls) or calls[position].id != callId:
+                raise conversationIntegrityError('会话完整性错误：tool result 乱序或出现非前缀缺口。')
+        prefixLen = len(closed)
+        nextIndex = assistantIndex + 1 + prefixLen
+        if prefixLen < len(calls) and nextIndex < len(currentConversation.messages):
+            raise conversationIntegrityError('会话完整性错误：未闭合 tool call 不是原序后缀缺口。')
+        return prefixLen
 
     def logModelError(
         self,

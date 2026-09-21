@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.26
-> Date: 2026-09-15
+> Version: 1.27
+> Date: 2026-09-21
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 9 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -32,6 +32,7 @@
 > v1.21：会话索引也迁至 `~/.flamingo/logs/webData/sessions.json`；新索引缺失时复制尚存的仓库旧索引，之后统一在家目录读写；索引损坏显式报错而非返回空历史。
 > v1.22：历史读取兼容旧 JSON 事件数组及其后续 JSONL 追加；提供显式 sessionRecovery 工具重建已删除索引，DTO 与日常新建写入格式不变。
 > v1.26（chatUxImprovePlan）：§2.2 新增 `kind:error`；终态 `modelError`（`willRetry` 非 true）下发，重试中仍不下发；`request`/traceback/diag 不下发。
+> v1.27：UI stopped 与 Core draining 分离；同会话新请求在 Core 未退出前最多等 2s，超时 409；attach 在 draining 时可回放 stopped history。
 
 ---
 
@@ -689,7 +690,7 @@
 - 标题口径：原文前 20 字；**纯引用发送（原文为空）时取第一个附件名前 20 字（含 `📄 ` 前缀）**；纯图片发送取第一张图片名。
 - GET `/api/sessions/{sessionId}/images/{ref}`（v1.25）：鉴权后返回会话图片文件；ref 必须匹配 `img-<12位hex>.(png|jpg|webp)`，越权 404。
 
-预检（失败走 REST 错误，不开流）：sessionId 非法 → 400；会话不存在 → 404；**`message` trim 后为空且 `attachments` 为空且 `images` 为空 → 400**；该会话有活跃流 → 409。
+预检（失败走 REST 错误，不开流）：sessionId 非法 → 400；会话不存在 → 404；**`message` trim 后为空且 `attachments` 为空且 `images` 为空 → 400**；该会话有活跃流 → 409。停止后 UI 可能已 `stopped`，但 Core/worker 仍在 draining：`chat/stream` 与 `chat/confirm` 会锁外等待 `coreDone` 最多 2s，完成后重建 agent 再开流；超时仍 409「请稍后再试」。删除会话与切模型在 draining 期间继续 409。
 
 通过后返回 `text/event-stream`，事件序列见 §4.3。
 
@@ -744,7 +745,7 @@
 
 - 200：`{ "stopped": true }`（置停止标志成功）或 `{ "stopped": false }`（该会话无活跃流，幂等不报错）；
 - 404：会话不存在；
-- **语义（webAppPlan §4.3-H1）**：非即时。SSE 连接在泵线程跑到下一个事件/当前 step 结束后关闭；停止后前端立即停渲染并给半截消息加「已中断」标记；半截文本不落 jsonl，刷新即消失；
+- **语义（webAppPlan §4.3-H1）**：UI 可即时收成 `errorType: "stopped"`。Core 会等已启动工具线程静止、transcript 闭合后再释放占用；不协作的自定义工具无法硬杀，期间同会话新请求可能短暂 409；
 - **本地 abort ≠ 持久化完成（v1.19）**：本窗口 `abort()` 会使 SSE `done` 先于 `_recordUsage` resolve；前端须把 stop POST Promise 挂在本流上，UI 立即收口，权威 status GET 等 POST 完成尝试后再发（失败仍允许 best-effort GET，不宣称落账成功）；
 - **stopped 广播（v1.7）**：停止生效时泵向**所有订阅者**广播 `error` 帧（`errorType: "stopped"`）作为终态——停止发起方处于「停止中」态仅记录终态；其他 attach 窗口按「已中断」标记 + 静默回空闲处理。
 

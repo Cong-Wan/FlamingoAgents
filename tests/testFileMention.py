@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.1
-Date: 2026-09-07
-Description: Accepts path-only @ references: no content inline, no count cap, archives allowed, preview NUL behavior unchanged. v1.1 兼容 runUserMessageStream 的 images 关键字参数。
+Version: 1.2
+Date: 2026-09-21
+Description: Accepts path-only @ references: no content inline, no count cap, archives allowed, preview NUL behavior unchanged. v1.2 兼容 startStream 的 runEvent 关键字参数。
 '''
 
 from __future__ import annotations
@@ -230,7 +230,7 @@ def testPathOnlyArchiveHttpReachesAgent(archivePath: Path, monkeypatch: pytest.M
         agent.runUserMessageStream.side_effect = runUserMessageStream
         return agent
 
-    def fakeStartStream(_sessionId, _agent, _stream, meta=None):
+    def fakeStartStream(_sessionId, _agent, _stream, meta=None, runEvent=None):
         captured['meta'] = meta
         return FakePump()
 

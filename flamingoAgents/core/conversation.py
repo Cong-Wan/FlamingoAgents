@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.13
-Date: 2026-09-08
-Description: Maintains and resumes per-session JSONL conversations. v1.12 persists JSON-safe assistant/toolCall providerData for Responses opaque replay, restores malformed/legacy values as empty objects, and keeps reasoning display text separate from model content. v1.13（imageInputPlan）：userMessage 可选 images 引用字段、严格 JSONL 恢复、损坏 images 明确报错。
+Version: 1.14
+Date: 2026-09-21
+Description: Maintains and resumes per-session JSONL conversations. v1.14 恢复时校验同一 assistant 内 tool call ID 非空且唯一，并提供原序闭合前缀查询，禁止猜测配对。
 '''
 
 from __future__ import annotations
@@ -68,16 +68,27 @@ class conversation:
                 ))
             elif eventType == 'assistantMessage':
                 self._closeOrphanToolCalls(openCallIds)
-                toolCalls = [
-                    toolCall(
+                toolCalls = []
+                seenCallIds: set[str] = set()
+                for tc in (event.get('toolCalls') or []):
+                    if not isinstance(tc, dict):
+                        continue
+                    call = toolCall(
                         id=tc.get('id', ''),
                         toolName=tc.get('toolName', ''),
                         arguments=tc.get('arguments', {}) if isinstance(tc.get('arguments'), dict) else {},
                         providerData=normalizeProviderData(tc.get('providerData')),
                     )
-                    for tc in (event.get('toolCalls') or [])
-                    if isinstance(tc, dict)
-                ]
+                    if not call.id:
+                        raise RuntimeError(
+                            f'会话完整性错误：assistant tool call ID 为空 sessionId={self.sessionId}'
+                        )
+                    if call.id in seenCallIds:
+                        raise RuntimeError(
+                            f'会话完整性错误：assistant 内重复 tool call ID {call.id} sessionId={self.sessionId}'
+                        )
+                    seenCallIds.add(call.id)
+                    toolCalls.append(call)
                 self.messages.append(chatMessage(
                     role='assistant',
                     content=event.get('content', ''),
@@ -186,6 +197,14 @@ class conversation:
         self.logger.logEvent(event)
         self._accumulateUsage(responsePayload.get('usage'))
         self.messages.append(message)
+
+    def consecutiveToolMessagesAfter(self, assistantIndex: int) -> list[chatMessage]:
+        closed: list[chatMessage] = []
+        for message in self.messages[assistantIndex + 1:]:
+            if message.role != 'tool':
+                break
+            closed.append(message)
+        return closed
 
     def addToolResult(self, result: toolResult) -> None:
         self.logger.logEvent({

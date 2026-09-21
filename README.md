@@ -2,9 +2,9 @@
 
 <!--
 Author: wilbur
-Version: 1.4
-Date: 2026-09-14
-Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history. v1.1：Web @ 改为仅路径引用，不预读文件内容。v1.2：模型勾选 image 后支持图片输入（上传落盘 + @ 图片快照，请求体 data URL）。v1.3（configHomePlan）：运行时配置迁到 ~/.flamingo/config/，项目 config/ 仅保留模板与说明。v1.4：原生 Windows 可启动 Web；完整能力仍以 POSIX 为准。
+Version: 1.5
+Date: 2026-09-21
+Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history. v1.5：工具并行池是同批屏障汇合并发，不是后台 job。
 -->
 
 ## 现状能力
@@ -13,6 +13,7 @@ Description: Documents centralized session storage under ~/.flamingo and explici
 
 - **事件流 Agent**：`runUserMessageStream` / `continueConfirmationStream` 生成器产出 7 种事件（正文/思维链增量、工具起止、确认请求、完成、错误），调用方想怎么渲染就怎么渲染；
 - **工具系统**：内置 read/write/edit/bash/**askSubAgent**，schema 驱动 + 正则权限规则（如删除类命令需人工确认），新增工具只需写函数 + factory + 注册（见 `docs/addCallableToolFunction.md`）；bash/askSubAgent 执行**可中断**（`_runWithInterrupt` 分片 poll，中断即 terminate/kill）；
+- **并行工具池（opt-in）**：`tools.yaml` v4 的 `parallelToolPool.toolNames` 显式加入的工具，在同一 assistant 批次内连续免确认调用会并发执行，但必须在批末屏障汇合——结果按原 call 顺序落盘，模型不会在 function call 尚无 output 时继续。这不是后台 job / fire-and-forget。空池或 `maxWorkers: 1` 保持原串行；池外工具与权限确认是顺序屏障；`maxWorkers` 是每批上限，不是进程全局配额；
 - **子代理 askSubAgent**：以 function call 形式把子任务派给独立子代理会话，可指定 `provider/model`、独立 workDir 与 system prompt，超时透传（默认 600s，上限 3600s），子代理输出经 JSON stdout 回收——多 plan 并发的编排地基；
 - **会话持久化与恢复**：jsonl 原子日志，进程重启后自动 resume（含 system prompt 前缀恢复，provider 缓存可命中）；
 - **用量统计**：每会话累计 prompt/cached/completion tokens；
@@ -22,7 +23,7 @@ Description: Documents centralized session storage under ~/.flamingo and explici
 ### `webApp/` —— Web 程序（单用户、局域网）
 
 - **现代化对话界面**：流式逐字输出、思维链折叠、工具调用卡片（结果可折叠内滚动预览）、**工具确认框**（批准/拒绝续跑）；
-- **随时停止**：停止按钮 fire-and-forget 即时 abort，工具执行一并中断，多窗口间停止状态静默同步；
+- **随时停止**：停止按钮即时把 UI 收成 `stopped`；Core 会等已启动的工具线程静止后再释放占用。不协作的池内工具无法硬杀，同会话新请求在 draining 期间可能短暂 409；
 - **多窗口并行流式**：同会话多标签页 attach 回放式重连，互不抢流；
 - **文件树与 @ 路径引用**：侧栏文件树浏览/读文件；输入框 `@` 唤起文件面板，目录可下钻也可整体选为引用（chip 📄/📁 区分）。发送时只把校验后的绝对路径交给模型，不预读内容、不解包；读取由 Agent 按需使用工具完成。能 `@` 不等于能在预览里打开该文件；
 - **图片输入**：模型配置勾选 `image` 后，可通过按钮/粘贴/拖入发送 PNG/JPEG/WebP（单张 5MiB、单条最多 4 张）。图片落在会话日志旁的 `{sessionId}.images/`，JSONL 只记引用；`@` 到图片文件时先确认存在再快照编码进模型请求。未勾选 image 时上传图会被拒绝，`@` 图片回退为路径引用；

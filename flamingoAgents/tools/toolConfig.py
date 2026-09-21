@@ -1,14 +1,14 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-09-08
-Description: Loads tool schemas (name/description/parameters) and embedded permission rules from a single YAML config (version 3). Schemas are declarative; executable handlers remain in builtinTools.py. v1.3（configHomePlan P2）：默认路径切到 ~/.flamingo/config/tools.yaml（模板在项目 config/，首次运行自动拷贝）。
+Version: 1.4
+Date: 2026-09-21
+Description: Loads tool schemas and permission rules from YAML. v1.4 adds tools.yaml v4 parallelToolPool (opt-in allowlist + per-batch maxWorkers) while keeping v3 serial-compatible.
 '''
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Pattern
 
@@ -26,9 +26,16 @@ class toolSchemaSpec:
     permissions: list[permissionRule]
 
 
+@dataclass(frozen=True)
+class parallelToolPoolSettings:
+    maxWorkers: int = 1
+    toolNames: frozenset[str] = frozenset()
+
+
 @dataclass
 class toolSettings:
     toolSchemas: list[toolSchemaSpec]
+    parallelToolPool: parallelToolPoolSettings = field(default_factory=parallelToolPoolSettings)
 
 
 defaultToolsConfigPath = userToolsPath
@@ -49,9 +56,23 @@ def parseToolSettings(rawConfig: Any, source: str = '<memory>', debugConsole=Non
     if not isinstance(rawConfig, dict):
         raise RuntimeError(f'工具配置必须是 YAML 对象：{source}')
     version = rawConfig.get('version')
-    if version != 3:
-        raise RuntimeError(f'工具配置 version 必须是 3，实际为：{version}')
+    if version == 3:
+        if 'parallelToolPool' in rawConfig:
+            raise RuntimeError('工具配置 version 3 不支持 parallelToolPool，请升级到 version 4。')
+        toolSchemas = parseToolSchemaList(rawConfig, source, debugConsole=debugConsole)
+        return toolSettings(toolSchemas=toolSchemas)
+    if version == 4:
+        toolSchemas = parseToolSchemaList(rawConfig, source, debugConsole=debugConsole)
+        pool = parseParallelToolPool(
+            rawConfig.get('parallelToolPool'),
+            {schema.name for schema in toolSchemas},
+            source,
+        )
+        return toolSettings(toolSchemas=toolSchemas, parallelToolPool=pool)
+    raise RuntimeError(f'工具配置 version 必须是 3 或 4，实际为：{version}')
 
+
+def parseToolSchemaList(rawConfig: dict[str, Any], source: str, debugConsole=None) -> list[toolSchemaSpec]:
     rawTools = rawConfig.get('tools')
     if not isinstance(rawTools, list) or not rawTools:
         raise RuntimeError('工具配置 tools 必须是非空数组。')
@@ -78,7 +99,44 @@ def parseToolSettings(rawConfig: Any, source: str = '<memory>', debugConsole=Non
             f'工具设置加载完成 toolCount={len(toolSchemas)} '
             f'tools={",".join(s.name for s in toolSchemas)}'
         )
-    return toolSettings(toolSchemas=toolSchemas)
+    return toolSchemas
+
+
+def parseParallelToolPool(rawPool: Any, knownNames: set[str], source: str) -> parallelToolPoolSettings:
+    if rawPool is None:
+        return parallelToolPoolSettings()
+    if not isinstance(rawPool, dict):
+        raise RuntimeError(f'{source} parallelToolPool 必须是对象。')
+    allowedKeys = {'maxWorkers', 'toolNames'}
+    extraKeys = set(rawPool) - allowedKeys
+    missingKeys = allowedKeys - set(rawPool)
+    if extraKeys or missingKeys:
+        parts = []
+        if missingKeys:
+            parts.append('缺少字段：' + ','.join(sorted(missingKeys)))
+        if extraKeys:
+            parts.append('含未知字段：' + ','.join(sorted(extraKeys)))
+        raise RuntimeError(f'{source} parallelToolPool ' + '；'.join(parts) + '。')
+
+    maxWorkers = rawPool.get('maxWorkers')
+    if isinstance(maxWorkers, bool) or not isinstance(maxWorkers, int) or maxWorkers < 1 or maxWorkers > 32:
+        raise RuntimeError(f'{source} parallelToolPool.maxWorkers 必须是整数 1..32。')
+
+    rawNames = rawPool.get('toolNames')
+    if not isinstance(rawNames, list):
+        raise RuntimeError(f'{source} parallelToolPool.toolNames 必须是字符串数组。')
+    toolNames: list[str] = []
+    seenNames: set[str] = set()
+    for index, name in enumerate(rawNames):
+        if not isinstance(name, str) or not name:
+            raise RuntimeError(f'{source} parallelToolPool.toolNames 第 {index + 1} 项必须是非空字符串。')
+        if name in seenNames:
+            raise RuntimeError(f'{source} parallelToolPool.toolNames 重复：{name}')
+        if name not in knownNames:
+            raise RuntimeError(f'{source} parallelToolPool.toolNames 未知工具：{name}')
+        seenNames.add(name)
+        toolNames.append(name)
+    return parallelToolPoolSettings(maxWorkers=maxWorkers, toolNames=frozenset(toolNames))
 
 
 def parseToolSchema(rawTool: dict[str, Any], source: str, position: int, debugConsole=None) -> toolSchemaSpec:

@@ -1,4 +1,8 @@
-version: 3
+version: 4
+
+parallelToolPool:
+  maxWorkers: 4
+  toolNames: []
 
 tools:
   - name: read

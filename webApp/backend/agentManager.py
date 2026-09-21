@@ -1,22 +1,8 @@
 '''
 Author: wilbur
-Version: 1.11
-Date: 2026-09-07
-Description: sessionId → agent 实例缓存（懒建、模型配置变更后置失效标记惰性重建）、活跃流登记（同会话并发 409）、停止标志与泵线程结构。
-            v1.1 随包改名调整 import（webApp.backend.*）。
-            v1.2 迭代一（方案 §11.4）：泵线程流开始快照 usageTotal、终态算 delta 先写 usageStore.usageTurns（后回写 sessions 索引，原有回写不变）。
-            v1.3 迭代二（方案 §3.3/§3.6）：新增 dropAgentIfIdle（单锁完成查活跃流+丢缓存，/model 指令用）；泵线程回写索引时附带 contextTokens（conversation.lastTurnTokens）。
-            v1.4 状态栏口径：回写索引时附带 lastUsage=本轮 delta（↑↓⚡ 展示最近一轮，不再用会话累计）。
-            v1.5 多窗口并行（multiWindowStreamingPlan §4.1）：streamPump 广播化——单队列改「事件 history + 多订阅者队列」（subLock 内回放/广播/关闭，不丢不重）；
-            startStream 增加 meta（baseCount/userMessage，attach 首帧用）；新增 getActivePump/subscribe/unsubscribe/compactDeltas；
-            stop 分支补广播 stopped 终态（其他订阅窗口静默收尾，不再误报连接中断）。
-            v1.6（stopResponsivenessPlan L2）：requestStop 改主动收尾（interrupt + 广播 stopped + 幂等 usage + 注销 + 关订阅）；
-            doneEvent/usageRecorded/historyOverflowed；_broadcast 拦截已终态事件；history 2000 截尾。
-            v1.7 logDir 按会话 workDir 注入 ~/.flamingo/logs/webData/<workDir路径>/，不再用扁平 sessionLogsDir。
-            v1.8 泵异常与 sseGen 意外异常落 jsonl（pumpError/sseGenError），只用 conversations.get，禁止 getConversation。
-            v1.9 泵/sseGen 诊断落盘失败不得盖掉真正的流异常。
-            v1.10 固化泵实际模型；Core usageUpdate 转 DTO；中间只写 sessions usage/context；惰性 liveCost；终态锁外落账且异常不阻断 seal。
-            v1.11 生产直接读取 agent.modelAdapter.config，不再用 getattr/unknown 兜底掩盖缺失接口。
+Version: 1.12
+Date: 2026-09-21
+Description: sessionId → agent 实例缓存、活跃流登记与泵线程结构。v1.12 分离 UI done 与 Core draining：stop/terminal 原子 claim、finishStream 同锁 pop+coreDone、活跃/抽干期间禁止替换 agent。
 '''
 
 from __future__ import annotations
@@ -38,14 +24,19 @@ agentCache: dict[str, object] = {}
 staleSessionIds: set[str] = set()
 activeStreams: dict[str, 'streamPump'] = {}
 HISTORY_MAX_EVENTS = 2000
+CORE_IDLE_WAIT_SECONDS = 2.0
 
 
 def getAgent(sessionId: str):
     # 懒建缓存：按索引中的 workDir/providerId/modelId 建 agent，logDir 落到 ~/.flamingo/logs/webData/<workDir路径>/。
+    # draining 期间必须返回旧 pump.agent，禁止旧 worker 尚未退出时建新锁实例。
     meta = sessionStore.getSession(sessionId)
     if meta is None:
         raise RuntimeError(f'会话不存在：{sessionId}')
     with managerLock:
+        pump = activeStreams.get(sessionId)
+        if pump is not None:
+            return pump.agent
         cached = agentCache.get(sessionId)
         if cached is not None and sessionId not in staleSessionIds:
             return cached
@@ -66,16 +57,22 @@ def getCachedAgent(sessionId: str):
         return agentCache.get(sessionId)
 
 
-def dropAgent(sessionId: str) -> None:
+def dropAgent(sessionId: str) -> bool:
     with managerLock:
+        if sessionId in activeStreams:
+            staleSessionIds.add(sessionId)
+            return False
         agentCache.pop(sessionId, None)
         staleSessionIds.discard(sessionId)
+        return True
 
 
 def dropAgentIfIdle(sessionId: str) -> bool:
     # /model 指令（迭代二 §3.3，评审 M7）：同一把锁内完成「有活跃流 → False / 否则丢缓存 → True」，消除竞态窗口。
+    # draining 期间不替换旧 agent，但标 stale，确保 Core 完成后下次 getAgent 重建。
     with managerLock:
         if sessionId in activeStreams:
+            staleSessionIds.add(sessionId)
             return False
         agentCache.pop(sessionId, None)
         staleSessionIds.discard(sessionId)
@@ -116,16 +113,28 @@ def compactDeltas(events: list) -> list:
     return compacted
 
 
-def startStream(sessionId: str, agentInstance, stream, meta: dict | None = None) -> 'streamPump | None':
-    # 同会话已有活跃流时返回 None（路由层映射 409）；登记与启动在同一把锁内完成。
-    # meta = {'baseCount': int, 'userMessage': str|None}：attach 首帧 streamResume 用（multiWindowStreamingPlan §4.3）。
+def startStream(sessionId: str, agentInstance, stream, meta: dict | None = None, runEvent: threading.Event | None = None) -> 'streamPump | None':
+    # claim-before-start：先复查无 active、构造并注册 pump identity，随后才启动线程。
+    startError = None
     with managerLock:
         if sessionId in activeStreams:
             return None
-        pump = streamPump(sessionId, agentInstance, stream, meta=meta)
+        pump = streamPump(sessionId, agentInstance, stream, meta=meta, runEvent=runEvent)
         activeStreams[sessionId] = pump
-        pump.start()
-        return pump
+        try:
+            pump.start()
+        except Exception as error:
+            if activeStreams.get(sessionId) is pump:
+                activeStreams.pop(sessionId, None)
+            pump.coreDoneEvent.set()
+            startError = error
+    if startError is not None:
+        try:
+            stream.close()
+        except Exception:
+            pass
+        raise startError
+    return pump
 
 
 def unregisterStream(sessionId: str) -> None:
@@ -133,30 +142,121 @@ def unregisterStream(sessionId: str) -> None:
         activeStreams.pop(sessionId, None)
 
 
+def finishStream(sessionId: str, expectedPump: 'streamPump') -> None:
+    with managerLock:
+        if activeStreams.get(sessionId) is expectedPump:
+            activeStreams.pop(sessionId, None)
+        expectedPump.coreDoneEvent.set()
+
+
+def waitForCoreIdle(sessionId: str, timeout: float = CORE_IDLE_WAIT_SECONDS) -> str:
+    with managerLock:
+        pump = activeStreams.get(sessionId)
+        if pump is None:
+            return 'idle'
+        draining = (
+            pump.stopFlag.is_set()
+            or pump.stopClaimed
+            or pump.terminalSeen
+            or pump.doneEvent.is_set()
+        )
+        if not draining:
+            return 'active'
+        coreDone = pump.coreDoneEvent
+    if not coreDone.wait(timeout):
+        return 'timeout'
+    with managerLock:
+        current = activeStreams.get(sessionId)
+        if current is None:
+            return 'idle'
+        if current is pump:
+            return 'timeout'
+        stillDraining = (
+            current.stopFlag.is_set()
+            or current.stopClaimed
+            or current.terminalSeen
+            or current.doneEvent.is_set()
+        )
+        return 'timeout' if stillDraining else 'active'
+
+
 def requestStop(sessionId: str) -> bool:
     with managerLock:
         pump = activeStreams.get(sessionId)
         if pump is None:
             return False
-        pump.requestStop()
+        claimed = claimStopOwner(pump)
+        alreadyTerminal = pump.terminalSeen
+    if not claimed:
+        if alreadyTerminal:
+            try:
+                pump._recordUsage()
+            except Exception:
+                pass
         return True
+    dispatchStop(pump)
+    return True
+
+
+def claimStopOwner(pump: 'streamPump') -> bool:
+    if pump.terminalSeen or pump.stopClaimed:
+        return False
+    pump.stopClaimed = True
+    pump.stopDispatchDone.clear()
+    pump.stopFlag.set()
+    if pump.runEvent is not None:
+        pump.runEvent.set()
+    return True
+
+
+def dispatchStop(pump: 'streamPump') -> None:
+    try:
+        try:
+            pump.agent.interruptActiveStreams(pump.sessionId)
+        except Exception as error:
+            try:
+                pump._logDiagEvent('stopInterruptError', error, traceback.format_exc())
+            except Exception:
+                pass
+        try:
+            pump._recordUsage()
+        except Exception as error:
+            try:
+                pump._logDiagEvent('stopUsageError', error, traceback.format_exc())
+            except Exception:
+                pass
+        try:
+            pump._sealStopped()
+        except Exception as error:
+            try:
+                pump._logDiagEvent('stopSealError', error, traceback.format_exc())
+            except Exception:
+                pass
+    finally:
+        pump.stopDispatchDone.set()
 
 
 class streamPump:
     # 泵线程 + 广播结构（multiWindowStreamingPlan §4.1）：事件 history + 多订阅者队列。
     # subscribe/_broadcast/结束置 closed 均在 subLock 内 → 回放与实时无缝衔接，不丢不重；
     # v1.6：requestStop 主动收尾（不再只置标志等泵消费），doneEvent 供 chatStream 宽容闸等待。
-    def __init__(self, sessionId: str, agentInstance, stream, meta: dict | None = None):
+    def __init__(self, sessionId: str, agentInstance, stream, meta: dict | None = None, runEvent: threading.Event | None = None):
         self.sessionId = sessionId
         self.agent = agentInstance
         self.stream = stream
         self.meta = meta or {}
+        self.runEvent = runEvent if runEvent is not None else threading.Event()
         self.subLock = threading.Lock()
         self.history: list = []
         self.subscribers: list[queue.Queue] = []
         self.closed = False
         self.stopFlag = threading.Event()
         self.doneEvent = threading.Event()
+        self.coreDoneEvent = threading.Event()
+        self.stopDispatchDone = threading.Event()
+        self.stopDispatchDone.set()
+        self.stopClaimed = False
+        self.terminalSeen = False
         self.usageRecorded = False
         self.usageRecordLock = threading.Lock()
         self.usageRecordDone = threading.Event()
@@ -174,19 +274,21 @@ class streamPump:
         self.thread.start()
 
     def requestStop(self) -> None:
-        # 主动收尾（stopResponsivenessPlan L2）：幂等早退 → 置标志 → 叫醒库内阻塞
-        # → 记 usage → 注销泵 → 同锁广播 stopped + 关订阅 + 置 doneEvent（竞态红线）。
-        # doneEvent 必须在 unregister 之后置位，否则宽容闸 wait 成功后 startStream 仍撞旧泵。
-        if self.doneEvent.is_set():
-            return
-        self.stopFlag.set()
-        try:
-            self.agent.interruptActiveStreams(self.sessionId)
-        except Exception:
-            pass
-        self._recordUsage()
-        unregisterStream(self.sessionId)
-        self._sealStopped()
+        with managerLock:
+            current = activeStreams.get(self.sessionId)
+            claimed = current is self and claimStopOwner(self)
+        if claimed:
+            dispatchStop(self)
+
+    def claimTerminal(self) -> bool:
+        with managerLock:
+            current = activeStreams.get(self.sessionId)
+            if current is not None and current is not self:
+                return False
+            if self.stopClaimed or self.terminalSeen:
+                return False
+            self.terminalSeen = True
+            return True
 
     def _sealStopped(self) -> None:
         # 同锁写入 stopped + 关订阅 + 置 doneEvent，保证 stopped 是 history 尾事件。
@@ -323,14 +425,16 @@ class streamPump:
         try:
             for event in self.stream:
                 if self.stopFlag.is_set() or self.doneEvent.is_set():
-                    # requestStop 已广播 stopped；此处只跳出，避免泵再追加事件。
                     break
                 if isinstance(event, usageUpdateEvent):
                     event = self._toUsageUpdateDto(event)
                 if self.stopFlag.is_set() or self.doneEvent.is_set():
                     break
+                isTerminal = isinstance(event, terminalEventTypes)
+                if isTerminal and not self.claimTerminal():
+                    break
                 self._broadcast(event)
-                if isinstance(event, terminalEventTypes):
+                if isTerminal:
                     break
         except Exception as error:
             try:
@@ -339,17 +443,31 @@ class streamPump:
                 self._logDiagEvent('pumpError', error, stack)
             except Exception:
                 pass
-            self._broadcast(errorEvent(message=str(error), errorType=type(error).__name__))
+            if self.claimTerminal():
+                self._broadcast(errorEvent(message=str(error), errorType=type(error).__name__))
         finally:
-            self.stream.close()
-            self._recordUsage()
-            if self.stopFlag.is_set():
-                # 中断路径由 requestStop 负责广播 stopped / 关订阅 / 置 doneEvent，
-                # 避免泵先关连接导致其他窗口收不到 stopped（G3）。
-                return
-            if not self.doneEvent.is_set():
-                unregisterStream(self.sessionId)
-                self._closeSubscribers()
+            try:
+                try:
+                    self.stream.close()
+                except Exception as error:
+                    try:
+                        self._logDiagEvent('streamCloseError', error, traceback.format_exc())
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        self._recordUsage()
+                    except Exception as error:
+                        try:
+                            self._logDiagEvent('usageRecordError', error, traceback.format_exc())
+                        except Exception:
+                            pass
+            finally:
+                if self.stopFlag.is_set() or self.stopClaimed:
+                    self.stopDispatchDone.wait()
+                if not self.doneEvent.is_set():
+                    self._closeSubscribers()
+                finishStream(self.sessionId, self)
 
     def logSseGenError(self, error) -> None:
         try:

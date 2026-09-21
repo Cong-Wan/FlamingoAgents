@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-09-07
-Description: Core usageUpdateEvent, pump DTO/liveCost/_recordUsage, SSE codec dual mapping, and temp JSONL/sessions/usage.db reconciliation for live status-bar usage. v1.2 parameterized startStream/requestStop/_pump owner×failure race with waiterEntered before owner I/O release. v1.3 restores explicit and real-query price-load count coverage with nonzero pump baselines; uses camelCase token keys.
+Version: 1.4
+Date: 2026-09-21
+Description: Core usageUpdateEvent, pump DTO/liveCost/_recordUsage, SSE codec dual mapping, and temp JSONL/sessions/usage.db reconciliation for live status-bar usage. v1.4 覆盖 UI done 与 Core draining 分离后的 usage at-most-once 竞态。
 '''
 
 from __future__ import annotations

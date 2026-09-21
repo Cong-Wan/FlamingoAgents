@@ -1,9 +1,9 @@
 '''
 Author: wilbur
-Version: 1.2
-Date: 2026-08-14
+Version: 1.3
+Date: 2026-09-21
 Description: Executes callable tool definitions through shared argument validation and toolResult wrapping.
-             v1.2（stopResponsivenessPlan L3.5）：modelInterruptedError 直通，不包装成 toolResult 错误。
+             v1.3：prepareArguments 也直通 modelInterruptedError，避免并行批次把中断吞成普通工具错误。
 '''
 
 from __future__ import annotations
@@ -28,6 +28,8 @@ def executeToolCall(definition: toolDefinition, call: toolCall, context: toolCon
             arguments = definition.prepareArguments(arguments)
             if not isinstance(arguments, dict):
                 return toolResult(call.id, definition.name, True, '工具参数预处理结果必须是对象。', {'invalidPreparedArguments': True})
+    except modelInterruptedError:
+        raise
     except Exception as error:
         return toolResult(
             toolCallId=call.id,

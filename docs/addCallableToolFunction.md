@@ -72,15 +72,25 @@ builtinFactories: dict[str, Callable[[list[permissionRule]], toolDefinition]] = 
 }
 ```
 
-在 `~/.flamingo/config/tools.yaml` 启用（模板在项目 `config/tools.yaml`，首次运行自动拷贝）：
+在 `~/.flamingo/config/tools.yaml` 启用（模板在项目 `config/tools.yaml`，首次运行自动拷贝）：把工具写成 `tools[]` 一项（v3/v4 同一结构）。v4 若要并发，再把名称加入 `parallelToolPool.toolNames`；默认空池保持串行。
 
 ```yaml
-enabledTools:
-  - read
-  - write
-  - edit
-  - bash
-  - currentTime
+version: 4
+
+parallelToolPool:
+  maxWorkers: 4
+  toolNames: []          # 推荐起步只加 read；不要默认加入 write/edit/bash
+
+tools:
+  - name: currentTime
+    description: 获取当前 UTC 时间。
+    parameters:
+      type: object
+      properties:
+        timezone:
+          type: string
+          default: utc
+      additionalProperties: false
 ```
 
 验证（没有测试框架，靠编译 + 让模型实际调用）：
@@ -100,11 +110,11 @@ uv run python askModel.py    # 让模型读一段触发 currentTime 的 prompt
 写 Python callable
   -> 写 createXTool factory
   -> 注册到 createBuiltinTools 的 factory map
-  -> 在 ~/.flamingo/config/tools.yaml 的 enabledTools 中启用
-  -> 如需权限确认，在 toolPermissions 中配置规则
+  -> 在 ~/.flamingo/config/tools.yaml 的 tools[] 中声明 schema/permissions
+  -> 如需同批并发，再把名称加入 parallelToolPool.toolNames
 ```
 
-启动时 `createBuiltinTools()` 按 `enabledTools` 逐个调用 factory 生成 `toolDefinition`，交给 `toolRegistry` 按 name 去重注册。模型发起 function call 时，executor 校验参数 schema → 检查权限 → 调用 `definition.execute()` → 把结果统一包装成 `toolResult`。
+启动时 `createBuiltinTools()` 按 `tools[]` 调用 factory 生成 `toolDefinition`，交给 `toolRegistry` 按 name 去重注册。模型发起 function call 时，executor 校验参数 schema → 检查权限 → 调用 `definition.execute()` → 把结果统一包装成 `toolResult`。
 
 工具函数本身只负责「拿到 `arguments` 做事、返回 `toolOutput`」，不用管 `toolCallId`、schema 校验、权限确认——这些都是 executor 的事。
 
@@ -116,8 +126,8 @@ uv run python askModel.py    # 让模型读一段触发 currentTime 的 prompt
 | `flamingoAgents/tools/toolDefinition.py` | `toolDefinition`、`defineTool()`、`permissionRule` 类型 |
 | `flamingoAgents/tools/toolRegistry.py` | 按 name 去重注册 tool definition |
 | `flamingoAgents/tools/toolRuntime.py` | 通用 executor：校验参数、检查权限、调用 `execute()`、包装 `toolResult` |
-| `flamingoAgents/tools/toolConfig.py` | 解析 `enabledTools` 和 `toolPermissions` |
-| `~/.flamingo/config/tools.yaml` | 决定启用哪些工具、哪些需要权限确认（模板在项目 `config/tools.yaml`） |
+| `flamingoAgents/tools/toolConfig.py` | 解析 `tools[]` schema/permissions 与 v4 `parallelToolPool` |
+| `~/.flamingo/config/tools.yaml` | 决定启用哪些工具、哪些需要权限确认、哪些可进并行池（模板在项目 `config/tools.yaml`） |
 
 新增工具的代码改动集中在 `builtinTools.py` 和 `tools.yaml`，不要往其他文件塞业务逻辑。
 
@@ -186,29 +196,45 @@ factory 把函数、schema、description、permissions、preview 绑成一个 `t
 
 ### 5. 在配置中启用
 
-在 `~/.flamingo/config/tools.yaml` 的 `enabledTools` 加入工具名。不需要权限确认的工具，无需在 `toolPermissions` 下配置。
+在 `~/.flamingo/config/tools.yaml` 的 `tools[]` 加入工具 schema。权限规则写在该工具的 `permissions` 数组中，不需要确认则可省略。
 
 ## Permissions
 
-工具某些调用需要用户确认时，在 `toolPermissions.<工具名>` 下配置规则。例如 `fetchUrl` 访问内网地址要确认：
+工具某些调用需要用户确认时，把规则写在该工具的 `permissions` 下。例如 `fetchUrl` 访问内网地址要确认：
 
 ```yaml
-toolPermissions:
-  fetchUrl:
-    - id: localNetworkUrl
-      field: url
-      action: requireApproval
-      reason: 访问内网地址需要用户确认
-      match:
-        type: regex
-        patterns:
-          - '^https?://(127\.0\.0\.1|localhost|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)'
+tools:
+  - name: fetchUrl
+    description: 请求 URL。
+    parameters:
+      type: object
+      properties:
+        url: {type: string}
+      required: [url]
+    permissions:
+      - id: localNetworkUrl
+        field: url
+        action: requireApproval
+        reason: 访问内网地址需要用户确认
+        match:
+          type: regex
+          patterns:
+            - '^https?://(127\.0\.0\.1|localhost|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)'
 ```
 
 - `field` 必须对应工具 arguments 中的字段名。
 - `action` 第一阶段只支持 `requireApproval`。
 - `match.type` 第一阶段只支持 `regex`，以 `re.IGNORECASE` 编译。
 - 触发权限的调用返回 `confirmationRequired`，不会提前执行真实函数。
+
+## Parallel pool contract
+
+把工具名加入 `parallelToolPool.toolNames` 后，同一 assistant 批次里连续免确认调用可能在线程池中重叠执行。池内工具必须：
+
+- **线程安全**：不依赖全局可变状态；共享文件/端口/外部系统冲突由你承担，系统不会静态分析 `bash`。
+- **有界**：禁止永不返回的循环；线程池无法硬杀 running 线程。
+- **协作取消**：轮询 `context.interruptEvent`，收到停止后尽快返回或抛 `modelInterruptedError`。
+- **不要默认并发写**：`write`/`edit`/`bash`/`askSubAgent` 不建议加入推荐池；`askSubAgent` 若实验必须显式不同 workDir。
 
 ## Common Errors
 
@@ -233,6 +259,7 @@ toolPermissions:
 - [ ] 预览函数：`previewCurrentTimeTool(arguments) -> str`
 - [ ] factory：`createCurrentTimeTool(permissions=None) -> toolDefinition`
 - [ ] 注册：`'currentTime': createCurrentTimeTool`
-- [ ] 配置：`enabledTools` 加入 `currentTime`
-- [ ] 权限：需要确认时在 `toolPermissions.currentTime` 中配置规则
+- [ ] 配置：`tools[]` 加入 `currentTime` schema
+- [ ] 权限：需要确认时在该工具 `permissions` 中配置规则
+- [ ] 并发：仅当工具线程安全、有界且协作取消时，才加入 `parallelToolPool.toolNames`
 - [ ] 验证：`uv run python -m py_compile ...` + `uv run python askModel.py`
