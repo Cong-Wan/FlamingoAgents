@@ -1,8 +1,8 @@
 <!--
 Author: wilbur
-Version: 1.21
-Date: 2026-09-15
-Description: FlamingoAgents native Web UI shell. v1.19 加号为入口，悬停/点击弹出二级菜单再上传图片。v1.20（configHomePlan P4）：模型配置/技能页说明改为 ~/.flamingo/config/...。v1.21（chatUxImprovePlan）：mermaid + 复制按钮 + 错误历史。v1.22：逻辑图节点文字；styles.css?v=1.24 markdown.js?v=1.2。
+Version: 1.23
+Date: 2026-09-21
+Description: FlamingoAgents native Web UI shell. v1.23 用量页改为单一时间范围下拉框、四张汇总卡和 Provider 趋势图，删除会话表与 Chart.js。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -12,7 +12,7 @@ Description: FlamingoAgents native Web UI shell. v1.19 加号为入口，悬停/
   <title>FlamingoAgents</title>
   <link rel="icon" type="image/png" href="/static/flamingo.png">
   <link rel="stylesheet" href="/static/vendor/highlight-theme.min.css">
-  <link rel="stylesheet" href="/static/styles.css?v=1.24">
+  <link rel="stylesheet" href="/static/styles.css?v=1.25">
 </head>
 <body>
   <!-- 登录门：无 token 或任意请求 401 时全屏遮罩 -->
@@ -157,35 +157,36 @@ Description: FlamingoAgents native Web UI shell. v1.19 加号为入口，悬停/
 
       <!-- 用量统计页 -->
       <section id="usagePage" class="page hidden">
-        <header class="topbar"><span class="topbar-title">用量统计</span></header>
+        <header class="topbar">
+          <span class="topbar-title">用量统计</span>
+          <label class="time-filter" for="periodSelect">
+            <span>时间范围</span>
+            <select id="periodSelect" aria-label="时间范围">
+              <option value="today">今天</option>
+              <option value="yesterday">昨天</option>
+              <option value="last7Days" selected>近7天</option>
+              <option value="last30Days">近1个月</option>
+              <option value="thisMonth">本月</option>
+              <option value="lastMonth">上月</option>
+            </select>
+          </label>
+        </header>
         <div class="page-body">
-          <div class="usage-cards">
+          <div class="usage-cards" aria-label="筛选范围汇总">
             <div class="usage-card"><div class="usage-card-label">Prompt Tokens</div><div id="usagePrompt" class="usage-card-value">-</div></div>
             <div class="usage-card"><div class="usage-card-label">Cached Tokens</div><div id="usageCached" class="usage-card-value">-</div></div>
             <div class="usage-card"><div class="usage-card-label">Completion Tokens</div><div id="usageCompletion" class="usage-card-value">-</div></div>
-            <div id="usageCostCard" class="usage-card hidden"><div class="usage-card-label">总费用</div><div id="usageCost" class="usage-card-value">-</div></div>
+            <div class="usage-card"><div class="usage-card-label">总费用</div><div id="usageCost" class="usage-card-value">-</div></div>
           </div>
-          <div class="usage-chart-area">
-            <div class="usage-chart-head">
-              <span class="usage-chart-title">用量趋势</span>
-              <div id="granularitySwitch" class="granularity-switch">
-                <button data-granularity="hour" class="granularity-btn">时</button>
-                <button data-granularity="day" class="granularity-btn active">天</button>
-                <button data-granularity="month" class="granularity-btn">月</button>
-              </div>
-            </div>
-            <div class="usage-chart-wrap">
-              <canvas id="usageChart"></canvas>
-              <div id="usageChartEmpty" class="usage-chart-empty hidden">暂无用量数据</div>
-            </div>
-            <div class="usage-chart-note">图表含已删除会话的历史用量；上方卡片仅统计现存会话。</div>
+          <div class="range-strip">
+            <strong id="usageRangeText">-</strong>
+            <span id="usageTimeZone"></span>
+            <span id="usageCallCount" class="range-tag"></span>
           </div>
-          <table class="usage-table">
-            <thead>
-              <tr><th>会话</th><th>模型</th><th>Prompt</th><th>Cached</th><th>Completion</th><th>更新时间</th></tr>
-            </thead>
-            <tbody id="usageTableBody"></tbody>
-          </table>
+          <div id="usageQualityNotice" class="quality-notice"></div>
+          <div id="usageStatus" class="usage-status hidden"></div>
+          <section id="providerList" class="provider-list" aria-label="Provider 用量趋势"></section>
+          <p class="usage-coverage">仅含已落账且 Provider 返回 usage 的终态调用；进行中/无 usage 不包含，补账可能回填历史。</p>
         </div>
       </section>
     </main>
@@ -297,10 +298,9 @@ Description: FlamingoAgents native Web UI shell. v1.19 加号为入口，悬停/
   <script src="/static/vendor/marked.min.js"></script>
   <script src="/static/vendor/dompurify.min.js"></script>
   <script src="/static/vendor/highlight.min.js"></script>
-  <script src="/static/vendor/chart.umd.min.js"></script>
   <script src="/static/js/markdown.js?v=1.2"></script>
   <script src="/static/js/store.js"></script>
-  <script src="/static/js/api.js"></script>
+  <script src="/static/js/api.js?v=1.10"></script>
   <script src="/static/js/sse.js"></script>
   <script src="/static/js/sidebarView.js"></script>
   <script src="/static/js/statusUsage.js?v=1.1"></script>
@@ -313,7 +313,7 @@ Description: FlamingoAgents native Web UI shell. v1.19 加号为入口，悬停/
   <script src="/static/js/subscriptionModels.js"></script>
   <script src="/static/js/settingsView.js"></script>
   <script src="/static/js/skillsView.js"></script>
-  <script src="/static/js/usageView.js"></script>
+  <script src="/static/js/usageView.js?v=1.5"></script>
   <script src="/static/js/main.js"></script>
 </body>
 </html>

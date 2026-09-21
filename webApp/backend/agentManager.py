@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.12
+Version: 1.13
 Date: 2026-09-21
-Description: sessionId → agent 实例缓存、活跃流登记与泵线程结构。v1.12 分离 UI done 与 Core draining：stop/terminal 原子 claim、finishStream 同锁 pop+coreDone、活跃/抽干期间禁止替换 agent。
+Description: sessionId → agent 实例缓存、活跃流登记与泵线程结构。v1.13 Web Agent 注入 usageSource=web；状态栏费用改读 usageEvents，泵终态不再写 usageTurns。
 '''
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ def getAgent(sessionId: str):
             logDir=ensureSessionLogDir('webData', Path(meta['workDir'])),
             providerId=meta['providerId'],
             modelId=meta['modelId'],
+            usageSource='web',
         )
         agentCache[sessionId] = newAgent
         staleSessionIds.discard(sessionId)
@@ -366,9 +367,7 @@ class streamPump:
         if self.liveCostState != 'pending':
             return
         try:
-            dbBaseCost = usageStore.querySessionCost(self.sessionId)
-            costMap = usageStore.loadCostMap()
-            pumpModelCost = costMap.get(f'{self.pumpProviderId}/{self.pumpModelId}')
+            usageStore.querySessionCost(self.sessionId)
         except Exception as error:
             self.liveCostState = 'unavailable'
             self.dbBaseCost = None
@@ -378,8 +377,6 @@ class streamPump:
             except Exception:
                 pass
             return
-        self.dbBaseCost = dbBaseCost
-        self.pumpModelCost = pumpModelCost
         self.liveCostState = 'ready'
 
     def _toUsageUpdateDto(self, event: usageUpdateEvent) -> usageUpdateDto:
@@ -396,24 +393,18 @@ class streamPump:
             except Exception:
                 pass
         self._ensureLiveCostState()
-        delta = {
-            key: max(0, int(event.usage[key]) - int(self.startUsage[key]))
-            for key in usageStore.tokenKeys
-        }
-        if self.liveCostState != 'ready' or self.dbBaseCost is None:
+        if self.liveCostState != 'ready':
             liveCost = None
         else:
-            deltaCost = (
-                usageStore.calcTurnCost(
-                    delta['promptTokens'],
-                    delta['cachedTokens'],
-                    delta['completionTokens'],
-                    self.pumpModelCost,
-                )
-                if self.pumpModelCost
-                else 0.0
-            )
-            liveCost = self.dbBaseCost + deltaCost
+            try:
+                liveCost = usageStore.querySessionCost(self.sessionId)
+            except Exception as error:
+                liveCost = None
+                self.liveCostState = 'unavailable'
+                try:
+                    self._logDiagEvent('liveCostQueryError', error, traceback.format_exc())
+                except Exception:
+                    pass
         return usageUpdateDto(
             usage={key: int(event.usage[key]) for key in usageStore.tokenKeys},
             stepUsage={key: int(event.stepUsage.get(key, 0) or 0) for key in usageStore.tokenKeys},
@@ -527,12 +518,6 @@ class streamPump:
                     for key in self.startUsage
                 }
                 delta = {key: finalUsage[key] - self.startUsage[key] for key in finalUsage}
-                usageStore.writeUsageTurn(
-                    self.sessionId,
-                    self.pumpProviderId,
-                    self.pumpModelId,
-                    delta,
-                )
                 sessionStore.updateUsage(
                     self.sessionId,
                     finalUsage,

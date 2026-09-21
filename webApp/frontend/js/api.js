@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.9
-Date: 2026-09-08
-Description: Authenticated fetch wrapper for Web APIs. v1.8 adds POST subscription model-candidate discovery while preserving credential-secret-free login/status/task calls. v1.9 新增 getSessionImage（鉴权 blob，不把 token 放 URL）。
+Version: 1.10
+Date: 2026-09-21
+Description: Authenticated fetch wrapper for Web APIs. v1.10 getUsage 只请求 period 单一统计接口，删除 series，并支持 AbortController。
 */
 (function () {
   'use strict';
@@ -37,7 +37,8 @@ Description: Authenticated fetch wrapper for Web APIs. v1.8 adds POST subscripti
     var resp = await fetch(path, {
       method: options.method || 'GET',
       headers: headers,
-      body: options.body !== undefined ? JSON.stringify(options.body) : undefined
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+      signal: options.signal
     });
     if (resp.status === 401) {
       window.appStore.clearToken();
@@ -90,9 +91,8 @@ Description: Authenticated fetch wrapper for Web APIs. v1.8 adds POST subscripti
     stopChat: function (sessionId) {
       return request('/api/chat/stop', { method: 'POST', body: { sessionId: sessionId } });
     },
-    getUsage: function () { return request('/api/usage'); },
-    getUsageSeries: function (granularity) {
-      return request('/api/usage/series?granularity=' + encodeURIComponent(granularity || 'day'));
+    getUsage: function (period, options) {
+      return request('/api/usage?period=' + encodeURIComponent(period || 'last7Days'), options);
     },
     getModels: function () { return request('/api/models'); },
     putModels: function (config) { return request('/api/models', { method: 'PUT', body: config }); },

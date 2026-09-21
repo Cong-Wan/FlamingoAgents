@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.24
+Version: 1.25
 Date: 2026-09-21
-Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.24 引入批次事务账本、每流单调 runEvent、池内连续调用屏障汇合并发，以及任意 yield 关闭后的原序幂等闭合。
+Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.25 每个物理 attempt 在请求前生成 usageKey，合法 terminal usage 先写 JSONL usageRecord 再幂等落入统一账本。
 '''
 
 from __future__ import annotations
@@ -51,6 +51,7 @@ from flamingoAgents.core.types import (
     usageUpdateEvent,
 )
 from flamingoAgents.utils.logPaths import newSessionId
+from flamingoAgents.utils import usageLedger
 from flamingoAgents.tools.toolDefinition import toolDefinition
 from flamingoAgents.tools.toolPolicy import evaluateToolCall
 from flamingoAgents.tools.toolRegistry import toolRegistry
@@ -105,6 +106,8 @@ class agent:
         maxModelSteps: int | None = None,
         parallelToolNames: frozenset[str] | None = None,
         maxParallelTools: int = 1,
+        usageSource: str = 'library',
+        parentSessionId: str | None = None,
     ):
         self.modelAdapter = modelAdapter
         self.toolRegistry = toolRegistry(toolDefinitions, debugConsole=debugConsole)
@@ -112,6 +115,8 @@ class agent:
         self.logDir = logDir
         self.systemPrompt = systemPrompt
         self.debugConsole = debugConsole
+        self.usageSource = usageSource or 'library'
+        self.parentSessionId = parentSessionId
         # None 或 <=0：不限制模型循环步数；>0：硬上限
         self.maxModelSteps = maxModelSteps
         if isinstance(maxParallelTools, bool) or not isinstance(maxParallelTools, int) or maxParallelTools < 1 or maxParallelTools > 32:
@@ -394,16 +399,27 @@ class agent:
                 for key in usageTotalKeys
             }
             completion = None
+            attemptSnapshot = None
             for attempt in range(MODEL_RETRY_MAX_ATTEMPTS + 1):
                 if runEvent.is_set():
                     return
                 chunkSeen = False
+                attemptSnapshot = {
+                    'usageKey': usageLedger.newUsageKey(),
+                    'startedAt': usageLedger.utcNowIso(),
+                    'providerId': self.currentProviderId(),
+                    'modelId': self.currentModelId(),
+                    'costFields': usageLedger.snapshotModelCost(self.currentProviderId(), self.currentModelId()),
+                }
                 try:
                     try:
                         currentConversation.logger.logEvent({
                             'type': 'modelRequestStart',
                             'sessionId': sessionId,
                             'attempt': attempt + 1,
+                            'usageKey': attemptSnapshot['usageKey'],
+                            'providerId': attemptSnapshot['providerId'],
+                            'modelId': attemptSnapshot['modelId'],
                             'messageCount': len(currentConversation.messages),
                             'contextTokens': currentConversation.lastTurnTokens,
                         })
@@ -496,13 +512,13 @@ class agent:
             responsePayload = getattr(completion, 'responsePayload', None)
             assistantMessage = completion.message
             safePayload = responsePayload if isinstance(responsePayload, dict) else {}
-            rawUsage = safePayload.get('usage')
-            hasTerminalUsage = isinstance(rawUsage, dict) and all(
-                isinstance(rawUsage.get(key), int)
-                and not isinstance(rawUsage.get(key), bool)
-                and rawUsage[key] >= 0
-                for key in ('prompt_tokens', 'completion_tokens')
+            persistedUsageKey = self.persistAttemptUsage(
+                currentConversation,
+                sessionId,
+                safePayload,
+                attemptSnapshot,
             )
+            hasTerminalUsage = persistedUsageKey is not None
             if assistantMessage.toolCalls:
                 idError = self.validateToolCallIds(assistantMessage.toolCalls)
                 if idError is not None:
@@ -511,7 +527,7 @@ class agent:
                 ledger = self.makeToolBatchLedger(assistantMessage.toolCalls, 0)
                 batchError = None
                 try:
-                    currentConversation.appendAssistantMessage(assistantMessage, safePayload)
+                    currentConversation.appendAssistantMessage(assistantMessage, safePayload, usageKey=persistedUsageKey)
                     ledger.assistantPersisted = True
                     if hasTerminalUsage:
                         usageNow = {
@@ -545,7 +561,7 @@ class agent:
                 stepIndex += 1
                 continue
 
-            currentConversation.appendAssistantMessage(assistantMessage, safePayload)
+            currentConversation.appendAssistantMessage(assistantMessage, safePayload, usageKey=persistedUsageKey)
             if hasTerminalUsage:
                 usageNow = {
                     key: int(currentConversation.usageTotal.get(key, 0) or 0)
@@ -762,8 +778,80 @@ class agent:
             workDir=self.workDir,
             debugConsole=self.debugConsole,
             interruptEvent=activeEvent,
+            sessionId=sessionId,
         )
         return executeCallableToolCall(definition, call, context)
+
+    def currentProviderId(self) -> str:
+        config = getattr(self.modelAdapter, 'config', None)
+        providerId = getattr(config, 'configProviderId', None) or getattr(config, 'provider', None)
+        return str(providerId or 'unknown')
+
+    def currentModelId(self) -> str:
+        config = getattr(self.modelAdapter, 'config', None)
+        modelId = getattr(config, 'model', None)
+        return str(modelId or 'unknown')
+
+    def persistAttemptUsage(
+        self,
+        currentConversation: conversation,
+        sessionId: str,
+        payload: dict,
+        attemptSnapshot: dict | None,
+    ) -> str | None:
+        tokens = usageLedger.parseExactUsage(payload.get('usage') if isinstance(payload, dict) else None)
+        if not isinstance(attemptSnapshot, dict):
+            return None
+        usageKey = attemptSnapshot.get('usageKey')
+        if tokens is None or not usageKey:
+            return None
+        providerId = str(attemptSnapshot.get('providerId') or self.currentProviderId())
+        modelId = str(attemptSnapshot.get('modelId') or self.currentModelId())
+        record = usageLedger.makeExactRecord(
+            usageKey=usageKey,
+            source=self.usageSource,
+            sessionId=sessionId,
+            parentSessionId=self.parentSessionId,
+            providerId=providerId,
+            modelId=modelId,
+            requestStartedAt=attemptSnapshot.get('startedAt') or usageLedger.utcNowIso(),
+            occurredAt=usageLedger.utcNowIso(),
+            tokens=tokens,
+            costFields=attemptSnapshot.get('costFields'),
+        )
+        outboxOk = False
+        try:
+            currentConversation.appendUsageRecord(record)
+            outboxOk = True
+        except Exception as error:
+            if self.debugConsole:
+                self.debugConsole.debug(f'usageRecord outbox 写入失败 usageKey={usageKey} error={error}')
+        dbOk = False
+        try:
+            usageLedger.insertUsageEvent(record)
+            dbOk = True
+        except Exception as error:
+            if self.debugConsole:
+                self.debugConsole.debug(f'usageEvents 写入失败 usageKey={usageKey} error={error}')
+            if outboxOk:
+                usageLedger.scheduleRetry(record)
+        if not outboxOk and not dbOk:
+            try:
+                currentConversation.logger.logEvent({
+                    'type': 'usageRecordError',
+                    'usageKey': usageKey,
+                    'sessionId': sessionId,
+                    'message': 'outbox 与账本同时写入失败',
+                })
+            except Exception:
+                pass
+            return None
+        if not outboxOk and dbOk:
+            currentConversation.usageTotal['promptTokens'] += tokens['promptTokens']
+            currentConversation.usageTotal['cachedTokens'] += tokens['cachedTokens']
+            currentConversation.usageTotal['completionTokens'] += tokens['completionTokens']
+            currentConversation.lastTurnTokens = tokens['promptTokens'] + tokens['completionTokens']
+        return usageKey
 
     def buildToolPreview(self, definition: toolDefinition, call: toolCall) -> str:
         if definition.preview is not None and isinstance(call.arguments, dict):

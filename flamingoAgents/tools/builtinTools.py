@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.8
-Date: 2026-09-17
-Description: Provides executable handlers (execute/preview) for built-in tools and a name-keyed registry mapping them to schema-driven tool definitions. Schemas and permissions come from config/tools.yaml. v1.4 adds askSubAgent: wraps sdkEntry.py as a sub-agent function call (JSON stdout parsed into toolOutput). v1.5: askSubAgent omits --system when not provided so the sub-agent falls back to the default config/systemPrompt.md. v1.6: askSubAgent timeout is a passthrough argument (default 600s, max 3600s) instead of a hardcoded 600s. v1.7（stopResponsivenessPlan L3.5）：新增 _runWithInterrupt——interruptEvent 非 None 时 subprocess 改 Popen 分片 poll，中断即 terminate/kill 并 raise modelInterruptedError，bash/askSubAgent 均接入。v1.8（bashPipeHangSessionLockFixPlan）：两条路径都走有界 Popen；首领退出后 0.5s 管道宽限；TERM 后固定 sleep 再无条件 SIGKILL；close 读端后不再 communicate。
+Version: 1.9
+Date: 2026-09-21
+Description: Provides executable handlers (execute/preview) for built-in tools. v1.9 askSubAgent 显式传 usage-source=subagent 与父会话 ID，子进程用量写入统一账本。
 '''
 
 from __future__ import annotations
@@ -382,6 +382,9 @@ def askSubAgentTool(arguments: dict[str, Any], context: toolContext) -> toolOutp
         command += ['--tools', tools]
     workDir = str(arguments.get('workDir', '')).strip() or str(context.workDir)
     command += ['--work-dir', workDir]
+    command += ['--usage-source', 'subagent']
+    if context.sessionId:
+        command += ['--parent-session-id', context.sessionId]
 
     if context.debugConsole:
         context.debugConsole.debug(f'子代理开始 model={model} workDir={workDir} tools={tools or "<none>"} timeout={timeout}')

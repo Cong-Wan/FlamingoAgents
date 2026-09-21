@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.9
+Version: 1.11
 Date: 2026-09-21
-Description: Pure-library Agent assembly factory. v1.9 将 tools.yaml v4 parallelToolPool 在工具白名单过滤后取交集注入 agent。
+Description: Pure-library Agent assembly factory. v1.11 注入 usageSource/parentSessionId，createAgent 时初始化统一账本并扫描补账。
 '''
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from flamingoAgents.tools.toolConfig import loadToolSettings
 from flamingoAgents.utils.configPaths import ensureUserConfig, userSystemPromptPath
 from flamingoAgents.utils.debug import debugConsole
 from flamingoAgents.utils.logPaths import ensureSessionLogDir
+from flamingoAgents.utils import usageLedger
 
 
 defaultSystemPromptPath = userSystemPromptPath
@@ -40,8 +41,11 @@ def createAgent(
     providerId: str = '101',
     modelId: str | None = None,
     skillsDir: str | Path | None = None,
+    usageSource: str = 'library',
+    parentSessionId: str | None = None,
 ) -> agent:
     ensureUserConfig()
+    usageLedger.ensureReady(reconcile=True)
     workDirPath = Path(workDir).resolve()
     printer = debugConsole(debug)
     resolvedLogDir = Path(logDir).resolve() if logDir else ensureSessionLogDir('cliData', workDirPath)
@@ -115,4 +119,6 @@ def createAgent(
         debugConsole=printer,
         parallelToolNames=poolNames,
         maxParallelTools=pool.maxWorkers,
+        usageSource=usageSource,
+        parentSessionId=parentSessionId,
     )

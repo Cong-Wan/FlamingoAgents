@@ -1,13 +1,8 @@
 /*
 Author: wilbur
-Version: 1.4
-Date: 2026-08-12
-Description: 用量统计页：顶部三卡片（总 prompt/cached/completion）+ 会话用量表格（契约 §2.3/§3.9）。
-             v1.1 迭代一（§11.4/契约 §3.10）：Chart.js 组合图（每模型哈希固定色堆叠柱状 + 总量折线）、
-             时/天/月粒度切换、任一模型 cost 非零时出「总费用」卡（month 全量求和口径）、双口径标注。
-             v1.2 tokensOf 去掉重复计入的 cachedTokens（其为 promptTokens 子集，OpenAI 原生语义），图表总量不再双计。
-             v1.3 配色去重：20 色 palette + assignColors 同图去重。
-             v1.4 tooltip 过滤：label/afterBody 跳过 0 用量模型，全 0 桶兜底。
+Version: 1.5
+Date: 2026-09-21
+Description: 用量统计页：一个时间范围下拉框、四张汇总卡、Provider 纵向趋势图；只请求 GET /api/usage?period=...，旧响应不得覆盖新选择。
 */
 (function () {
   'use strict';
@@ -15,259 +10,446 @@ Description: 用量统计页：顶部三卡片（总 prompt/cached/completion）
   var promptEl = document.getElementById('usagePrompt');
   var cachedEl = document.getElementById('usageCached');
   var completionEl = document.getElementById('usageCompletion');
-  var costCardEl = document.getElementById('usageCostCard');
   var costEl = document.getElementById('usageCost');
-  var tableBodyEl = document.getElementById('usageTableBody');
-  var chartCanvas = document.getElementById('usageChart');
-  var chartEmptyEl = document.getElementById('usageChartEmpty');
-  var granularitySwitchEl = document.getElementById('granularitySwitch');
+  var rangeTextEl = document.getElementById('usageRangeText');
+  var timeZoneEl = document.getElementById('usageTimeZone');
+  var callCountEl = document.getElementById('usageCallCount');
+  var qualityEl = document.getElementById('usageQualityNotice');
+  var statusEl = document.getElementById('usageStatus');
+  var providerListEl = document.getElementById('providerList');
+  var periodSelect = document.getElementById('periodSelect');
+  var tooltip = null;
+  var requestGeneration = 0;
+  var abortController = null;
+  var currentPeriod = 'last7Days';
+  var currentSnapshot = null;
+  var resizeTimer = null;
+  var tokenColors = {
+    input: '#a9c4ff',
+    cached: '#648fdf',
+    output: '#2858ad'
+  };
 
-  var granularity = 'day'; // 当前粒度（默认天）
-  var chart = null;        // Chart.js 实例
+  function formatNumber(value) {
+    return Math.round(value || 0).toLocaleString('zh-CN');
+  }
 
-  // 每模型固定一色：按 providerId/modelId 字符串 djb2 哈希到预设调色板
-  var palette = ['#3b6ef6', '#30a46c', '#f5a524', '#e5484d', '#8e4ec6',
-                 '#12a594', '#e93d82', '#6d7ff2', '#ad5700', '#5b5bd6',
-                 '#0090ff', '#46a758', '#ff6b35', '#ab4aba', '#0d9488',
-                 '#f43f5e', '#3b82f6', '#ca8a04', '#64748b', '#d6409f'];
+  function formatCompact(value) {
+    var number = Number(value || 0);
+    if (number >= 1000000) return (number / 1000000).toFixed(number >= 10000000 ? 0 : 1) + 'M';
+    if (number >= 1000) return (number / 1000).toFixed(number >= 100000 ? 0 : 1) + 'k';
+    return String(Math.round(number));
+  }
 
-  function colorFor(modelKey) {
-    var hash = 5381;
-    for (var i = 0; i < modelKey.length; i++) {
-      hash = ((hash << 5) + hash + modelKey.charCodeAt(i)) >>> 0;
+  function formatCost(totals) {
+    if (!totals || totals.costStatus === 'unavailable' || totals.costNanoUsd == null) return '—';
+    var usd = Number(totals.costNanoUsd) / 1000000000;
+    if (totals.costStatus === 'complete' && usd === 0) return '$0.0000';
+    return '$' + usd.toFixed(usd >= 10 ? 2 : 4);
+  }
+
+  function formatRange(text) {
+    if (!text) return '-';
+    return String(text).replace('T', ' ').replace(/\+\d{2}:\d{2}$/, '');
+  }
+
+  function emptyTotals() {
+    return {
+      callCount: 0,
+      promptTokens: 0,
+      cachedTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      costNanoUsd: 0,
+      costStatus: 'complete',
+      unpricedCallCount: 0,
+      unpricedTokens: 0
+    };
+  }
+
+  function inputTokens(totals) {
+    return Math.max(0, (totals.promptTokens || 0) - (totals.cachedTokens || 0));
+  }
+
+  function createElement(tagName, className, text) {
+    var element = document.createElement(tagName);
+    if (className) element.className = className;
+    if (text !== undefined) element.textContent = text;
+    return element;
+  }
+
+  function ensureTooltip() {
+    if (tooltip) return tooltip;
+    tooltip = createElement('div', 'usage-tooltip');
+    tooltip.setAttribute('role', 'tooltip');
+    tooltip.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(tooltip);
+    return tooltip;
+  }
+
+  function hideTooltip() {
+    if (!tooltip) return;
+    tooltip.classList.remove('visible');
+    tooltip.setAttribute('aria-hidden', 'true');
+  }
+
+  function setStatus(kind, message, retryable) {
+    statusEl.className = 'usage-status' + (kind ? ' ' + kind : '');
+    statusEl.replaceChildren();
+    if (!message) {
+      statusEl.classList.add('hidden');
+      return;
     }
-    return palette[hash % palette.length];
-  }
-
-  // 同图去重：先取偏好色，被占用则从偏好下标起线性探测下一未占用色；>20 允许复用
-  function assignColors(models) {
-    var used = {};
-    var colorMap = {};
-    for (var i = 0; i < models.length; i++) {
-      var modelKey = models[i];
-      var preferred = colorFor(modelKey);
-      var startIdx = palette.indexOf(preferred);
-      var color = preferred;
-      if (used[color]) {
-        var found = false;
-        for (var step = 1; step < palette.length; step++) {
-          var candidate = palette[(startIdx + step) % palette.length];
-          if (!used[candidate]) {
-            color = candidate;
-            found = true;
-            break;
-          }
-        }
-        // 超 20 模型时全部颜色已占，复用偏好色，不报错
-        if (!found) color = preferred;
-      }
-      used[color] = true;
-      colorMap[modelKey] = color;
+    statusEl.classList.remove('hidden');
+    statusEl.appendChild(document.createTextNode(message));
+    if (retryable) {
+      var button = createElement('button', 'btn usage-retry', '重试');
+      button.type = 'button';
+      button.addEventListener('click', function () { loadPeriod(currentPeriod); });
+      statusEl.appendChild(button);
     }
-    return colorMap;
   }
 
-  function formatNumber(num) {
-    return (num || 0).toLocaleString('zh-CN');
+  function paintSummary(data) {
+    var totals = data.totals || emptyTotals();
+    promptEl.textContent = formatNumber(totals.promptTokens);
+    cachedEl.textContent = formatNumber(totals.cachedTokens);
+    completionEl.textContent = formatNumber(totals.completionTokens);
+    costEl.textContent = formatCost(totals);
+    rangeTextEl.textContent = formatRange(data.startAt) + ' ～ ' + formatRange(data.endAt);
+    timeZoneEl.textContent = data.timeZone || '';
+    callCountEl.textContent = '已落账 ' + formatNumber(totals.callCount) + ' 次调用';
   }
 
-  function formatTime(isoTime) {
-    if (!isoTime) return '';
-    var date = new Date(isoTime);
-    if (isNaN(date.getTime())) return isoTime;
-    function pad(n) { return n < 10 ? '0' + n : '' + n; }
-    return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate())
-      + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes());
+  function qualityText(quality) {
+    if (!quality) return '';
+    var parts = [];
+    if (quality.legacyInferredRecords || quality.legacyUnverifiedRecords) {
+      parts.push('含 ' + formatNumber((quality.legacyInferredRecords || 0) + (quality.legacyUnverifiedRecords || 0)) + ' 条历史迁移记录');
+    }
+    if (quality.migratedPriceRecords) {
+      parts.push(formatNumber(quality.migratedPriceRecords) + ' 条使用迁移时价格估算');
+    }
+    if (quality.unknownPriceRecords) {
+      parts.push(formatNumber(quality.unknownPriceRecords) + ' 条费用未知');
+    }
+    return parts.join('；');
   }
 
-  function tokensOf(entry) {
-    // cachedTokens 是 promptTokens 的子集（OpenAI 原生语义），不再单加，避免双计（statusBarUsageFixPlan M3）
-    return (entry.promptTokens || 0) + (entry.completionTokens || 0);
+  function paintQuality(data) {
+    var text = qualityText(data.quality);
+    qualityEl.textContent = text;
+    qualityEl.classList.toggle('visible', Boolean(text));
   }
 
-  /* ---------- 卡片区（三 token 卡原口径；费用卡 = month 全量求和） ---------- */
-
-  async function loadSummary() {
-    var data = await window.api.getUsage();
-    var total = data.total || {};
-    promptEl.textContent = formatNumber(total.promptTokens);
-    cachedEl.textContent = formatNumber(total.cachedTokens);
-    completionEl.textContent = formatNumber(total.completionTokens);
-    renderTable(data.sessions || []);
+  function niceMaximum(value) {
+    if (value <= 0) return 1000;
+    var power = Math.pow(10, Math.floor(Math.log10(value)));
+    var normalized = value / power;
+    var step = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
+    return step * power;
   }
 
-  // 总费用卡：granularity=month 全量 buckets cost 求和（hour/day 有范围限制，不能作总费用口径）
-  async function loadCostCard() {
-    costCardEl.classList.add('hidden');
-    try {
-      var data = await window.api.getUsageSeries('month');
-      var totalCost = 0;
-      (data.buckets || []).forEach(function (bucket) { totalCost += bucket.cost || 0; });
-      if (totalCost > 0) { // 全部模型 cost 为 0 时恒 0，不展示费用卡
-        costEl.textContent = '$' + totalCost.toFixed(4);
-        costCardEl.classList.remove('hidden');
-      }
-    } catch (ignore) { /* 费用卡加载失败不影响其它区块 */ }
-  }
+  function drawChart(canvas, provider) {
+    var cssWidth = Math.max(280, Math.round(canvas.getBoundingClientRect().width || canvas.parentElement.clientWidth || 800));
+    var cssHeight = parseInt(getComputedStyle(canvas).height, 10) || 300;
+    var deviceRatio = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.round(cssWidth * deviceRatio);
+    canvas.height = Math.round(cssHeight * deviceRatio);
+    var context = canvas.getContext('2d');
+    context.setTransform(deviceRatio, 0, 0, deviceRatio, 0, 0);
+    context.clearRect(0, 0, cssWidth, cssHeight);
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, cssWidth, cssHeight);
 
-  function renderTable(sessions) {
-    tableBodyEl.innerHTML = '';
-    sessions.forEach(function (session) {
-      var row = document.createElement('tr');
-
-      var titleTd = document.createElement('td');
-      var link = document.createElement('a');
-      link.href = '#/chat/' + session.sessionId;
-      link.textContent = session.title || '新会话';
-      titleTd.appendChild(link);
-      row.appendChild(titleTd);
-
-      var modelTd = document.createElement('td');
-      modelTd.textContent = session.modelId
-        ? session.providerId + ' / ' + session.modelId
-        : (session.providerId || '');
-      row.appendChild(modelTd);
-
-      var usage = session.usage || {};
-      [usage.promptTokens, usage.cachedTokens, usage.completionTokens].forEach(function (value) {
-        var td = document.createElement('td');
-        td.textContent = formatNumber(value);
-        row.appendChild(td);
+    var buckets = provider.buckets || [];
+    var modelIds = (provider.models || []).map(function (model) { return model.modelId; });
+    var plotLeft = cssWidth < 520 ? 48 : 58;
+    var plotRight = cssWidth - 12;
+    var plotTop = 16;
+    var plotBaseline = cssHeight - 48;
+    var plotHeight = plotBaseline - plotTop;
+    var plotWidth = plotRight - plotLeft;
+    var maximumValue = 0;
+    buckets.forEach(function (bucket) {
+      (bucket.models || []).forEach(function (cell) {
+        maximumValue = Math.max(maximumValue, (cell.totals && cell.totals.totalTokens) || 0);
       });
-
-      var timeTd = document.createElement('td');
-      timeTd.textContent = formatTime(session.updatedAt);
-      row.appendChild(timeTd);
-
-      tableBodyEl.appendChild(row);
     });
-  }
-
-  /* ---------- 图表区（契约 §3.10：堆叠柱状 + 总量折线，byModel key 为 providerId/modelId） ---------- */
-
-  async function loadChart() {
-    if (chart) { chart.destroy(); chart = null; }
-    chartEmptyEl.classList.add('hidden');
-    if (!window.Chart) {
-      chartEmptyEl.textContent = '图表组件（Chart.js）加载失败。';
-      chartEmptyEl.classList.remove('hidden');
-      return;
-    }
-    var data;
-    try {
-      data = await window.api.getUsageSeries(granularity);
-    } catch (error) {
-      chartEmptyEl.textContent = '图表数据加载失败：' + error.message;
-      chartEmptyEl.classList.remove('hidden');
-      return;
-    }
-    var models = data.models || [];
-    var buckets = data.buckets || [];
-    if (buckets.length === 0) {
-      chartEmptyEl.textContent = '暂无用量数据';
-      chartEmptyEl.classList.remove('hidden');
-      return;
+    var maximum = niceMaximum(maximumValue * 1.08);
+    context.font = '10px -apple-system, BlinkMacSystemFont, sans-serif';
+    context.textBaseline = 'middle';
+    for (var gridIndex = 0; gridIndex <= 4; gridIndex += 1) {
+      var ratio = gridIndex / 4;
+      var y = plotTop + plotHeight * ratio;
+      context.strokeStyle = gridIndex === 4 ? '#dcdce2' : '#eeeef2';
+      context.beginPath();
+      context.moveTo(plotLeft, Math.round(y) + 0.5);
+      context.lineTo(plotRight, Math.round(y) + 0.5);
+      context.stroke();
+      context.fillStyle = '#8e8e96';
+      context.textAlign = 'right';
+      context.fillText(formatCompact(maximum * (1 - ratio)), plotLeft - 7, y);
     }
 
-    var hasCost = buckets.some(function (bucket) { return (bucket.cost || 0) > 0; });
+    var groupStep = plotWidth / Math.max(1, buckets.length);
+    var modelCount = Math.max(1, modelIds.length);
+    var groupInnerWidth = Math.max(2, groupStep * 0.72);
+    var modelGap = modelCount > 1 ? Math.min(3, groupInnerWidth * 0.1) : 0;
+    var barWidth = Math.max(1, Math.min(18, (groupInnerWidth - modelGap * (modelCount - 1)) / modelCount));
+    var barsWidth = barWidth * modelCount + modelGap * (modelCount - 1);
+    var unit = provider.bucketUnit || 'day';
+    var targetLabels = Math.max(4, Math.floor(plotWidth / (unit === 'hour' ? 52 : 58)));
+    var labelStep = Math.max(1, Math.ceil(buckets.length / targetLabels));
 
-    // 堆叠柱状：每模型一根柱（值 = 该桶该模型三 token 之和），同图去重配色
-    var colorMap = assignColors(models);
-    var datasets = models.map(function (modelKey) {
-      return {
-        type: 'bar',
-        label: modelKey,
-        backgroundColor: colorMap[modelKey],
-        stack: 'tokens',
-        data: buckets.map(function (bucket) {
-          var byModel = bucket.byModel && bucket.byModel[modelKey];
-          return byModel ? tokensOf(byModel) : 0;
-        })
-      };
-    });
-    // 总量折线叠加（所有模型三 token 之和）
-    datasets.push({
-      type: 'line',
-      label: '总量',
-      borderColor: '#1c1c1e',
-      backgroundColor: '#1c1c1e',
-      borderWidth: 2,
-      pointRadius: 2,
-      tension: 0.2,
-      data: buckets.map(tokensOf)
-    });
-
-    chart = new window.Chart(chartCanvas, {
-      data: { labels: buckets.map(function (bucket) { return bucket.label; }), datasets: datasets },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        interaction: { mode: 'index', intersect: false },
-        scales: {
-          x: { stacked: true },
-          y: { stacked: true, beginAtZero: true }
-        },
-        plugins: {
-          tooltip: {
-            callbacks: {
-              label: function (item) {
-                if (item.parsed.y === 0 && item.dataset.label !== '总量') return null;
-                return ' ' + item.dataset.label + '：' + formatNumber(item.parsed.y) + ' tokens';
-              },
-              // 该桶各模型明细与 cost（cost 恒 0 时不显示费用行）
-              afterBody: function (items) {
-                if (!items.length) return [];
-                var bucket = buckets[items[0].dataIndex];
-                if (!bucket) return [];
-                var lines = [];
-                models.forEach(function (modelKey) {
-                  var byModel = bucket.byModel && bucket.byModel[modelKey];
-                  if (!byModel) return;
-                  if (tokensOf(byModel) === 0) return;
-                  var line = modelKey + '：' + formatNumber(tokensOf(byModel)) + ' tokens';
-                  if (hasCost) line += '，$' + (byModel.cost || 0).toFixed(4);
-                  lines.push(line);
-                });
-                if (hasCost) lines.push('桶费用合计：$' + (bucket.cost || 0).toFixed(4));
-                if (lines.length === 0) return ['该桶无明细'];
-                return lines;
-              }
-            }
-          }
-        }
+    buckets.forEach(function (bucket, intervalIndex) {
+      var centerX = plotLeft + groupStep * (intervalIndex + 0.5);
+      var groupLeft = centerX - barsWidth / 2;
+      var isLabel = intervalIndex % labelStep === 0 || intervalIndex === buckets.length - 1;
+      if (isLabel) {
+        context.strokeStyle = '#f0f1f5';
+        context.beginPath();
+        context.moveTo(centerX + 0.5, plotTop);
+        context.lineTo(centerX + 0.5, plotBaseline);
+        context.stroke();
+      }
+      modelIds.forEach(function (modelId, modelIndex) {
+        var cell = (bucket.models || []).find(function (item) { return item.modelId === modelId; });
+        var totals = (cell && cell.totals) || emptyTotals();
+        var x = groupLeft + modelIndex * (barWidth + modelGap);
+        var currentY = plotBaseline;
+        [
+          ['input', inputTokens(totals)],
+          ['cached', totals.cachedTokens || 0],
+          ['output', totals.completionTokens || 0]
+        ].forEach(function (entry) {
+          var height = entry[1] / maximum * plotHeight;
+          if (height <= 0) return;
+          currentY -= height;
+          context.fillStyle = tokenColors[entry[0]];
+          context.fillRect(x, currentY, barWidth, Math.max(1, height));
+        });
+      });
+      if (isLabel) {
+        context.fillStyle = '#85858d';
+        context.textAlign = 'center';
+        context.textBaseline = 'alphabetic';
+        context.fillText(bucket.label || '', centerX, plotBaseline + 25);
       }
     });
+
+    canvas._chartState = {
+      provider: provider,
+      modelIds: modelIds,
+      buckets: buckets,
+      plotLeft: plotLeft,
+      plotRight: plotRight,
+      plotTop: plotTop,
+      plotBaseline: plotBaseline,
+      groupStep: groupStep,
+      barsWidth: barsWidth,
+      barWidth: barWidth,
+      modelGap: modelGap
+    };
   }
 
-  granularitySwitchEl.addEventListener('click', function (event) {
-    var button = event.target.closest('.granularity-btn');
-    if (!button || button.dataset.granularity === granularity) return;
-    granularity = button.dataset.granularity;
-    granularitySwitchEl.querySelectorAll('.granularity-btn').forEach(function (btn) {
-      btn.classList.toggle('active', btn === button);
+  function tooltipRow(label, value, color) {
+    var row = createElement('div', 'tooltip-row');
+    var swatch = createElement('span', 'tooltip-swatch');
+    swatch.style.background = color || 'transparent';
+    row.appendChild(swatch);
+    row.appendChild(document.createTextNode(label));
+    row.appendChild(createElement('strong', '', value));
+    return row;
+  }
+
+  function showTooltip(event, state, intervalIndex, modelIndex) {
+    var provider = state.provider;
+    var modelId = state.modelIds[modelIndex];
+    var bucket = state.buckets[intervalIndex];
+    var cell = (bucket.models || []).find(function (item) { return item.modelId === modelId; });
+    var totals = (cell && cell.totals) || emptyTotals();
+    var box = ensureTooltip();
+    box.replaceChildren();
+    box.appendChild(createElement('div', 'tooltip-title', provider.providerId + ' / ' + modelId));
+    box.appendChild(createElement('div', 'tooltip-subtitle', bucket.label || ''));
+    box.appendChild(tooltipRow('模型调用', formatNumber(totals.callCount) + ' 次', '#8292ad'));
+    box.appendChild(tooltipRow('输入', formatNumber(inputTokens(totals)) + ' tokens', tokenColors.input));
+    box.appendChild(tooltipRow('缓存', formatNumber(totals.cachedTokens) + ' tokens', tokenColors.cached));
+    box.appendChild(tooltipRow('输出', formatNumber(totals.completionTokens) + ' tokens', tokenColors.output));
+    var total = tooltipRow('合计', formatNumber(totals.totalTokens) + ' tokens', '#ffffff');
+    total.classList.add('tooltip-total');
+    box.appendChild(total);
+    box.appendChild(tooltipRow('估算费用', formatCost(totals), '#8292ad'));
+    box.classList.add('visible');
+    box.setAttribute('aria-hidden', 'false');
+    var left = event.clientX + 14;
+    var top = event.clientY + 14;
+    var width = box.offsetWidth;
+    var height = box.offsetHeight;
+    box.style.left = Math.max(8, Math.min(left, window.innerWidth - width - 10)) + 'px';
+    box.style.top = Math.max(8, Math.min(top, window.innerHeight - height - 10)) + 'px';
+  }
+
+  function bindChartTooltip(canvas) {
+    canvas.addEventListener('pointermove', function (event) {
+      var state = canvas._chartState;
+      if (!state || event.offsetX < state.plotLeft || event.offsetX > state.plotRight ||
+          event.offsetY < state.plotTop || event.offsetY > state.plotBaseline) {
+        hideTooltip();
+        canvas.style.cursor = 'default';
+        return;
+      }
+      var intervalIndex = Math.floor((event.offsetX - state.plotLeft) / state.groupStep);
+      intervalIndex = Math.max(0, Math.min(state.buckets.length - 1, intervalIndex));
+      var centerX = state.plotLeft + state.groupStep * (intervalIndex + 0.5);
+      var groupLeft = centerX - state.barsWidth / 2;
+      var localX = event.offsetX - groupLeft;
+      var slotWidth = state.barWidth + state.modelGap;
+      var modelIndex = Math.floor(localX / Math.max(1, slotWidth));
+      if (modelIndex < 0 || modelIndex >= state.modelIds.length ||
+          localX < modelIndex * slotWidth - 3 ||
+          localX > modelIndex * slotWidth + state.barWidth + 3) {
+        hideTooltip();
+        canvas.style.cursor = 'default';
+        return;
+      }
+      canvas.style.cursor = 'crosshair';
+      showTooltip(event, state, intervalIndex, modelIndex);
     });
-    loadChart();
+    canvas.addEventListener('pointerleave', hideTooltip);
+  }
+
+  function renderLegend(panel, provider) {
+    var modelGroup = createElement('div', 'legend-group');
+    modelGroup.appendChild(createElement('span', 'legend-title', '模型'));
+    (provider.models || []).forEach(function (model, index) {
+      var item = createElement('span', 'legend-item');
+      item.appendChild(createElement('span', 'model-index', 'M' + (index + 1)));
+      item.appendChild(document.createTextNode(model.modelId));
+      modelGroup.appendChild(item);
+    });
+    var tokenGroup = createElement('div', 'legend-group');
+    tokenGroup.appendChild(createElement('span', 'legend-title', 'Tokens'));
+    [['input', '输入'], ['cached', '缓存'], ['output', '输出']].forEach(function (entry) {
+      var item = createElement('span', 'legend-item');
+      var swatch = createElement('span', 'token-swatch');
+      swatch.style.background = tokenColors[entry[0]];
+      item.appendChild(swatch);
+      item.appendChild(document.createTextNode(entry[1]));
+      tokenGroup.appendChild(item);
+    });
+    panel.appendChild(modelGroup);
+    panel.appendChild(tokenGroup);
+  }
+
+  function createProviderCard(provider) {
+    var card = createElement('article', 'provider-card');
+    var head = createElement('header', 'provider-head');
+    var main = createElement('div', 'provider-main');
+    var titleRow = createElement('div', 'provider-title-row');
+    titleRow.appendChild(createElement('h2', 'provider-title', provider.providerId));
+    titleRow.appendChild(createElement('span', 'provider-chip', (provider.models || []).length + ' 个模型'));
+    main.appendChild(titleRow);
+    main.appendChild(createElement(
+      'div',
+      'provider-meta',
+      formatNumber(provider.totals.callCount) + ' 次调用 · ' + formatNumber(provider.totals.totalTokens) + ' tokens'
+    ));
+    head.appendChild(main);
+    var metrics = createElement('div', 'provider-metrics');
+    [
+      ['Prompt', provider.totals.promptTokens],
+      ['Cached', provider.totals.cachedTokens],
+      ['Completion', provider.totals.completionTokens]
+    ].forEach(function (entry) {
+      var metric = createElement('span', '', entry[0]);
+      metric.appendChild(createElement('b', '', formatNumber(entry[1])));
+      metrics.appendChild(metric);
+    });
+    var costMetric = createElement('span', '', '估算费用');
+    costMetric.appendChild(createElement('b', '', formatCost(provider.totals)));
+    metrics.appendChild(costMetric);
+    head.appendChild(metrics);
+    card.appendChild(head);
+    var legend = createElement('div', 'legend-panel');
+    renderLegend(legend, provider);
+    card.appendChild(legend);
+    var wrap = createElement('div', 'chart-wrap');
+    var canvas = createElement('canvas', 'usage-chart');
+    canvas.setAttribute('aria-label', provider.providerId + ' 用量趋势');
+    wrap.appendChild(canvas);
+    card.appendChild(wrap);
+    providerListEl.appendChild(card);
+    drawChart(canvas, provider);
+    bindChartTooltip(canvas);
+  }
+
+  function renderProviders(data) {
+    providerListEl.replaceChildren();
+    hideTooltip();
+    var providers = data.providers || [];
+    if (!providers.length) {
+      setStatus('empty', '当前区间暂无已落账用量', false);
+      return;
+    }
+    setStatus('', '', false);
+    providers.forEach(createProviderCard);
+  }
+
+  function paint(data) {
+    currentSnapshot = data;
+    paintSummary(data);
+    paintQuality(data);
+    renderProviders(data);
+  }
+
+  function redraw() {
+    if (!currentSnapshot) return;
+    var canvases = providerListEl.querySelectorAll('canvas.usage-chart');
+    var providers = currentSnapshot.providers || [];
+    canvases.forEach(function (canvas, index) {
+      if (providers[index]) drawChart(canvas, providers[index]);
+    });
+  }
+
+  async function loadPeriod(period) {
+    currentPeriod = period || 'last7Days';
+    periodSelect.value = currentPeriod;
+    requestGeneration += 1;
+    var generation = requestGeneration;
+    if (abortController) abortController.abort();
+    abortController = typeof AbortController === 'function' ? new AbortController() : null;
+    promptEl.textContent = '-';
+    cachedEl.textContent = '-';
+    completionEl.textContent = '-';
+    costEl.textContent = '-';
+    providerListEl.replaceChildren();
+    qualityEl.classList.remove('visible');
+    qualityEl.textContent = '';
+    setStatus('loading', '正在加载用量…', false);
+    try {
+      var data = await window.api.getUsage(currentPeriod, abortController ? { signal: abortController.signal } : {});
+      if (generation !== requestGeneration) return;
+      paint(data);
+    } catch (error) {
+      if (error && error.name === 'AbortError') return;
+      if (generation !== requestGeneration) return;
+      setStatus('error', '加载失败：' + (error && error.message ? error.message : error), true);
+    }
+  }
+
+  periodSelect.addEventListener('change', function () {
+    loadPeriod(periodSelect.value);
+  });
+  window.addEventListener('resize', function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(redraw, 80);
   });
 
   window.usageView = {
-    open: async function () {
-      promptEl.textContent = '-';
-      cachedEl.textContent = '-';
-      completionEl.textContent = '-';
-      costCardEl.classList.add('hidden');
-      tableBodyEl.innerHTML = '';
-      try {
-        await loadSummary();
-      } catch (error) {
-        var row = document.createElement('tr');
-        var td = document.createElement('td');
-        td.colSpan = 6;
-        td.textContent = '加载失败：' + error.message;
-        row.appendChild(td);
-        tableBodyEl.appendChild(row);
-      }
-      loadCostCard();
-      loadChart();
+    open: function () {
+      return loadPeriod(periodSelect.value || 'last7Days');
     }
   };
 })();

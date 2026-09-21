@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.19
+Version: 1.20
 Date: 2026-09-21
-Description: FastAPI application and authenticated REST/SSE routes. v1.19 chat/stream 与 chat/confirm 在建 agent/stream 前走 Core idle gate，draining 完成后重建并透传 runEvent。
+Description: FastAPI application and authenticated REST/SSE routes. v1.20 GET /api/usage 改为单一 period 账本快照；删除 /usage/series；删除会话前必须补齐 usageRecord。
 '''
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from flamingoAgents.core.types import inputImage
 from flamingoAgents.models.modelConfig import loadModelConfigFromYaml
 from flamingoAgents.models.subscriptionModels import discoverSubscriptionModels, modelDiscoveryError
 from flamingoAgents.utils.logPaths import resolveSessionLogDir
+from flamingoAgents.utils import usageLedger
 
 from webApp.backend import agentManager, fileBrowser, historyView, modelAuthManager, modelConfigStore, sessionStore, skillStore, usageStore
 from webApp.backend.piModelsImport import convertPiDocument
@@ -431,8 +432,13 @@ def deleteSession(sessionId: str):
     session = requireSession(sessionId)
     if agentManager.hasActiveStream(sessionId):
         raise HTTPException(status_code=409, detail='该会话有活跃流，无法删除。')
-    sessionStore.deleteSession(sessionId)
     logPath = resolveSessionLogDir('webData', Path(session['workDir'])) / f'{sessionId}.jsonl'
+    if logPath.exists():
+        try:
+            usageLedger.drainLogFile(logPath)
+        except usageLedger.usageLedgerError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+    sessionStore.deleteSession(sessionId)
     try:
         logPath.unlink(missing_ok=True)
     except OSError as error:
@@ -487,31 +493,10 @@ def getPending(sessionId: str):
 
 
 @authedApi.get('/usage')
-def getUsage():
-    sessions = sessionStore.listSessions()
-    total = {'promptTokens': 0, 'cachedTokens': 0, 'completionTokens': 0}
-    entries = []
-    for session in sessions:
-        usage = session.get('usage') or {}
-        for key in total:
-            total[key] += int(usage.get(key, 0) or 0)
-        entries.append({
-            'sessionId': session['sessionId'],
-            'title': session.get('title', ''),
-            'providerId': session.get('providerId', ''),
-            'modelId': session.get('modelId', ''),
-            'usage': usage,
-            'updatedAt': session.get('updatedAt', ''),
-        })
-    return {'total': total, 'sessions': entries}
-
-
-@authedApi.get('/usage/series')
-def getUsageSeries(granularity: str = 'day'):
-    # 时/天/月粒度用量序列（契约 §3.10）：数据源 usageTurns（账单口径，删会话不删账）。
-    if granularity not in ('hour', 'day', 'month'):
-        raise HTTPException(status_code=400, detail=f'granularity 非法：{granularity}（仅允许 hour/day/month）。')
-    return usageStore.querySeries(granularity)
+def getUsage(period: str = 'last7Days'):
+    if period not in usageLedger.PERIODS:
+        raise HTTPException(status_code=400, detail=f'period 非法：{period}（仅允许 {"/".join(usageLedger.PERIODS)}）。')
+    return usageStore.queryUsage(period)
 
 
 @authedApi.get('/models')

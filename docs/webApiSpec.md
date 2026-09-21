@@ -1,7 +1,7 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.27
+> Version: 1.28
 > Date: 2026-09-21
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 9 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
@@ -33,6 +33,7 @@
 > v1.22：历史读取兼容旧 JSON 事件数组及其后续 JSONL 追加；提供显式 sessionRecovery 工具重建已删除索引，DTO 与日常新建写入格式不变。
 > v1.26（chatUxImprovePlan）：§2.2 新增 `kind:error`；终态 `modelError`（`willRetry` 非 true）下发，重试中仍不下发；`request`/traceback/diag 不下发。
 > v1.27：UI stopped 与 Core draining 分离；同会话新请求在 Core 未退出前最多等 2s，超时 409；attach 在 draining 时可回放 stopped history。
+> v1.28：用量统计改为单一 `GET /api/usage?period=` 账本快照（usageEvents）；删除 `/api/usage/series` 与会话明细；状态栏费用改读已落账记录；删除会话前必须 drain usageRecord。
 
 ---
 
@@ -154,25 +155,41 @@
 - **jsonl 事件过滤口径（审核 M2，v1.26 修订）**：`systemMessage` 不下发；**终态 `modelError` 下发为 `kind:error`**；重试中的 `modelError`（`willRetry === true`）仍不下发；`assistantMessage.timings` 不下发；
 - 前端配对规则：`assistant.toolCalls[].id` ↔ 后续 `tool.toolCallId`；**末尾未配对的 toolCalls = dangling（中断未完成），渲染置灰卡片**——但需先经 §3.8 pending 接口识别：**pending 中的 toolCall 不按 dangling 渲染，而是重弹确认框**（审核 H1）。
 
-### 2.3 usage（用量汇总，`GET /api/usage` 响应）
+### 2.3 usage（用量快照，`GET /api/usage` 响应）
 
 ```json
 {
-  "total": { "promptTokens": 12000, "cachedTokens": 3000, "completionTokens": 2400 },
-  "sessions": [
-    {
-      "sessionId": "session_0bcd11873ded",
-      "title": "阅读文档并总结",
-      "providerId": "volcano",
-      "modelId": "deepseek-v4-flash",
-      "usage": { "promptTokens": 5532, "cachedTokens": 1024, "completionTokens": 635 },
-      "updatedAt": "..."
-    }
-  ]
+  "period": "last7Days",
+  "timeZone": "Asia/Shanghai",
+  "startAt": "2026-09-15T00:00:00+08:00",
+  "endAt": "2026-09-21T08:55:46+08:00",
+  "snapshotAt": "2026-09-21T08:55:46+08:00",
+  "totals": {
+    "callCount": 128,
+    "promptTokens": 1284920,
+    "cachedTokens": 972810,
+    "completionTokens": 42306,
+    "totalTokens": 1327226,
+    "costNanoUsd": 8260000000,
+    "costStatus": "complete",
+    "unpricedCallCount": 0,
+    "unpricedTokens": 0
+  },
+  "providers": [],
+  "quality": {
+    "exactRecords": 120,
+    "legacyInferredRecords": 8,
+    "legacyUnverifiedRecords": 0,
+    "migratedPriceRecords": 8,
+    "unknownPriceRecords": 0
+  }
 }
 ```
 
-`sessions` 按 `updatedAt` 倒序；`total` 为全部会话 usage 求和。
+- 唯一数据源：`~/.flamingo/logs/usage.db` 的 `usageEvents`；一次只读事务快照。不读 `sessions.json`、JSONL 或查询时 `models.yaml`。
+- 不含会话明细；`cachedTokens` 是 Prompt 子集；`totalTokens = promptTokens + completionTokens`。
+- `costNanoUsd` 为调用时价格快照的纳米美元整数；`costStatus=complete|partial|unavailable` 只表示价格覆盖，不代表 Provider 发票。
+- 合法零价显示为 0；未知价格不得记成 0。
 
 ### 2.4 modelConfig（模型配置文档，对齐 `config/models.yaml`）
 
@@ -391,12 +408,11 @@
 - `gitBranch`：`git -C <workDir> rev-parse --abbrev-ref HEAD`（参数数组无 shell、timeout=2s）每次现查不缓存；非 git 仓库 / workDir 已删 / 超时 → `null`，不报错；
 - `usage` / `contextTokens` / `lastUsage`：**单一数据源为 sessions 索引**；
   - `usage`：**会话累计** token（OpenAI 原生语义，`promptTokens` 含 `cachedTokens` 子集）；每个模型 step 合法 terminal usage 后可中间回写，使流中 `GET status` 与 SSE `usageUpdate` 看到最新累计。状态栏 `↑↓⚡` 自 statusBar v1.3 起读此字段并前端减法归一化（`↑=max(0, promptTokens−cachedTokens)`、`↓=completionTokens`、`⚡=cachedTokens`，三者互不重叠、↑+⚡=总输入，对齐 pi footer）；
-  - `lastUsage`：**最近一轮（最近一次完整泵流）token 增量**，与写入 `usageTurns` 的 delta 同口径；**仅泵终态覆盖**，中间回写必须传 `lastUsage=null`。字段保留，状态栏自 statusBar v1.3 起不再使用（v1.5 的「↑↓⚡ 应读此字段」指引已反转）。
-    - 读路径：优先 sessions 索引的 `lastUsage`；**索引缺该字段时回退** `usageTurns` 中该 sessionId `ORDER BY id DESC LIMIT 1`（保证进程重启 / 升级前会话仍能显示最近增量，而非全 0）；
-    - 会话从未产生过任何 usageTurns 时为全 0；
+  - `lastUsage`：**最近一轮（最近一次完整泵流）token 增量**；**仅泵终态覆盖**，中间回写必须传 `lastUsage=null`。字段保留，状态栏自 statusBar v1.3 起不再使用。
+    - 读路径：优先 sessions 索引的 `lastUsage`；**索引缺该字段时回退** `usageEvents` 中该 sessionId 最近一条；
+    - 会话从未产生过任何已落账 usage 时为全 0；
   - `contextTokens`：最近一次模型调用的 `promptTokens + completionTokens`（窗口占用估计，迭代二 §3.6），可随模型 step 中间回写；
-- `cost`：usageTurns 按 sessionId 聚合、逐 turn 按其记录的 `providerId/modelId` 套 models.yaml **查询时当前价**求和（公式同 §3.10）——**会话累计费用**。流中 SSE `usageUpdate.cost` 是泵级 liveCost（db 基线 + 本泵累计 delta，不写盘）；关闭后本接口为权威校准。本地 abort SSE **不是**持久化完成信号：本窗口 stop 须等 `POST /api/chat/stop` 完成尝试后再发权威 GET；
-- `usageTurns.providerId/modelId`：记录该泵启动时固化的实际 adapter `configProviderId/model`，不受流中 `/model` 改写 sessions 索引影响；
+- `cost`：`usageEvents` 按 sessionId 聚合已落账 `costNanoUsd`（调用时价格快照）——**会话累计估算费用**。流中 SSE `usageUpdate.cost` 读取同一账本的当前会话合计；关闭后本接口为权威校准。本地 abort SSE **不是**持久化完成信号：本窗口 stop 须等 `POST /api/chat/stop` 完成尝试后再发权威 GET；
 - `contextWindow`：当前会话模型在 models.yaml 的 `contextWindow`；**yaml 缺失/损坏/模型无该字段 → `null` 且 cost 按 0 计，不影响其余字段**；
 - `contextUsedPercent`（v1.5）：**使用率** `clamp((contextTokens/contextWindow) × 100, 0, 100)` 保留 1 位小数；`contextWindow` 为 `null` 时该字段为 `null`。
   - **破坏性变更**：原 `contextRemainingPercent`（剩余率 `(1 − contextTokens/contextWindow)×100`）已移除，前端须改读 `contextUsedPercent`；

@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.14
+Version: 1.16
 Date: 2026-09-21
-Description: Maintains and resumes per-session JSONL conversations. v1.14 恢复时校验同一 assistant 内 tool call ID 非空且唯一，并提供原序闭合前缀查询，禁止猜测配对。
+Description: Maintains and resumes per-session JSONL conversations. v1.16 独立 usageRecord outbox：新累计只从 usageRecord 加总；assistant 仅在缺少对应 usageKey 时按旧 usage 恢复。
 '''
 
 from __future__ import annotations
@@ -47,12 +47,19 @@ class conversation:
     def _resumeFromLog(self) -> None:
         events = self.logger.readEvents(strict=True)
         openCallIds: list[str] = []
+        seenUsageKeys: set[str] = set()
         for event in events:
             eventType = event.get('type')
             if eventType == 'systemMessage':
                 # 恢复创建时的 system（含当时注入的时间戳），保证前缀与历史一致。
                 if not any(m.role == 'system' for m in self.messages):
                     self.messages.append(chatMessage(role='system', content=event.get('content', '')))
+                continue
+            if eventType == 'usageRecord':
+                usageKey = event.get('usageKey')
+                if isinstance(usageKey, str) and usageKey:
+                    seenUsageKeys.add(usageKey)
+                self._accumulateUsageFromRecord(event)
                 continue
             if eventType == 'modelError':
                 continue
@@ -96,7 +103,9 @@ class conversation:
                     providerData=normalizeProviderData(event.get('providerData')),
                 ))
                 openCallIds.extend(tc.id for tc in toolCalls)
-                self._accumulateUsage(event.get('usage'))
+                usageKey = event.get('usageKey')
+                if not usageKey or usageKey not in seenUsageKeys:
+                    self._accumulateUsage(event.get('usage'))
             elif eventType == 'toolResult':
                 callId = event.get('toolCallId', '')
                 if callId in openCallIds:
@@ -137,11 +146,26 @@ class conversation:
     def _accumulateUsage(self, usage: dict | None) -> None:
         if not isinstance(usage, dict):
             return
-        promptTokens = int(usage.get('prompt_tokens', 0) or 0)
-        completionTokens = int(usage.get('completion_tokens', 0) or 0)
+        try:
+            promptTokens = int(usage.get('prompt_tokens', 0) or 0)
+            completionTokens = int(usage.get('completion_tokens', 0) or 0)
+            details = usage.get('prompt_tokens_details') or {}
+            cachedTokens = int(details.get('cached_tokens', 0) or 0) if isinstance(details, dict) else 0
+        except (TypeError, ValueError):
+            return
         self.usageTotal['promptTokens'] += promptTokens
-        details = usage.get('prompt_tokens_details') or {}
-        self.usageTotal['cachedTokens'] += int(details.get('cached_tokens', 0) or 0)
+        self.usageTotal['cachedTokens'] += cachedTokens
+        self.usageTotal['completionTokens'] += completionTokens
+        self.lastTurnTokens = promptTokens + completionTokens
+
+    def _accumulateUsageFromRecord(self, record: dict | None) -> None:
+        if not isinstance(record, dict):
+            return
+        promptTokens = int(record.get('promptTokens', 0) or 0)
+        cachedTokens = int(record.get('cachedTokens', 0) or 0)
+        completionTokens = int(record.get('completionTokens', 0) or 0)
+        self.usageTotal['promptTokens'] += promptTokens
+        self.usageTotal['cachedTokens'] += cachedTokens
         self.usageTotal['completionTokens'] += completionTokens
         self.lastTurnTokens = promptTokens + completionTokens
 
@@ -172,7 +196,16 @@ class conversation:
         self.logger.logEvent(event)
         self.messages.append(chatMessage(role='user', content=content, images=storedImages))
 
-    def appendAssistantMessage(self, message: chatMessage, responsePayload: dict) -> None:
+    def appendUsageRecord(self, record: dict) -> None:
+        if self.debugConsole:
+            self.debugConsole.debug(
+                f'记录 usageRecord usageKey={record.get("usageKey")} '
+                f'model={record.get("providerId")}/{record.get("modelId")}'
+            )
+        self.logger.logEvent({'type': 'usageRecord', **record})
+        self._accumulateUsageFromRecord(record)
+
+    def appendAssistantMessage(self, message: chatMessage, responsePayload: dict, usageKey: str | None = None) -> None:
         message.providerData = normalizeProviderData(message.providerData)
         for call in message.toolCalls:
             call.providerData = normalizeProviderData(call.providerData)
@@ -194,8 +227,11 @@ class conversation:
         }
         if reasoning:
             event['reasoning'] = reasoning
+        if usageKey:
+            event['usageKey'] = usageKey
         self.logger.logEvent(event)
-        self._accumulateUsage(responsePayload.get('usage'))
+        if not usageKey:
+            self._accumulateUsage(responsePayload.get('usage'))
         self.messages.append(message)
 
     def consecutiveToolMessagesAfter(self, assistantIndex: int) -> list[chatMessage]:

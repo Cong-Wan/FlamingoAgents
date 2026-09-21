@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.10
-Date: 2026-09-08
-Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.8 adds JSON-only providerData to chatMessage/toolCall for Responses opaque item persistence and replay while preserving empty defaults for old sessions. v1.9 adds usageUpdateEvent for per-model-call live usage without Web pricing fields. v1.10（imageInputPlan §3.2）新增 inputImage 与 chatMessage.images（default []，仅 user 消息使用）及 runResult.errorType，供图片输入链路使用。
+Version: 1.11
+Date: 2026-09-21
+Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.8 adds JSON-only providerData to chatMessage/toolCall for Responses opaque item persistence and replay while preserving empty defaults for old sessions. v1.9 adds usageUpdateEvent for per-model-call live usage without Web pricing fields. v1.10（imageInputPlan §3.2）新增 inputImage 与 chatMessage.images（default []，仅 user 消息使用）及 runResult.errorType，供图片输入链路使用。v1.11 toolContext 增加可选 sessionId，供 askSubAgent 把父会话传给子进程账本。
 '''
 
 from __future__ import annotations
@@ -65,6 +65,7 @@ class toolContext:
     workDir: Path
     debugConsole: Any | None = None
     interruptEvent: threading.Event | None = None
+    sessionId: str | None = None
 
 
 @dataclass

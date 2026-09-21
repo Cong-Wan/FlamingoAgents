@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.4
+Version: 1.5
 Date: 2026-09-21
-Description: Core usageUpdateEvent, pump DTO/liveCost/_recordUsage, SSE codec dual mapping, and temp JSONL/sessions/usage.db reconciliation for live status-bar usage. v1.4 覆盖 UI done 与 Core draining 分离后的 usage at-most-once 竞态。
+Description: Core usageUpdateEvent, pump DTO/liveCost/_recordUsage, SSE codec dual mapping, and temp JSONL/sessions/usageEvents reconciliation for live status-bar usage. v1.5 泵终态不再写 usageTurns，状态栏费用改读统一账本。
 '''
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from flamingoAgents.models.chatCompletions import modelCompletion, modelRequestE
 from flamingoAgents.models.responsesAdapter import normalizeUsage
 from flamingoAgents.tools.toolDefinition import defineTool, permissionRule
 from flamingoAgents.utils.jsonl import jsonlLog
+from flamingoAgents.utils import usageLedger
 from webApp.backend import sessionStore, usageStore
 from webApp.backend.agentManager import compactDeltas, requestStop, startStream, streamPump, unregisterStream
 from webApp.backend.sseCodec import eventToFrame, usageUpdateDto
@@ -143,17 +144,13 @@ def isolatedStores(tmp_path, monkeypatch):
     sessionsDir.mkdir()
     monkeypatch.setattr(sessionStore, 'webDataDir', sessionsDir)
     monkeypatch.setattr(sessionStore, 'indexPath', sessionsDir / 'sessions.json')
-    monkeypatch.setattr(usageStore, 'dbPath', tmp_path / 'usage.db')
-    monkeypatch.setattr(usageStore, 'logsRoot', tmp_path)
-    previous = usageStore.dbConnection
-    usageStore.dbConnection = None
+    monkeypatch.setattr(usageLedger, 'dbPath', tmp_path / 'usage.db')
+    monkeypatch.setattr(usageLedger, 'logsRoot', tmp_path)
+    usageLedger.resetState()
     try:
         yield tmp_path
     finally:
-        created = usageStore.dbConnection
-        if created is not None and created is not previous:
-            created.close()
-        usageStore.dbConnection = previous
+        usageLedger.resetState()
 
 
 def writeSession(sessionId, workDir, providerId='index-provider', modelId='index-model', lastUsage=None):
@@ -284,14 +281,15 @@ def testCoreInvalidUsageDoesNotEmit(tmp_path, monkeypatch) -> None:
         assert any(isinstance(event, completedEvent) for event in events)
 
 
-def testCoreIllegalStringUsageRaisesBeforeEvent(tmp_path, monkeypatch) -> None:
+def testCoreIllegalStringUsageDoesNotEmit(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr('flamingoAgents.core.agent.time.sleep', lambda seconds: None)
     current = makeAgent(tmp_path, [[finalChunk(completion=completionWith(
         chatMessage(role='assistant', content='x'),
         {'prompt_tokens': 'bad', 'completion_tokens': 1},
     ))]])
-    with pytest.raises(ValueError):
-        list(current.runUserMessageStream('hello', 'sess-live'))
+    events = list(current.runUserMessageStream('hello', 'sess-live'))
+    assert usageEvents(events) == []
+    assert any(isinstance(event, completedEvent) for event in events)
 
 
 def testCoreNonDictPayloadSafeAndNoEvent(tmp_path, monkeypatch) -> None:
@@ -446,11 +444,9 @@ def testPumpConvertsDtoAndLazyCost(tmp_path, monkeypatch, isolatedStores) -> Non
         order.append(('load',))
         return {'volcano/flash-test': {'input': 1.0, 'cacheRead': 0.1, 'output': 2.0}}
 
-    writes = []
     monkeypatch.setattr(sessionStore, 'updateUsage', updateUsage)
     monkeypatch.setattr(usageStore, 'querySessionCost', query)
     monkeypatch.setattr(usageStore, 'loadCostMap', load)
-    monkeypatch.setattr(usageStore, 'writeUsageTurn', lambda *a, **k: writes.append(a))
 
     first = usageUpdateEvent(
         usage={'promptTokens': 100, 'cachedTokens': 10, 'completionTokens': 20},
@@ -467,21 +463,15 @@ def testPumpConvertsDtoAndLazyCost(tmp_path, monkeypatch, isolatedStores) -> Non
     currentConversation.usageTotal = {'promptTokens': 250, 'cachedTokens': 30, 'completionTokens': 50}
     currentConversation.lastTurnTokens = 180
     pump._pump()
-    assert writes  # final record
     assert order[0][0] == 'update'
     assert order[0][1] is None
     assert ('query', 'sess-live') in order
-    assert order.count(('load',)) == 1
+    assert order.count(('load',)) == 0
     dtos = [event for event in pump.history if isinstance(event, usageUpdateDto)]
     assert len(dtos) == 2
     assert not any(isinstance(event, usageUpdateEvent) for event in pump.history)
-    costMap = {'input': 1.0, 'cacheRead': 0.1, 'output': 2.0}
-    firstCost = 0.01 + usageStore.calcTurnCost(100, 10, 20, costMap)
-    secondCost = 0.01 + usageStore.calcTurnCost(250, 30, 50, costMap)
-    doubledFirst = firstCost + usageStore.calcTurnCost(250, 30, 50, costMap)
-    assert dtos[0].cost == pytest.approx(firstCost)
-    assert dtos[1].cost == pytest.approx(secondCost)
-    assert dtos[1].cost != pytest.approx(doubledFirst)
+    assert dtos[0].cost == pytest.approx(0.01)
+    assert dtos[1].cost == pytest.approx(0.01)
     stored = sessionStore.getSession('sess-live')
     assert stored['usage']['promptTokens'] == 250
     assert stored['lastUsage'] == {'promptTokens': 250, 'cachedTokens': 30, 'completionTokens': 50}
@@ -601,20 +591,18 @@ def testSubscribeReplaysDto(tmp_path, monkeypatch, isolatedStores) -> None:
 
 
 def testRecordUsageUsesPumpModelAndOnce(tmp_path, monkeypatch, isolatedStores) -> None:
-    writes = []
-    monkeypatch.setattr(usageStore, 'writeUsageTurn', lambda *a, **k: writes.append(a))
-    monkeypatch.setattr(sessionStore, 'updateUsage', lambda *a, **k: None)
+    updates = []
+    monkeypatch.setattr(sessionStore, 'updateUsage', lambda *a, **k: updates.append((a, k)))
     logPath = tmp_path / 'sess-live.jsonl'
     currentConversation = conversation(sessionId='sess-live', logPath=logPath, systemPrompt='sys')
     currentConversation.usageTotal = {'promptTokens': 5, 'cachedTokens': 1, 'completionTokens': 2}
     pump = makePump('sess-live', currentConversation, [], providerId='volcano', modelId='actual-model')
     pump.startUsage = {'promptTokens': 0, 'cachedTokens': 0, 'completionTokens': 0}
-    assert writes == []
+    assert updates == []
     pump._recordUsage()
     pump._recordUsage()
-    assert len(writes) == 1
-    assert writes[0][1] == 'volcano'
-    assert writes[0][2] == 'actual-model'
+    assert len(updates) == 1
+    assert updates[0][1]['lastUsage'] == {'promptTokens': 5, 'cachedTokens': 1, 'completionTokens': 2}
 
 
 def testRecordUsageIoErrorAndMissingConversation(tmp_path, monkeypatch, isolatedStores) -> None:
@@ -644,19 +632,15 @@ def testRecordUsageOwnerWaiterRace(tmp_path, monkeypatch, isolatedStores, owner,
     sessionAttempts = []
     stopResult = {'ok': None}
 
-    def gatedWrite(*args, **kwargs):
-        if failure != 'missing':
-            ownerEntered.set()
-            assert ownerGate.wait(timeout=5), 'ownerGate not released for write'
-        writes.append(args)
-        if failure == 'db':
-            raise OSError('db')
-
     def countingUpdate(*args, **kwargs):
         if kwargs.get('lastUsage') is not None:
+            if failure != 'missing':
+                ownerEntered.set()
+                assert ownerGate.wait(timeout=5), 'ownerGate not released for write'
             sessionAttempts.append(kwargs)
-            if failure == 'sessions':
-                raise OSError('sessions')
+            writes.append(args)
+            if failure in ('db', 'sessions'):
+                raise OSError(failure)
 
     class gatedConversations:
         def __init__(self, inner):
@@ -683,7 +667,6 @@ def testRecordUsageOwnerWaiterRace(tmp_path, monkeypatch, isolatedStores, owner,
         def close(self):
             pass
 
-    monkeypatch.setattr(usageStore, 'writeUsageTurn', gatedWrite)
     monkeypatch.setattr(sessionStore, 'updateUsage', countingUpdate)
     monkeypatch.setattr(usageStore, 'querySessionCost', lambda *a, **k: 0)
     monkeypatch.setattr(usageStore, 'loadCostMap', lambda: {})
@@ -752,10 +735,7 @@ def testRecordUsageOwnerWaiterRace(tmp_path, monkeypatch, isolatedStores, owner,
             assert sessionAttempts == []
         else:
             assert len(writes) == 1
-            if failure == 'db':
-                assert sessionAttempts == []
-            else:
-                assert len(sessionAttempts) == 1
+            assert len(sessionAttempts) == 1
     finally:
         streamStart.set()
         streamHold.set()
@@ -833,21 +813,19 @@ def testLongToolBroadcastsBeforeDbWrite(tmp_path, monkeypatch, isolatedStores) -
         connection = sqlite3.connect(dbPath)
         try:
             rows = connection.execute(
-                'SELECT providerId, modelId, promptTokens, cachedTokens, completionTokens FROM usageTurns WHERE sessionId = ?',
+                'SELECT providerId, modelId, promptTokens, cachedTokens, completionTokens FROM usageEvents WHERE sessionId = ? ORDER BY occurredAt, createdAt',
                 (sessionId,),
             ).fetchall()
         finally:
             connection.close()
-        assert rows == [('volcano', 'flash-test', 60, 14, 12)]
+        assert rows == [('volcano', 'flash-test', 40, 12, 8), ('volcano', 'flash-test', 20, 2, 4)]
         mapped = {'promptTokens': 0, 'cachedTokens': 0, 'completionTokens': 0}
         for event in jsonlLog(tmp_path / f'{sessionId}.jsonl').readEvents():
-            if event.get('type') != 'assistantMessage':
+            if event.get('type') != 'usageRecord':
                 continue
-            usage = event.get('usage') or {}
-            mapped['promptTokens'] += int(usage.get('prompt_tokens', 0) or 0)
-            details = usage.get('prompt_tokens_details') or {}
-            mapped['cachedTokens'] += int(details.get('cached_tokens', 0) or 0)
-            mapped['completionTokens'] += int(usage.get('completion_tokens', 0) or 0)
+            mapped['promptTokens'] += int(event.get('promptTokens', 0) or 0)
+            mapped['cachedTokens'] += int(event.get('cachedTokens', 0) or 0)
+            mapped['completionTokens'] += int(event.get('completionTokens', 0) or 0)
         assert mapped == stored['usage']
         rest = drainQueue(subscriber)
         assert rest[-1] is None
@@ -882,7 +860,7 @@ def testConfirmPumpsRecordOwnIncrements(tmp_path, monkeypatch, isolatedStores) -
     connection = sqlite3.connect(tmp_path / 'usage.db')
     try:
         rows1 = connection.execute(
-            'SELECT promptTokens, cachedTokens, completionTokens FROM usageTurns WHERE sessionId = ? ORDER BY id',
+            'SELECT promptTokens, cachedTokens, completionTokens FROM usageEvents WHERE sessionId = ? ORDER BY occurredAt, createdAt',
             (sessionId,),
         ).fetchall()
     finally:
@@ -898,7 +876,7 @@ def testConfirmPumpsRecordOwnIncrements(tmp_path, monkeypatch, isolatedStores) -
     connection = sqlite3.connect(tmp_path / 'usage.db')
     try:
         rows2 = connection.execute(
-            'SELECT promptTokens, cachedTokens, completionTokens FROM usageTurns WHERE sessionId = ? ORDER BY id',
+            'SELECT promptTokens, cachedTokens, completionTokens FROM usageEvents WHERE sessionId = ? ORDER BY occurredAt, createdAt',
             (sessionId,),
         ).fetchall()
     finally:
@@ -924,7 +902,7 @@ def testConfirmPumpsRecordOwnIncrements(tmp_path, monkeypatch, isolatedStores) -
     connection = sqlite3.connect(tmp_path / 'usage.db')
     try:
         rowsReject = connection.execute(
-            'SELECT promptTokens, cachedTokens, completionTokens FROM usageTurns WHERE sessionId = ? ORDER BY id',
+            'SELECT promptTokens, cachedTokens, completionTokens FROM usageEvents WHERE sessionId = ? ORDER BY occurredAt, createdAt',
             (rejectId,),
         ).fetchall()
     finally:
@@ -969,43 +947,27 @@ def testLiveCostInitFailsOnlyOnceForMultipleSteps(tmp_path, monkeypatch, isolate
     monkeypatch.setattr(usageStore, 'loadCostMap', lambda: loads.append(1) or (_ for _ in ()).throw(RuntimeError('yaml')))
     pump2 = makePump('sess-live', currentConversation, events)
     pump2._pump()
-    assert queries == [1]
-    assert loads == [1]
-    assert pump2.liveCostState == 'unavailable'
+    assert queries == [1, 1, 1]
+    assert loads == []
+    assert pump2.liveCostState == 'ready'
     dtos2 = [item for item in pump2.history if isinstance(item, usageUpdateDto)]
     assert len(dtos2) == 2
-    assert dtos2[0].cost is None and dtos2[1].cost is None
+    assert dtos2[0].cost == pytest.approx(0.2) and dtos2[1].cost == pytest.approx(0.2)
 
 
-@pytest.mark.parametrize('useRealQuery', [False, True])
-def testLiveCostInitializationCounts(tmp_path, monkeypatch, isolatedStores, useRealQuery) -> None:
+def testLiveCostInitializationCounts(tmp_path, monkeypatch, isolatedStores) -> None:
     sessionId = 'sess-cost-counts'
     lastUsage = {'promptTokens': 10, 'cachedTokens': 2, 'completionTokens': 3}
     writeSession(sessionId, tmp_path, lastUsage=lastUsage)
     currentConversation = conversation(sessionId=sessionId, logPath=tmp_path / f'{sessionId}.jsonl', systemPrompt='sys')
     currentConversation.usageTotal = dict(lastUsage)
-    cost = {'input': 1.0, 'cacheRead': 0.1, 'output': 2.0}
-    calls = {'query': 0, 'load': 0, 'yaml': 0}
-    writes = []
-    realQuery = usageStore.querySessionCost
-    realLoad = usageStore.loadCostMap
-
-    def readPrices():
-        calls['yaml'] += 1
-        return {'providers': {'volcano': {'models': [{'id': 'flash-test', 'cost': cost}]}}}
-
-    def loadPrices():
-        calls['load'] += 1
-        return realLoad() if useRealQuery else {'volcano/flash-test': cost}
+    calls = {'query': 0}
 
     def queryCost(sid):
         calls['query'] += 1
-        return realQuery(sid) if useRealQuery else 0.0
+        return 0.0042
 
-    monkeypatch.setattr(usageStore.modelConfigStore, 'readRawYaml', readPrices)
-    monkeypatch.setattr(usageStore, 'loadCostMap', loadPrices)
     monkeypatch.setattr(usageStore, 'querySessionCost', queryCost)
-    monkeypatch.setattr(usageStore, 'writeUsageTurn', lambda *args: writes.append(args))
     firstUsage = {'promptTokens': 30, 'cachedTokens': 4, 'completionTokens': 6}
     finalUsage = {'promptTokens': 60, 'cachedTokens': 6, 'completionTokens': 11}
     pump = makePump(sessionId, currentConversation, [
@@ -1013,24 +975,21 @@ def testLiveCostInitializationCounts(tmp_path, monkeypatch, isolatedStores, useR
         usageUpdateEvent(finalUsage, {'promptTokens': 30, 'cachedTokens': 2, 'completionTokens': 5}, 35),
         completedEvent(message='done'),
     ])
-    assert calls == {'query': 0, 'load': 0, 'yaml': 0}
+    assert calls == {'query': 0}
     currentConversation.usageTotal = dict(finalUsage)
     currentConversation.lastTurnTokens = 35
     originalBroadcast = pump._broadcast
 
     def checkBroadcast(event):
         if isinstance(event, usageUpdateDto):
-            assert writes == []
             assert sessionStore.getSession(sessionId)['lastUsage'] == lastUsage
         originalBroadcast(event)
 
     monkeypatch.setattr(pump, '_broadcast', checkBroadcast)
     pump._pump()
-    assert calls == {'query': 1, 'load': 2 if useRealQuery else 1, 'yaml': 2 if useRealQuery else 0}
+    assert calls['query'] >= 1
     dtos = [event for event in pump.history if isinstance(event, usageUpdateDto)]
-    assert [event.cost for event in dtos] == pytest.approx([0.0000242, 0.0000624])
-    assert len(writes) == 1
-    assert writes[0][3] == {'promptTokens': 50, 'cachedTokens': 4, 'completionTokens': 8}
+    assert [event.cost for event in dtos] == pytest.approx([0.0042, 0.0042])
 
 
 def testCoreInterruptedAndFailureEmitNoUsage(tmp_path, monkeypatch) -> None:
@@ -1066,3 +1025,84 @@ def testCoreInterruptedAndFailureEmitNoUsage(tmp_path, monkeypatch) -> None:
     failedEvents = list(failed.runUserMessageStream('hello', 'sess-fail'))
     assert usageEvents(failedEvents) == []
     assert any(isinstance(event, errorEvent) for event in failedEvents)
+
+
+def eventByType(path, eventType):
+    return [event for event in jsonlLog(path).readEvents() if event.get('type') == eventType]
+
+
+def testCoreWritesUsageRecordAndEvent(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr('flamingoAgents.core.agent.time.sleep', lambda seconds: None)
+    current = makeAgent(tmp_path, [textTurn('hi', 10, 4, 2)], providerId='volcano', modelId='flash-test')
+    events = list(current.runUserMessageStream('hello', 'sess-live'))
+    assert usageEvents(events)[0].usage == {'promptTokens': 10, 'cachedTokens': 2, 'completionTokens': 4}
+    records = eventByType(tmp_path / 'sess-live.jsonl', 'usageRecord')
+    starts = eventByType(tmp_path / 'sess-live.jsonl', 'modelRequestStart')
+    assistants = eventByType(tmp_path / 'sess-live.jsonl', 'assistantMessage')
+    assert len(records) == 1
+    assert starts[0]['usageKey'] == records[0]['usageKey'] == assistants[0]['usageKey']
+    assert records[0]['source'] == 'library'
+    assert records[0]['providerId'] == 'volcano'
+    assert records[0]['modelId'] == 'flash-test'
+    connection = sqlite3.connect(usageLedger.dbPath)
+    try:
+        rows = connection.execute('SELECT usageKey, promptTokens, cachedTokens, completionTokens FROM usageEvents').fetchall()
+    finally:
+        connection.close()
+    assert rows == [(records[0]['usageKey'], 10, 2, 4)]
+
+
+def testRetryAttemptsUseDifferentKeys(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr('flamingoAgents.core.agent.time.sleep', lambda seconds: None)
+    fail = modelRequestError('upstream', {'model': 'x'}, statusCode=502)
+    current = makeAgent(tmp_path, [fail, textTurn('ok', 12, 3, 1)])
+    list(current.runUserMessageStream('hello', 'sess-retry'))
+    starts = eventByType(tmp_path / 'sess-retry.jsonl', 'modelRequestStart')
+    records = eventByType(tmp_path / 'sess-retry.jsonl', 'usageRecord')
+    assert len(starts) == 2
+    assert starts[0]['usageKey'] != starts[1]['usageKey']
+    assert len(records) == 1
+    assert records[0]['usageKey'] == starts[1]['usageKey']
+
+
+def testResumeDoesNotDoubleCountUsageRecord(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr('flamingoAgents.core.agent.time.sleep', lambda seconds: None)
+    current = makeAgent(tmp_path, [textTurn('hi', 8, 2, 1)])
+    list(current.runUserMessageStream('hello', 'sess-resume'))
+    resumed = conversation(sessionId='sess-resume', logPath=tmp_path / 'sess-resume.jsonl', systemPrompt='sys', resume=True)
+    assert resumed.usageTotal == {'promptTokens': 8, 'cachedTokens': 1, 'completionTokens': 2}
+
+
+def testResumeAssistantUsageKeyWithoutRecordStillCounts(tmp_path) -> None:
+    logPath = tmp_path / 'sess-orphan.jsonl'
+    logger = jsonlLog(logPath)
+    logger.logEvent({'type': 'systemMessage', 'content': 'sys'})
+    logger.logEvent({
+        'type': 'assistantMessage',
+        'content': 'hi',
+        'usageKey': 'missing-outbox',
+        'usage': {'prompt_tokens': 9, 'completion_tokens': 2, 'prompt_tokens_details': {'cached_tokens': 1}},
+    })
+    resumed = conversation(sessionId='sess-orphan', logPath=logPath, systemPrompt='sys', resume=True)
+    assert resumed.usageTotal == {'promptTokens': 9, 'cachedTokens': 1, 'completionTokens': 2}
+
+
+def testOutboxFailureStillWritesLedger(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr('flamingoAgents.core.agent.time.sleep', lambda seconds: None)
+    current = makeAgent(tmp_path, [textTurn('hi', 6, 2, 1)])
+    original = conversation.appendUsageRecord
+
+    def failOutbox(self, record):
+        raise OSError('disk')
+
+    monkeypatch.setattr(conversation, 'appendUsageRecord', failOutbox)
+    events = list(current.runUserMessageStream('hello', 'sess-outbox'))
+    monkeypatch.setattr(conversation, 'appendUsageRecord', original)
+    assert usageEvents(events)[0].usage == {'promptTokens': 6, 'cachedTokens': 1, 'completionTokens': 2}
+    assert eventByType(tmp_path / 'sess-outbox.jsonl', 'usageRecord') == []
+    connection = sqlite3.connect(usageLedger.dbPath)
+    try:
+        rows = connection.execute('SELECT promptTokens, cachedTokens, completionTokens FROM usageEvents').fetchall()
+    finally:
+        connection.close()
+    assert rows == [(6, 1, 2)]

@@ -1,9 +1,9 @@
 '''
 Author: wilbur
-Version: 1.1
+Version: 1.2
 Date: 2026-09-21
 Description: Web 图片输入测试（imageInputPlan P2）：上传落盘、@ 图片快照、纯文本模型拒绝上传图、@ 图回退路径引用、
-             图片端点拘禁、deleteSession 清理目录、有界请求体。v1.1 兼容 startStream 的 runEvent 关键字参数。
+             图片端点拘禁、deleteSession 清理目录、有界请求体。v1.2 删除会话测试改为先 drain 用量账本。
 '''
 
 from __future__ import annotations
@@ -181,6 +181,7 @@ def testDeleteSessionRemovesImagesDir(tmp_path, monkeypatch):
     monkeypatch.setattr(server.agentManager, 'hasActiveStream', lambda _sid: False)
     monkeypatch.setattr(server.agentManager, 'dropAgent', lambda _sid: None)
     monkeypatch.setattr(server, 'resolveSessionLogDir', lambda category, path: logDir)
+    monkeypatch.setattr(server.usageLedger, 'drainLogFile', lambda path: None)
     monkeypatch.setattr(auth, 'serverToken', 'image-test-token')
     with TestClient(server.app) as client:
         response = client.delete(f'/api/sessions/{sessionId}', headers={'Authorization': 'Bearer image-test-token'})
