@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.7
-Date: 2026-09-21
-Description: SDK 入口：可编程调用 runSdk() 或 CLI 单独运行。v1.7 传入 usageSource/parentSessionId，CLI/SDK/子代理共用调用级账本。
+Version: 1.8
+Date: 2026-09-23
+Description: SDK 入口：可编程调用 runSdk() 或 CLI 单独运行。v1.7 传入 usageSource/parentSessionId，CLI/SDK/子代理共用调用级账本。v1.8（subAgentPipeDrainFixPlan）：新增 --session-id / runSdk(sessionId=None)，父进程可预生成子会话 ID 以便超时后定位子日志；缺省行为不变。
 '''
 
 import argparse
@@ -89,8 +89,10 @@ def runSdk(
     quiet: bool = False,
     usageSource: str = 'sdk',
     parentSessionId: str | None = None,
+    sessionId: str | None = None,
 ) -> str:
     # providerModel 格式：provider/model，如 volcano/deepseek-v4-flash；返回模型完整正文。
+    # sessionId：父进程（askSubAgent）预生成的子会话 ID；None 时自生成，兼容 CLI 直跑。
     providerId, _, modelId = providerModel.partition('/')
     if not providerId or not modelId:
         raise ValueError(f'providerModel 格式应为 provider/model，实际：{providerModel}')
@@ -108,7 +110,7 @@ def runSdk(
     flamingo.maxModelSteps = -1
 
     out = sys.stderr if quiet else sys.stdout
-    sessionId = flamingo.createSessionId()
+    sessionId = sessionId or flamingo.createSessionId()
     chunks: list[str] = []
     confirmationId = consumeStream(flamingo.runUserMessageStream(userPrompt, sessionId), chunks, out)
     while confirmationId:
@@ -131,6 +133,7 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument('--json', action='store_true', help='机器友好输出：stdout 仅一行 JSON，事件流挪到 stderr')
     parser.add_argument('--usage-source', default=None, help='用量账本来源：cli/sdk/subagent/library')
     parser.add_argument('--parent-session-id', default=None, help='父会话 ID，子代理记账用')
+    parser.add_argument('--session-id', default=None, help='子会话 ID：由父进程预生成，便于超时后定位子日志；缺省自生成')
     return parser.parse_args()
 
 
@@ -145,6 +148,7 @@ def main() -> None:
         debug=args.debug,
         usageSource=usageSource,
         parentSessionId=args.parent_session_id,
+        sessionId=args.session_id,
     )
     if not args.json:
         runSdk(args.model, args.prompt, **common)

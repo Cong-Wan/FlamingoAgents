@@ -1,8 +1,9 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-09-17
+Version: 1.1
+Date: 2026-09-23
 Description: _runWithInterrupt 有界等待回归（bashPipeHangSessionLockFixPlan）：活首领超时、孤儿写端事故形、忽略 SIGTERM、中断叫醒管道死等、短命令成功、超时后释放会话锁、interruptEvent=None 同样有界。
+  v1.1（subAgentPipeDrainFixPlan）：新增活首领大输出持续排空三用例——stderr 70,000B 正常返回、双管并发 700,000B、10MiB head/tail 有界；旧用例断言零修改。
 '''
 
 from __future__ import annotations
@@ -38,6 +39,15 @@ orphanHolderSource = (
     ')\n'
     'subprocess.Popen([sys.executable, "-c", childSource, str(handshake)])\n'
     'os._exit(0)\n'
+)
+
+stderrWriterSource = 'import os, sys\nos.write(2, b"x" * int(sys.argv[1]))\n'
+bothPipesWriterSource = (
+    'import os, sys, threading\n'
+    'n = int(sys.argv[1])\n'
+    'a = threading.Thread(target=lambda: os.write(1, b"o" * n))\n'
+    'b = threading.Thread(target=lambda: os.write(2, b"e" * n))\n'
+    'a.start(); b.start(); a.join(); b.join()\n'
 )
 
 
@@ -80,6 +90,60 @@ def testTimeoutWhenLeaderExitsButChildHoldsPipes(tmp_path):
     assert isinstance(error, subprocess.TimeoutExpired)
     assert elapsed <= 2.5
     assert handshake.exists()
+
+
+def testLeaderAliveLargeStderrCompletes(tmp_path):
+    # T1：活首领写满 PIPE 容量（65,536B）不再互等，正常返回而非超时。
+    context = makeContext(tmp_path, threading.Event())
+    command = [sys.executable, '-c', stderrWriterSource, '70000']
+    result, elapsed, error = runTimed(
+        lambda: _runWithInterrupt(command, context, 5)
+    )
+    assert error is None
+    assert result is not None
+    assert result.returncode == 0
+    assert len(result.stderr.encode('utf-8')) == 70000
+    assert elapsed <= 1.5
+
+
+def testBothPipesLargeConcurrent(tmp_path):
+    # T3：双管并发各 700,000B：核心断言是“不因 PIPE 回压等满 timeout”而是正常返回；
+    # 超出 spool 上限（head+tail=512KiB）的中间部分按设计丢弃，两端完整。
+    from flamingoAgents.tools.builtinTools import pipeHeadCapBytes, pipeTailCapBytes
+
+    context = makeContext(tmp_path, threading.Event())
+    command = [sys.executable, '-c', bothPipesWriterSource, '700000']
+    result, elapsed, error = runTimed(
+        lambda: _runWithInterrupt(command, context, 5)
+    )
+    assert error is None
+    assert result is not None
+    capped = pipeHeadCapBytes + pipeTailCapBytes
+    assert len(result.stdout.encode('utf-8')) == capped
+    assert len(result.stderr.encode('utf-8')) == capped
+    assert result.stdout.startswith('o' * 8)
+    assert result.stdout.endswith('o' * 8)
+    assert result.stderr.startswith('e' * 8)
+    assert result.stderr.endswith('e' * 8)
+    assert elapsed <= 3.5
+
+
+def testTenMiBOutputBoundedSpool(tmp_path):
+    # T4：10MiB 输出返回 head+tail 有界内容，父内存不随输出无界增长；耗时随 producer 而非 timeout。
+    from flamingoAgents.tools.builtinTools import pipeHeadCapBytes, pipeTailCapBytes
+
+    context = makeContext(tmp_path, threading.Event())
+    command = [sys.executable, '-c', stderrWriterSource, str(10 * 1024 * 1024)]
+    result, elapsed, error = runTimed(
+        lambda: _runWithInterrupt(command, context, 5)
+    )
+    assert error is None
+    assert result is not None
+    raw = result.stderr.encode('utf-8')
+    assert len(raw) == pipeHeadCapBytes + pipeTailCapBytes
+    assert raw[:5] == b'xxxxx'
+    assert raw[-5:] == b'xxxxx'
+    assert elapsed <= 3.5
 
 
 @skipWithoutBash

@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.9
-Date: 2026-09-21
-Description: Provides executable handlers (execute/preview) for built-in tools. v1.9 askSubAgent 显式传 usage-source=subagent 与父会话 ID，子进程用量写入统一账本。
+Version: 1.10
+Date: 2026-09-23
+Description: Provides executable handlers (execute/preview) for built-in tools. v1.9 askSubAgent 显式传 usage-source=subagent 与父会话 ID，子进程用量写入统一账本。v1.10（subAgentPipeDrainFixPlan）：_runWithInterrupt 改为每管一个 reader 线程持续排空到 head/tail 有界 spool，活 child 写满 PIPE 不再互等；首领退出 0.5s EOF 宽限语义保留；超时异常附带 pipeStats；askSubAgentTool 生成并传 --session-id，超时返回 childSessionId/childLogPath/partialStderrTail 等诊断，stdout 末行无 reply 时显式报错。
 '''
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -20,11 +21,15 @@ from typing import Any
 from flamingoAgents.core.types import modelInterruptedError, toolContext, toolOutput
 from flamingoAgents.tools.toolConfig import toolSchemaSpec
 from flamingoAgents.tools.toolDefinition import defineTool, toolDefinition, toolExecuteFunction, toolPreviewFunction
+from flamingoAgents.utils.logPaths import newSessionId, resolveSessionLogDir
 
 maxTimeoutSeconds = 120
 defaultTimeoutSeconds = 30
 defaultSubAgentTimeoutSeconds = 600
 maxSubAgentTimeoutSeconds = 3600
+pipeHeadCapBytes = 256 * 1024      # 每管保留输出前缀上限（bash 头部 clip 语义）
+pipeTailCapBytes = 256 * 1024      # 每管保留输出后缀上限（askSubAgent 尾行 JSON 语义）
+pipeReadChunkBytes = 64 * 1024
 
 
 # --- read ---
@@ -162,12 +167,70 @@ def _isInterrupted(context: toolContext) -> bool:
     return context.interruptEvent is not None and context.interruptEvent.is_set()
 
 
-def _pipeText(value) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, bytes):
-        return value.decode('utf-8', errors='replace')
-    return ''
+class _pipeSpool:
+    # head/tail 双端有界缓冲：head 保前缀（bash clip 语义），tail 保后缀（askSubAgent 尾行 JSON 语义）；
+    # 中间溢出丢弃并计数；lastActivityAt 记最后一次收到字节的墙钟时刻（0 表示尚无输出）。
+
+    def __init__(self) -> None:
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.totalBytes = 0
+        self.droppedBytes = 0
+        self.lastActivityAt = 0.0
+        self.eof = False
+        self.lock = threading.Lock()
+
+    def feed(self, data: bytes) -> None:
+        if not data:
+            return
+        with self.lock:
+            self.totalBytes += len(data)
+            self.lastActivityAt = time.time()
+            rest = data
+            if len(self.head) < pipeHeadCapBytes:
+                take = min(len(data), pipeHeadCapBytes - len(self.head))
+                self.head += data[:take]
+                rest = data[take:]
+            if rest:
+                self.tail += rest
+                overflow = len(self.tail) - pipeTailCapBytes
+                if overflow > 0:
+                    del self.tail[:overflow]
+                    self.droppedBytes += overflow
+
+    def markEof(self) -> None:
+        self.eof = True
+
+    def text(self) -> str:
+        with self.lock:
+            raw = bytes(self.head) + bytes(self.tail)
+        return raw.decode('utf-8', errors='replace')
+
+    def snapshot(self) -> dict[str, int | float]:
+        with self.lock:
+            return {
+                'bytes': self.totalBytes,
+                'droppedBytes': self.droppedBytes,
+                'lastActivityAt': self.lastActivityAt,
+            }
+
+
+def _drainPipe(stream, spool: _pipeSpool) -> None:
+    # 阻塞读整管到 spool 直到 EOF；异常（含父侧关读端）一律按 EOF 收尾，线程 daemon 兜底。
+    readChunk = getattr(stream, 'read1', None)
+    if not callable(readChunk):
+        readChunk = stream.read
+    try:
+        while True:
+            try:
+                data = readChunk(pipeReadChunkBytes)
+            except Exception:
+                break
+            if not data:
+                break
+            spool.feed(data)
+    finally:
+        spool.markEof()
 
 
 def _closeReadPipes(process: subprocess.Popen) -> None:
@@ -206,62 +269,71 @@ def _finishStop(
     reason: str,
     command: list[str],
     timeout: int,
-    partialOut,
-    partialErr,
+    outSpool: _pipeSpool,
+    errSpool: _pipeSpool,
+    leaderExitedAt: float | None,
+    startedAtWall: float,
 ) -> None:
     _killProcessGroup(process)
-    stdoutText = _pipeText(partialOut)
-    stderrText = _pipeText(partialErr)
-    try:
-        stdout, stderr = process.communicate(timeout=0.3)
-        stdoutText = _pipeText(stdout) or stdoutText
-        stderrText = _pipeText(stderr) or stderrText
-    except subprocess.TimeoutExpired as error:
-        stdoutText = _pipeText(error.stdout) or stdoutText
-        stderrText = _pipeText(error.stderr) or stderrText
-        _closeReadPipes(process)
-        try:
-            process.wait(timeout=0.2)
-        except subprocess.TimeoutExpired:
-            pass
+    # 杀组后写端全灭，reader 线程将收到 EOF；有界等待其收尾，不与 reader 抢管道（不 communicate）。
+    eofDeadline = time.monotonic() + 0.3
+    while time.monotonic() < eofDeadline and not (outSpool.eof and errSpool.eof):
+        time.sleep(0.02)
     if reason == 'interrupt':
         raise modelInterruptedError('用户已停止')
-    raise subprocess.TimeoutExpired(command, timeout, output=stdoutText, stderr=stderrText)
+    outStats = outSpool.snapshot()
+    errStats = errSpool.snapshot()
+    lastActivityAt = max(outStats['lastActivityAt'], errStats['lastActivityAt']) or startedAtWall
+    error = subprocess.TimeoutExpired(command, timeout, output=outSpool.text(), stderr=errSpool.text())
+    error.pipeStats = {
+        'stdoutBytes': outStats['bytes'],
+        'stderrBytes': errStats['bytes'],
+        'stdoutDroppedBytes': outStats['droppedBytes'],
+        'stderrDroppedBytes': errStats['droppedBytes'],
+        'lastActivityAt': lastActivityAt,
+        'timeoutSource': 'postLeaderGrace' if leaderExitedAt is not None else 'pipeOrLeader',
+    }
+    raise error
 
 
 def _runWithInterrupt(command: list[str], context: toolContext, timeout: int) -> subprocess.CompletedProcess:
-    # 有界 Popen：poll 循环查中断/deadline；首领退出后 0.5s 管道宽限；未 EOF 当超时杀组。
+    # 持续排空版有界 Popen：每管一个 reader 线程写入 head/tail 有界 spool，活 child 写满 PIPE 不再互等；
+    # 首领退出后保留 0.5s EOF 宽限（旧孤儿事故形语义）；EOF + 首领已退才组装返回。
     process = subprocess.Popen(
         command,
         cwd=str(context.workDir),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
         start_new_session=True,
     )
+    outSpool = _pipeSpool()
+    errSpool = _pipeSpool()
+    outReader = threading.Thread(target=_drainPipe, args=(process.stdout, outSpool), daemon=True)
+    errReader = threading.Thread(target=_drainPipe, args=(process.stderr, errSpool), daemon=True)
+    outReader.start()
+    errReader.start()
+    startedAtWall = time.time()
     deadline = time.monotonic() + timeout
-    partialOut = None
-    partialErr = None
+    leaderExitedAt = None
     try:
-        while process.poll() is None:
-            if _isInterrupted(context):
-                _finishStop(process, 'interrupt', command, timeout, partialOut, partialErr)
-            if time.monotonic() >= deadline:
-                _finishStop(process, 'timeout', command, timeout, partialOut, partialErr)
-            time.sleep(0.1)
-        graceDeadline = time.monotonic() + 0.5
         while True:
             if _isInterrupted(context):
-                _finishStop(process, 'interrupt', command, timeout, partialOut, partialErr)
-            remaining = graceDeadline - time.monotonic()
-            if remaining <= 0:
-                _finishStop(process, 'timeout', command, timeout, partialOut, partialErr)
-            try:
-                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
-                return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-            except subprocess.TimeoutExpired as error:
-                partialOut = error.stdout
-                partialErr = error.stderr
+                _finishStop(process, 'interrupt', command, timeout, outSpool, errSpool, leaderExitedAt, startedAtWall)
+            if time.monotonic() >= deadline:
+                _finishStop(process, 'timeout', command, timeout, outSpool, errSpool, leaderExitedAt, startedAtWall)
+            if process.poll() is not None:
+                if leaderExitedAt is None:
+                    leaderExitedAt = time.monotonic()
+                if outSpool.eof and errSpool.eof:
+                    break
+                if time.monotonic() - leaderExitedAt >= 0.5:
+                    _finishStop(process, 'timeout', command, timeout, outSpool, errSpool, leaderExitedAt, startedAtWall)
+            time.sleep(0.1)
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+        return subprocess.CompletedProcess(command, process.returncode, outSpool.text(), errSpool.text())
     finally:
         _closeReadPipes(process)
 
@@ -382,6 +454,12 @@ def askSubAgentTool(arguments: dict[str, Any], context: toolContext) -> toolOutp
         command += ['--tools', tools]
     workDir = str(arguments.get('workDir', '')).strip() or str(context.workDir)
     command += ['--work-dir', workDir]
+    childSessionId = newSessionId()
+    command += ['--session-id', childSessionId]
+    childWorkDir = Path(workDir)
+    if not childWorkDir.is_absolute():
+        childWorkDir = context.workDir / childWorkDir
+    childLogPath = resolveSessionLogDir('cliData', childWorkDir.resolve()) / f'{childSessionId}.jsonl'
     command += ['--usage-source', 'subagent']
     if context.sessionId:
         command += ['--parent-session-id', context.sessionId]
@@ -390,13 +468,29 @@ def askSubAgentTool(arguments: dict[str, Any], context: toolContext) -> toolOutp
         context.debugConsole.debug(f'子代理开始 model={model} workDir={workDir} tools={tools or "<none>"} timeout={timeout}')
     try:
         completedProcess = _runWithInterrupt(command, context, timeout)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as error:
         if context.debugConsole:
             context.debugConsole.debug(f'子代理超时 model={model} timeout={timeout}')
+        pipeStats = getattr(error, 'pipeStats', None)
+        pipeStats = pipeStats if isinstance(pipeStats, dict) else {}
+        stderrTail = (error.stderr or '')[-2000:]
         return toolOutput(
             content=f'子代理超时被终止（{timeout}s）。',
             isError=True,
-            details={'timeout': timeout, 'timeoutExpired': True, 'model': model},
+            details={
+                'timeout': timeout,
+                'timeoutExpired': True,
+                'model': model,
+                'childSessionId': childSessionId,
+                'childLogPath': str(childLogPath),
+                'stdoutBytes': pipeStats.get('stdoutBytes', 0),
+                'stderrBytes': pipeStats.get('stderrBytes', 0),
+                'stdoutDroppedBytes': pipeStats.get('stdoutDroppedBytes', 0),
+                'stderrDroppedBytes': pipeStats.get('stderrDroppedBytes', 0),
+                'partialStderrTail': stderrTail,
+                'lastActivityAt': pipeStats.get('lastActivityAt'),
+                'timeoutSource': pipeStats.get('timeoutSource'),
+            },
         )
 
     # stdout 最后一行是 --json 输出的单行 JSON。
@@ -409,16 +503,25 @@ def askSubAgentTool(arguments: dict[str, Any], context: toolContext) -> toolOutp
             payload = {}
     reply = payload.get('reply')
     error = payload.get('error')
-    isError = completedProcess.returncode != 0 or error is not None
+    isError = completedProcess.returncode != 0 or error is not None or reply is None
     if context.debugConsole:
         context.debugConsole.debug(f'子代理完成 exitCode={completedProcess.returncode} isError={isError} timeout={timeout}')
+    commonDetails = {
+        'model': model,
+        'workDir': workDir,
+        'tools': tools,
+        'exitCode': completedProcess.returncode,
+        'timeout': timeout,
+        'childSessionId': childSessionId,
+        'childLogPath': str(childLogPath),
+    }
     if isError:
-        content = f'子代理失败 exitCode={completedProcess.returncode}：{error or (completedProcess.stderr.strip()[:500] or "未知错误")}'
-        return toolOutput(content=content, isError=True)
-    return toolOutput(
-        content=str(reply),
-        details={'model': model, 'workDir': workDir, 'tools': tools, 'exitCode': completedProcess.returncode, 'timeout': timeout},
-    )
+        if reply is None and error is None:
+            content = '子代理 stdout 最后一行不是含 reply 的 JSON（可能被 head/tail 有界截断或子进程异常）。'
+        else:
+            content = f'子代理失败 exitCode={completedProcess.returncode}：{error or (completedProcess.stderr.strip()[:500] or "未知错误")}'
+        return toolOutput(content=content, isError=True, details=commonDetails)
+    return toolOutput(content=str(reply), details=commonDetails)
 
 
 # --- schema-driven assembly ---
