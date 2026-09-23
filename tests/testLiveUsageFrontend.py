@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.5
-Date: 2026-09-21
-Description: Node assert coverage for statusUsage helpers and statusBar/chatView deferred races. v1.5 同步 styles cache-bust 到 1.25。
+Version: 1.6
+Date: 2026-09-23
+Description: Node assert coverage for statusUsage helpers and statusBar/chatView deferred races. v1.6 同步 styles cache-bust 到 1.27（版本号功能）。
 '''
 
 from __future__ import annotations
@@ -907,7 +907,7 @@ def testIndexCacheBustOrder() -> None:
     usagePos = index.find('src="/static/js/statusUsage.js?v=1.1"')
     barPos = index.find('src="/static/js/statusBar.js?v=1.6"')
     chatPos = index.find('src="/static/js/chatView.js?v=1.24"')
-    stylesPos = index.find('href="/static/styles.css?v=1.25"')
+    stylesPos = index.find('href="/static/styles.css?v=1.27"')
     markdownPos = index.find('src="/static/js/markdown.js?v=1.2"')
     assert usagePos != -1 and barPos != -1 and chatPos != -1 and stylesPos != -1 and markdownPos != -1
     assert usagePos < barPos < chatPos

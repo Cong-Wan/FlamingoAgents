@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.25
-Date: 2026-09-21
-Description: FlamingoAgents native Web styles. v1.25 用量页改为下拉筛选、四卡常驻、Provider 趋势卡与质量提示，删除会话表和 Chart.js 容器。
+Version: 1.27
+Date: 2026-09-23
+Description: FlamingoAgents native Web styles. v1.25 用量页改为下拉筛选、四卡常驻、Provider 趋势卡与质量提示，删除会话表和 Chart.js 容器。v1.26（versionDisplayPlan §4.4）：新增 .login-version 与 .sidebar-version 版本号小字样式。v1.27：侧栏版本号移至顶部「新建会话」上方，字号 14px 与按钮同大。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -60,6 +60,7 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
 .login-input:focus { border-color: var(--accent); }
 .login-error { color: var(--danger); font-size: 13px; margin-top: 10px; }
 .login-button { width: 100%; margin-top: 16px; padding: 10px; }
+.login-version { margin-top: 16px; font-size: 12px; color: var(--text-dim); }
 
 /* ========== 整体布局 ========== */
 .app { display: flex; height: 100vh; }
@@ -119,6 +120,7 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
   font-size: 13px; padding: 2px 4px; border-radius: 4px;
 }
 .session-action-btn:hover { color: var(--sidebar-text); background: #dcdce2; }
+.sidebar-version { padding: 16px 14px 2px; font-size: 14px; font-weight: 600; color: var(--sidebar-text); }
 .sidebar-bottom { border-top: 1px solid var(--border); padding: 8px; }
 .sidebar-entry {
   display: flex; align-items: center; gap: 8px;

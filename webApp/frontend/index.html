@@ -1,8 +1,8 @@
 <!--
 Author: wilbur
-Version: 1.23
-Date: 2026-09-21
-Description: FlamingoAgents native Web UI shell. v1.23 用量页改为单一时间范围下拉框、四张汇总卡和 Provider 趋势图，删除会话表与 Chart.js。
+Version: 1.25
+Date: 2026-09-23
+Description: FlamingoAgents native Web UI shell. v1.23 用量页改为单一时间范围下拉框、四张汇总卡和 Provider 趋势图，删除会话表与 Chart.js。v1.24（versionDisplayPlan §4.4）：登录门与侧栏底部各加版本号容器，启动时经 /api/version 填充。v1.25：侧栏版本号从底部移到顶部「新建会话」上方，字号 14px 与新会话按钮同大。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -12,7 +12,7 @@ Description: FlamingoAgents native Web UI shell. v1.23 用量页改为单一时�
   <title>FlamingoAgents</title>
   <link rel="icon" type="image/png" href="/static/flamingo.png">
   <link rel="stylesheet" href="/static/vendor/highlight-theme.min.css">
-  <link rel="stylesheet" href="/static/styles.css?v=1.25">
+  <link rel="stylesheet" href="/static/styles.css?v=1.27">
 </head>
 <body>
   <!-- 登录门：无 token 或任意请求 401 时全屏遮罩 -->
@@ -24,12 +24,14 @@ Description: FlamingoAgents native Web UI shell. v1.23 用量页改为单一时�
       <input id="loginTokenInput" class="login-input" type="password" placeholder="Token" autocomplete="off">
       <div id="loginError" class="login-error hidden"></div>
       <button id="loginButton" class="btn btn-primary login-button">进入</button>
+      <div id="loginVersion" class="login-version"></div>
     </div>
   </div>
 
   <div id="app" class="app hidden">
     <!-- 左侧浅色侧栏 -->
     <aside class="sidebar">
+      <div id="sidebarVersion" class="sidebar-version"></div>
       <div class="sidebar-top">
         <button id="newSessionButton" class="btn-new-session" title="新建会话（⌘K / Ctrl+K）">＋ 新建会话 <kbd class="kbd-hint">⌘K</kbd></button>
         <button id="sidebarCollapseButton" class="sidebar-collapse-btn" title="收起侧栏">‹</button>
@@ -300,7 +302,7 @@ Description: FlamingoAgents native Web UI shell. v1.23 用量页改为单一时�
   <script src="/static/vendor/highlight.min.js"></script>
   <script src="/static/js/markdown.js?v=1.2"></script>
   <script src="/static/js/store.js"></script>
-  <script src="/static/js/api.js?v=1.10"></script>
+  <script src="/static/js/api.js?v=1.11"></script>
   <script src="/static/js/sse.js"></script>
   <script src="/static/js/sidebarView.js"></script>
   <script src="/static/js/statusUsage.js?v=1.1"></script>

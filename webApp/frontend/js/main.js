@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.5
-Date: 2026-08-14
+Version: 1.6
+Date: 2026-09-23
 Description: 启动引导 + 登录门 + hash 路由（#/chat、#/chat/{id}、#/settings/models、#/settings/skills、#/usage）。
              v1.1（composerFocusShortcutPlan T2）：全局快捷键 Cmd+N（mac）/ Ctrl+N（win）新建应用窗口
              （浏览器保留键拦不住时走原生行为；登录门态/弹层打开时不响应）。
@@ -12,6 +12,7 @@ Description: 启动引导 + 登录门 + hash 路由（#/chat、#/chat/{id}、#/s
              v1.4（F2 discoverability）：启动时按平台渲染「新建会话」按钮的快捷键提示
              （navigator.platform 判 mac 显 ⌘K，其余显 Ctrl+K；含 kbd 文本与 title 悬停）。
              v1.5：新增与模型配置平级的「技能」只读页路由 #/settings/skills（skillsView）。
+             v1.6（versionDisplayPlan §4.4）：启动时拉取 /api/version，填充登录门与侧栏底部版本号；失败静默不阻塞启动。
 */
 (function () {
   'use strict';
@@ -152,6 +153,17 @@ Description: 启动引导 + 登录门 + hash 路由（#/chat、#/chat/{id}、#/s
   window.api.setUnauthorizedHandler(function () {
     showLoginGate('登录已失效，请重新输入 token。');
   });
+
+  // 版本号（versionDisplayPlan §4.4）：登录门态与主界面态都填充，启动即调；失败静默（不显示、不阻塞）
+  (function fillVersion() {
+    window.api.getVersion().then(function (body) {
+      var text = 'v' + body.version;
+      var loginEl = document.getElementById('loginVersion');
+      var sidebarEl = document.getElementById('sidebarVersion');
+      if (loginEl) loginEl.textContent = text;
+      if (sidebarEl) sidebarEl.textContent = text;
+    }).catch(function () { /* 拉取失败静默：不显示版本，不阻塞启动 */ });
+  })();
 
   if (window.appStore.token) {
     hideLoginGate();

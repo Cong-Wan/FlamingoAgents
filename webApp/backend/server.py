@@ -1,8 +1,9 @@
 '''
 Author: wilbur
-Version: 1.20
-Date: 2026-09-21
+Version: 1.21
+Date: 2026-09-23
 Description: FastAPI application and authenticated REST/SSE routes. v1.20 GET /api/usage 改为单一 period 账本快照；删除 /usage/series；删除会话前必须补齐 usageRecord。
+            v1.21（versionDisplayPlan §4.1/§4.3）：/api/health 版本号改由 flamingoAgents/version.py 引用；新增免认证 GET /api/version（登录门展示用）。
 '''
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from flamingoAgents.models.modelConfig import loadModelConfigFromYaml
 from flamingoAgents.models.subscriptionModels import discoverSubscriptionModels, modelDiscoveryError
 from flamingoAgents.utils.logPaths import resolveSessionLogDir
 from flamingoAgents.utils import usageLedger
+from flamingoAgents.version import __version__ as packageVersion
 
 from webApp.backend import agentManager, fileBrowser, historyView, modelAuthManager, modelConfigStore, sessionStore, skillStore, usageStore
 from webApp.backend.piModelsImport import convertPiDocument
@@ -171,6 +173,12 @@ def login(body: dict = Body(...)):
     return {'ok': True}
 
 
+@app.get('/api/version')
+def version():
+    # 免认证：登录门前也要显示；仅返回版本号，无敏感信息（webApiSpec v1.29 §3.29）
+    return {'ok': True, 'version': packageVersion}
+
+
 # ---------- 认证 API 路由 ----------
 
 authedApi = APIRouter(prefix='/api', dependencies=[authDependency])
@@ -178,7 +186,7 @@ authedApi = APIRouter(prefix='/api', dependencies=[authDependency])
 
 @authedApi.get('/health')
 def health():
-    return {'ok': True, 'version': '0.1.0'}
+    return {'ok': True, 'version': packageVersion}
 
 
 @authedApi.get('/sessions')

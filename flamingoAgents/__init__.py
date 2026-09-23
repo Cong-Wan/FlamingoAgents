@@ -1,8 +1,9 @@
 '''
 Author: wilbur
-Version: 1.3
-Date: 2026-07-26
+Version: 1.4
+Date: 2026-09-23
 Description: Exposes the pure-library public API for Flamingo Agents. v1.3 exports the 7 agent event classes for event-stream consumers (docs/streamOutputPlan.md §6.2).
+            v1.4（versionDisplayPlan §4.1）：packageVersion 改由 flamingoAgents/version.py 唯一数据源引用，不再硬编码。
 '''
 
 from flamingoAgents.builder import createAgent
@@ -15,8 +16,7 @@ from flamingoAgents.core.types import (
     toolCallEndEvent,
     toolCallStartEvent,
 )
-
-packageVersion = '0.1.0'
+from flamingoAgents.version import __version__ as packageVersion
 
 __all__ = [
     'createAgent',

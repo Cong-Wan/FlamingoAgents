@@ -75,7 +75,7 @@ cp config/models.example.yaml ~/.flamingo/config/models.yaml   # 再按需删减
 uv run python askModel.py
 
 # 3. Web 方式（局域网访问）
-FLAMINGO_WEB_TOKEN=你的token uv run python -m webApp
+FLAMINGO_WEB_TOKEN=flamingo uv run python -m webApp
 # 浏览器打开 http://<本机IP>:8787，输入 token 登录
 ```
 

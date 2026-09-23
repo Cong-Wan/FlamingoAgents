@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.5
-Date: 2026-09-08
-Description: Adapts Flamingo messages/tools to ChatGPT Codex and xAI Responses SSE, including dynamic auth, safe opaque replay, terminal-authoritative item merging, usage normalization, stop, and one zero-output OAuth 401 refresh retry. v1.2 always persists/replays reasoning.summary（empty list if none）so OpenAI Responses does not 400 missing input[n].summary. v1.3 attaches stack-local stream diagnosis on connect/firstByte/streamRead/decode/streamEnd, records authRefresh only on failed 401 refresh, and writes success timings with sawDone. v1.4 connect diag assignment cannot replace the original modelRequestError. v1.5（imageInputPlan）：user 消息含图时追加 input_image，无图保持原 input_text 形状。
+Version: 1.6
+Date: 2026-09-23
+Description: Adapts Flamingo messages/tools to ChatGPT Codex and xAI Responses SSE, including dynamic auth, safe opaque replay, terminal-authoritative item merging, usage normalization, stop, and one zero-output OAuth 401 refresh retry. v1.2 always persists/replays reasoning.summary（empty list if none）so OpenAI Responses does not 400 missing input[n].summary. v1.3 attaches stack-local stream diagnosis on connect/firstByte/streamRead/decode/streamEnd, records authRefresh only on failed 401 refresh, and writes success timings with sawDone. v1.4 connect diag assignment cannot replace the original modelRequestError. v1.5（imageInputPlan）：user 消息含图时追加 input_image，无图保持原 input_text 形状。v1.6（versionDisplayPlan §4.1）：userAgent 版本号改由 flamingoAgents/version.py 引用。
 '''
 
 from __future__ import annotations
@@ -32,8 +32,9 @@ from flamingoAgents.models.chatCompletions import (
 )
 from flamingoAgents.models.modelAuth import modelAuth, modelAuthResolver
 from flamingoAgents.models.modelConfig import modelConfig
+from flamingoAgents.version import __version__
 
-userAgent = 'FlamingoAgents/0.1.0'
+userAgent = 'FlamingoAgents/' + __version__
 supportedItemTypes = frozenset({'reasoning', 'message', 'function_call', 'function_call_output'})
 
 

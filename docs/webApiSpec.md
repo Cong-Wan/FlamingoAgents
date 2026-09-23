@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.28
-> Date: 2026-09-21
+> Version: 1.29
+> Date: 2026-09-23
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 9 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -34,6 +34,7 @@
 > v1.26（chatUxImprovePlan）：§2.2 新增 `kind:error`；终态 `modelError`（`willRetry` 非 true）下发，重试中仍不下发；`request`/traceback/diag 不下发。
 > v1.27：UI stopped 与 Core draining 分离；同会话新请求在 Core 未退出前最多等 2s，超时 409；attach 在 draining 时可回放 stopped history。
 > v1.28：用量统计改为单一 `GET /api/usage?period=` 账本快照（usageEvents）；删除 `/api/usage/series` 与会话明细；状态栏费用改读已落账记录；删除会话前必须 drain usageRecord。
+> v1.29：版本号单一数据源（docs/plan/260923_versionDisplayPlan.md）——新增免认证 §3.29 GET /api/version（登录门 footer 展示）；§1.1 认证例外更新；§3.13 health 的 version 改随 flamingoAgents/version.py 变化。
 
 ---
 
@@ -42,7 +43,7 @@
 ### 1.1 基础
 
 - Base URL：`http://{host}:{port}`（默认 `8787`，局域网部署），前后端同源，无 CORS；
-- 静态页面 `/`、`/static/*` 不鉴权；**`/api/*` 全部需要认证**（唯一例外：`POST /api/auth/login`）；
+- 静态页面 `/`、`/static/*` 不鉴权；**`/api/*` 全部需要认证**（例外：`POST /api/auth/login`、`GET /api/version`（v1.29 起））；
 - 认证头：`Authorization: Bearer <token>`（token 由用户启动服务时通过 `FLAMINGO_WEB_TOKEN` 设置）；
 - 请求/响应均为 `application/json; charset=utf-8`；SSE 接口响应为 `text/event-stream`；
 - 时间戳：ISO 8601 UTC 字符串（与 jsonl 日志一致），如 `2026-08-05T02:17:55.158614+00:00`；
@@ -384,7 +385,7 @@
 
 ### 3.13 GET /api/health —— 探活
 
-- 200：`{ "ok": true, "version": "0.1.0" }`（需认证）。
+- 200：`{ "ok": true, "version": "<当前版本>" }`（需认证；`version` 随 `flamingoAgents/version.py` 的 `__version__` 变化）。
 
 ### 3.14 GET /api/sessions/{sessionId}/status —— 会话状态栏聚合（v1.3 新增，v1.5 口径修订）
 
@@ -683,6 +684,11 @@
 `source`：ChatGPT 在线目录为 `live-account-catalog`，xAI 在线交集为 `live-catalog-match`，网络/5xx 离线候选为 `local-fallback`；兼容旧响应保留 `local-only` 展示。`local-fallback/local-only` 固定 `autoApplicable=false`，前端必须显式确认。OpenAI 过滤原因包括 `hidden_by_provider`、`missing_model_metadata`、`unsupported_input_modality`。`cost=0` 仅表示不做订阅按 Token 成本估算。
 
 结构化失败：未登录/需重登/账户变化为 409，限流为 429，其余上游安全错误为 502；JSON 为 `{"error":"安全消息","code":"枚举值","retryAfter":17}`。任何成功/失败响应均不得出现 OAuth Token、Authorization 或原始上游响应体。
+
+### 3.29 GET /api/version —— 版本号（v1.29 新增）
+
+- **免认证**（登录门 footer 展示需要；仅返回版本号，无敏感信息）；
+- 200：`{ "ok": true, "version": "0.1.0" }`（示例值；`version` 随 `flamingoAgents/version.py` 的 `__version__` 变化，升版后自动更新，勿以示例字面量为契约）。
 
 ## 4. SSE 流式接口
 

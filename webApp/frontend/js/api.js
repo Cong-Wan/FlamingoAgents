@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.10
-Date: 2026-09-21
-Description: Authenticated fetch wrapper for Web APIs. v1.10 getUsage 只请求 period 单一统计接口，删除 series，并支持 AbortController。
+Version: 1.11
+Date: 2026-09-23
+Description: Authenticated fetch wrapper for Web APIs. v1.10 getUsage 只请求 period 单一统计接口，删除 series，并支持 AbortController。v1.11（versionDisplayPlan §4.4）：新增免认证 getVersion（登录门 footer 也要显示）。
 */
 (function () {
   'use strict';
@@ -66,6 +66,13 @@ Description: Authenticated fetch wrapper for Web APIs. v1.10 getUsage 只请求 
       });
       if (!resp.ok) throw buildError(resp.status, await parseErrorBody(resp));
       return true;
+    },
+
+    // 版本号（免认证：登录门也要显示，webApiSpec v1.29 §3.29）
+    getVersion: async function () {
+      var resp = await fetch('/api/version', { headers: { 'Accept': 'application/json' } });
+      if (!resp.ok) throw buildError(resp.status, await parseErrorBody(resp));
+      return resp.json();
     },
 
     getSessions: function () { return request('/api/sessions'); },
