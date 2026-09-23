@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.12
-Date: 2026-09-08
-Description: Model editor with independent subscription discovery, non-overwrite guarded merge, account-epoch flights, and per-open revision commits. v1.10 presents live ChatGPT Codex model sync and OpenAI catalog filtering reports. v1.11 image 勾选说明为「支持图片输入」。v1.12（configHomePlan P4）：保存提示改为 ~/.flamingo/config/models.yaml。
+Version: 1.13
+Date: 2026-09-23
+Description: Model editor with independent subscription discovery, non-overwrite guarded merge, account-epoch flights, and per-open revision commits. v1.10 presents live ChatGPT Codex model sync and OpenAI catalog filtering reports. v1.11 image 勾选说明为「支持图片输入」。v1.12（configHomePlan P4）：保存提示改为 ~/.flamingo/config/models.yaml。v1.13 思考强度下拉框补充 xhigh 档位。
 */
 (function () {
   'use strict';
@@ -732,7 +732,7 @@ Description: Model editor with independent subscription discovery, non-overwrite
     body.appendChild(makeField('maxTokens', makeTextInput(model.maxTokens || 0, function (v) { model.maxTokens = Number(v); }, true)));
 
     // 思考强度：仅编辑 reasoningEffort；reasoning/thinking 保留工作副本原值但不暴露控件
-    var effortPairs = [['', '（缺省）'], ['low', 'low'], ['medium', 'medium'], ['high', 'high'], ['max', 'max']];
+    var effortPairs = [['', '（缺省）'], ['low', 'low'], ['medium', 'medium'], ['high', 'high'], ['xhigh', 'xhigh'], ['max', 'max']];
     var effortValue = model.reasoningEffort || '';
     var known = effortPairs.some(function (pair) { return pair[0] === effortValue; });
     if (effortValue && !known) effortPairs.push([effortValue, effortValue]);
