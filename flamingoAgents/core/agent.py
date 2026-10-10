@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.25
-Date: 2026-09-21
-Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.25 每个物理 attempt 在请求前生成 usageKey，合法 terminal usage 先写 JSONL usageRecord 再幂等落入统一账本。
+Version: 1.26
+Date: 2026-10-10
+Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.25 每个物理 attempt 在请求前生成 usageKey，合法 terminal usage 先写 JSONL usageRecord 再幂等落入统一账本。v1.26（stopDrain409FixPlan T4/T5）：executeConcurrentSegment 停止时取消未开始 future，已开始 worker 有界 join（STOP_JOIN_BUDGET_SECONDS）；预算耗尽保持 draining 并记 stopJoinOverrun，不提前 shutdown/finishStream；executeToolCall 把会话 logger 注入 toolContext；固化每 call 唯一终态结果语义。
 '''
 
 from __future__ import annotations
@@ -63,6 +63,7 @@ MODEL_RETRY_BACKOFF_BASE_SECONDS = 1.0
 MODEL_RETRY_BACKOFF_MAX_SECONDS = 8.0
 MODEL_RETRY_RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
 MODEL_RETRYABLE_STATUS_CODES = MODEL_RETRY_RETRYABLE_STATUS_CODES
+STOP_JOIN_BUDGET_SECONDS = 2.0      # 停止后已开始 worker 的有界 join 预算；超预算只记诊断，不提前释放会话（T4）
 CANCELLED_TOOL_CONTENTS = {
     'userStopped': '该工具调用因用户停止未完成；停止前可能已产生文件或命令副作用。',
     'crashRecovered': '会话恢复时发现该工具调用未完成；为避免重复副作用未重新执行，停止前可能已产生文件或命令副作用。',
@@ -774,11 +775,19 @@ class agent:
         activeEvent = interruptEvent
         if activeEvent is None and sessionId:
             activeEvent = self.getActiveRunEvent(sessionId)
+        logger = None
+        if sessionId:
+            # 停止诊断写会话 jsonl（T3）；不触发建 conversation，无缓存时静默。
+            with self.sessionLocksGuard:
+                currentConversation = self.conversations.get(sessionId)
+            if currentConversation is not None:
+                logger = currentConversation.logger
         context = toolContext(
             workDir=self.workDir,
             debugConsole=self.debugConsole,
             interruptEvent=activeEvent,
             sessionId=sessionId,
+            logger=logger,
         )
         return executeCallableToolCall(definition, call, context)
 
@@ -981,12 +990,17 @@ class agent:
         sessionId: str,
         runEvent: threading.Event,
     ) -> bool:
+        # T4：停止时先 cancel 未开始 future，已开始 worker 依赖工具侧杀组返回；协调线程有界 join
+        # （STOP_JOIN_BUDGET_SECONDS）。预算耗尽仍有未结束 worker：不提前 shutdown/finishStream、
+        # 不放新轮进入，继续按现有语义等待并记 stopJoinOverrun——会话保持 draining。
         executor = ThreadPoolExecutor(
             max_workers=min(self.maxParallelTools, len(entries)),
             thread_name_prefix='flamingoTool',
         )
         futures = {}
         interrupted = False
+        joinDeadline: float | None = None
+        overrunLogged = False
         try:
             for entry in entries:
                 if runEvent.is_set():
@@ -1004,6 +1018,11 @@ class agent:
                     for future in pending:
                         future.cancel()
                     interrupted = True
+                    if joinDeadline is None:
+                        joinDeadline = time.monotonic() + STOP_JOIN_BUDGET_SECONDS
+                    if not overrunLogged and time.monotonic() >= joinDeadline:
+                        overrunLogged = True
+                        self.logStopJoinOverrun(sessionId, pending)
             return interrupted or runEvent.is_set()
         finally:
             for future in futures:
@@ -1017,6 +1036,31 @@ class agent:
                         raise
                     except Exception:
                         pass
+
+    def logRunDiagnostic(self, sessionId: str, eventType: str, fields: dict[str, Any] | None = None) -> None:
+        # 停止路径诊断只写会话 jsonl，不进入模型上下文；不触发建 conversation，无缓存时静默。
+        with self.sessionLocksGuard:
+            currentConversation = self.conversations.get(sessionId)
+        if currentConversation is None:
+            return
+        event: dict[str, Any] = {'type': eventType, 'sessionId': sessionId}
+        event.update(fields or {})
+        try:
+            currentConversation.logger.logEvent(event)
+        except Exception:
+            pass
+
+    def logStopJoinOverrun(self, sessionId: str, pending) -> None:
+        pendingCount = len(pending)
+        if self.debugConsole:
+            self.debugConsole.debug(
+                f'并行池停止 join 超预算 sessionId={sessionId} pendingCount={pendingCount} '
+                f'budgetSeconds={STOP_JOIN_BUDGET_SECONDS}'
+            )
+        self.logRunDiagnostic(sessionId, 'stopJoinOverrun', {
+            'pendingCount': pendingCount,
+            'budgetSeconds': STOP_JOIN_BUDGET_SECONDS,
+        })
 
     def persistLedgerEntries(
         self,
@@ -1080,6 +1124,9 @@ class agent:
         ledger: toolBatchLedger,
         reason: str,
     ) -> list[toolResult]:
+        # T5 唯一终结点：每个 call 只落一条最终结果——工具返回的真实 result 优先；未返回（杀组抛
+        # modelInterruptedError / 异常 / 被丢弃）才补唯一 cancelled/stopped。已 persisted 的不再写；
+        # 协调线程在池预算耗尽时仍等待 worker 返回，不会在工具返回前抢写 cancelled。
         prefixLen = self.assertClosedPrefix(currentConversation, ledger.toolCalls)
         if prefixLen < ledger.startIndex:
             raise conversationIntegrityError(

@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.29
-> Date: 2026-09-23
+> Version: 1.30
+> Date: 2026-10-10
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 9 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -35,6 +35,7 @@
 > v1.27：UI stopped 与 Core draining 分离；同会话新请求在 Core 未退出前最多等 2s，超时 409；attach 在 draining 时可回放 stopped history。
 > v1.28：用量统计改为单一 `GET /api/usage?period=` 账本快照（usageEvents）；删除 `/api/usage/series` 与会话明细；状态栏费用改读已落账记录；删除会话前必须 drain usageRecord。
 > v1.29：版本号单一数据源（docs/plan/260923_versionDisplayPlan.md）——新增免认证 §3.29 GET /api/version（登录门 footer 展示）；§1.1 认证例外更新；§3.13 health 的 version 改随 flamingoAgents/version.py 变化。
+> v1.30（stopDrain409FixPlan T6/T8）：新增 §3.30 只读 stream-state 探针；§4.4 补手动终止的进程组边界（只杀本轮 start_new_session 组，A/B 类存活、C 类随杀）与快速返回语义。
 
 ---
 
@@ -690,6 +691,19 @@
 - **免认证**（登录门 footer 展示需要；仅返回版本号，无敏感信息）；
 - 200：`{ "ok": true, "version": "0.1.0" }`（示例值；`version` 随 `flamingoAgents/version.py` 的 `__version__` 变化，升版后自动更新，勿以示例字面量为契约）。
 
+### 3.30 GET /api/sessions/{sessionId}/stream-state —— 只读收尾探针（v1.30 新增，stopDrain409FixPlan T6）
+
+- 鉴权同其余 `/api/*`；sessionId 非法 → 400，会话不存在 → 404；
+- 200：
+
+```json
+{ "state": "idle", "canAcceptMessage": true }
+```
+
+- `state`：`idle`（无当前泵、`finishStream` 已完成，可新开同会话流）/ `active`（本轮仍在跑，未点停止）/ `draining`（已停止或已终态，Core/worker 仍在收尾，同会话新流仍 409）；
+- `canAcceptMessage`：仅 `idle` 为 true；
+- **只读**：`managerLock` 内判定 `activeStreams`，不创建 Agent、不读写 JSONL、不返回 PID/命令行；旧 `GET .../status` 行为不变。前端停止后以此探针为依据重发排队消息，不再盲重试。
+
 ## 4. SSE 流式接口
 
 ### 4.1 POST /api/chat/stream —— 发起对话
@@ -767,7 +781,8 @@
 
 - 200：`{ "stopped": true }`（置停止标志成功）或 `{ "stopped": false }`（该会话无活跃流，幂等不报错）；
 - 404：会话不存在；
-- **语义（webAppPlan §4.3-H1）**：UI 可即时收成 `errorType: "stopped"`。Core 会等已启动工具线程静止、transcript 闭合后再释放占用；不协作的自定义工具无法硬杀，期间同会话新请求可能短暂 409；
+- **语义（webAppPlan §4.3-H1）**：UI 可即时收成 `errorType: "stopped"`。Core 会等已启动工具线程静止、transcript 闭合后再释放占用；不协作的自定义工具无法硬杀，期间同会话新请求可能短暂 409；新客户端应改用 §3.30 `stream-state` 探测 `idle` 后再发送。
+- **手动终止快速返回（v1.30，stopDrain409FixPlan T1-T3）**：对当前 `bash`/`askSubAgent` 立即 SIGTERM 本轮进程组 → 短 grace（0.3s）→ SIGKILL，再有界等待 poll()/EOF（0.5s）后返回中断；**只针对本轮 `start_new_session` 进程组**——A 类（更早轮次遗留进程）与 B 类（`setsid` 等另开会话的守护进程）存活，C 类（本轮 `&` 后台子孙）随本轮被杀；正常工具 timeout（未手动终止）语义不变。
 - **本地 abort ≠ 持久化完成（v1.19）**：本窗口 `abort()` 会使 SSE `done` 先于 `_recordUsage` resolve；前端须把 stop POST Promise 挂在本流上，UI 立即收口，权威 status GET 等 POST 完成尝试后再发（失败仍允许 best-effort GET，不宣称落账成功）；
 - **stopped 广播（v1.7）**：停止生效时泵向**所有订阅者**广播 `error` 帧（`errorType: "stopped"`）作为终态——停止发起方处于「停止中」态仅记录终态；其他 attach 窗口按「已中断」标记 + 静默回空闲处理。
 

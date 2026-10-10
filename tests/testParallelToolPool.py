@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-09-21
-Description: Parallel tool pool configuration, barrier concurrency, batch ledger close, run event, confirmation, and Web draining tests.
+Version: 1.1
+Date: 2026-10-10
+Description: Parallel tool pool configuration, barrier concurrency, batch ledger close, run event, confirmation, and Web draining tests. v1.1（stopDrain409FixPlan T4-T6）：停止时并行池有界 join、超预算保持 draining 且不抢写 cancelled（stopJoinOverrun）；每 call 唯一终态结果；stream-state 探针 idle/active/draining 与只读路由。
 '''
 
 from __future__ import annotations
@@ -1148,3 +1148,129 @@ def testGateTimeoutThenRetry(tmp_path, isolatedManager, monkeypatch):
     release.set()
     assert pump.coreDoneEvent.wait(timeout=2)
     assert agentManager.waitForCoreIdle(sessionId, timeout=1) == 'idle'
+
+
+class hangingStream:
+    def __init__(self):
+        self.release = threading.Event()
+
+    def __iter__(self):
+        if False:
+            yield None
+        self.release.wait(timeout=5)
+
+    def close(self):
+        pass
+
+
+class inertAgent:
+    def __init__(self):
+        self.sessionLocksGuard = threading.RLock()
+        self.conversations = {}
+        self.modelAdapter = scriptedAdapter([])
+
+    def interruptActiveStreams(self, _sessionId):
+        pass
+
+
+def testStreamStateIdleActiveDraining(tmp_path, isolatedManager):
+    # T6：idle 只在无当前 pump 时返回；有活跃流 active，停止后 draining；finishStream 后回 idle。
+    sessionId = 'sess-state'
+    writeSession(sessionId, tmp_path)
+    assert agentManager.getStreamState(sessionId) == {'state': 'idle', 'canAcceptMessage': True}
+    stream = hangingStream()
+    pump = agentManager.startStream(sessionId, inertAgent(), stream)
+    assert pump is not None
+    assert agentManager.getStreamState(sessionId) == {'state': 'active', 'canAcceptMessage': False}
+    assert agentManager.requestStop(sessionId) is True
+    assert agentManager.getStreamState(sessionId) == {'state': 'draining', 'canAcceptMessage': False}
+    assert agentManager.waitForCoreIdle(sessionId, timeout=0.05) == 'timeout'
+    stream.release.set()
+    assert pump.coreDoneEvent.wait(timeout=2)
+    pump.thread.join(timeout=2)
+    assert agentManager.getStreamState(sessionId) == {'state': 'idle', 'canAcceptMessage': True}
+
+
+def testStreamStateRouteIsReadOnly(tmp_path, isolatedManager, monkeypatch):
+    # T6：路由鉴权、只读；不建 Agent、不写会话 JSONL。
+    from fastapi.testclient import TestClient
+
+    from webApp.backend import auth, server
+
+    sessionId = 'sess-route'
+    writeSession(sessionId, tmp_path)
+    monkeypatch.setattr(auth, 'serverToken', 'state-test-token')
+    headers = {'Authorization': 'Bearer state-test-token'}
+    with TestClient(server.app) as client:
+        unauthorized = client.get(f'/api/sessions/{sessionId}/stream-state')
+        assert unauthorized.status_code == 401
+        response = client.get(f'/api/sessions/{sessionId}/stream-state', headers=headers)
+    assert response.status_code == 200
+    assert response.json() == {'state': 'idle', 'canAcceptMessage': True}
+    assert sessionId not in agentManager.agentCache
+    assert not (tmp_path / f'{sessionId}.jsonl').exists()
+
+
+def testStopJoinOverrunKeepsDrainingAndUniqueResults(tmp_path, isolatedManager):
+    # T4/T5：不协作池内 worker 停不下来时，有界 join 超预算只记诊断，不提前释放也不抢写 cancelled；
+    # release 后每个 call 恰好一条真实结果。
+    sessionId = 'sess-overrun'
+    writeSession(sessionId, tmp_path)
+    bothStarted = threading.Event()
+    release = threading.Event()
+    startLock = threading.Lock()
+    startCount = {'value': 0}
+
+    def execute(args, ctx):
+        with startLock:
+            startCount['value'] += 1
+            if startCount['value'] >= 2:
+                bothStarted.set()
+        # 不协作：不看 ctx.interruptEvent，只有 release 才能返回
+        release.wait(timeout=8)
+        return toolOutput(content=f'late-{args["name"]}')
+
+    tool = defineTool(
+        name='slow',
+        description='slow',
+        parameters={'type': 'object', 'properties': {'name': {'type': 'string'}}},
+        execute=execute,
+    )
+    current = makeAgent(
+        tmp_path,
+        [toolTurn([makeCall('c1'), makeCall('c2')]), textTurn()],
+        tools=[tool],
+        poolNames=['slow'],
+    )
+    agentManager.agentCache[sessionId] = current
+    pump = agentManager.startStream(sessionId, current, current.runUserMessageStream('hello', sessionId))
+    assert pump is not None
+    try:
+        assert bothStarted.wait(timeout=2)
+        assert agentManager.requestStop(sessionId) is True
+        assert pump.doneEvent.wait(timeout=2)
+        overrunSeen = False
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline and not overrunSeen:
+            events = jsonlLog(tmp_path / f'{sessionId}.jsonl').readEvents()
+            overrunSeen = any(event.get('type') == 'stopJoinOverrun' for event in events)
+            if not overrunSeen:
+                time.sleep(0.1)
+        assert overrunSeen, '预算耗尽应落 stopJoinOverrun 诊断'
+        assert not pump.coreDoneEvent.is_set()
+        assert agentManager.hasActiveStream(sessionId)
+        assert agentManager.waitForCoreIdle(sessionId, timeout=0.05) == 'timeout'
+        assert agentManager.getStreamState(sessionId) == {'state': 'draining', 'canAcceptMessage': False}
+        events = jsonlLog(tmp_path / f'{sessionId}.jsonl').readEvents()
+        assert all(event.get('type') != 'toolResult' for event in events)
+    finally:
+        release.set()
+    assert pump.coreDoneEvent.wait(timeout=3)
+    pump.thread.join(timeout=2)
+    assert not agentManager.hasActiveStream(sessionId)
+    assert agentManager.getStreamState(sessionId) == {'state': 'idle', 'canAcceptMessage': True}
+    mapping = resultMap(tmp_path, sessionId)
+    assert set(mapping) == {'c1', 'c2'}
+    for entries in mapping.values():
+        assert len(entries) == 1
+        assert entries[0].get('details', {}).get('cancelled') is not True

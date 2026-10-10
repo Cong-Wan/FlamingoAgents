@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.24
-Date: 2026-09-15
+Version: 1.25
+Date: 2026-10-10
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
@@ -50,6 +50,9 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              v1.22（fileMentionPathOnlyPlan）：当轮附件 chip tooltip 标明仅路径引用。
              v1.23（imageInputPlan）：发送/历史/attach 渲染用户图片；失败恢复图片草稿。
              v1.24（chatUxImprovePlan）：助手文字复制；历史 kind=error 红块；↑ 召回气泡原文（send push + reloadSession 灌入，不进 renderHistory）。
+             v1.25（stopDrain409FixPlan T7）：停止后 per-session FIFO 收尾队列（pendingSend/pendingConfirm，confirm 优先）；
+             stream-state idle 探针后才发送，409 只在未接受时 300/600/1200ms 有限退避；切会话分桶、刷新不静默重放；
+             stopped 广播不再直接推断 idle。
 */
 (function () {
   'use strict';
@@ -985,6 +988,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       if (stoppedStream && stoppedStream.currentStep) renderFinal(stoppedStream.currentStep);
       markInterrupted();
       goIdle();
+      markSessionDraining(sessionId); // stopped 只是 UI 终态：可否发送以 stream-state 为准，不直接推断 idle
       return;
     }
     if (data.errorType === 'pendingConfirmationExists') {
@@ -1116,22 +1120,165 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     focusComposerIfReady();
   }
 
-  var lastUserSend = null; // { text, attachments }：409 静默重试用，避免 composer 已清空导致 send() 空转
+  var lastUserSend = null; // { sessionId, text, attachments, images }：409 收尾队列重试/400 恢复草稿用
+
+  /* ---------- 停止收尾队列（stopDrain409FixPlan T7） ---------- */
+
+  // 点击停止后 UI 立即空闲，但后端 Core 可能仍在 draining。本地已知收尾时 send/confirm 先入
+  // per-session FIFO，经 GET stream-state 探到 idle 后 confirm 优先、send 每条只发一次；
+  // 409 仅当 payload 从未被接受时按 300/600/1200ms 有限退避。队列仅在内存：刷新即丢弃，不静默重放。
+  var DRAIN_PROBE_INTERVAL_MS = 300;
+  var DRAIN_RETRY_BACKOFF_MS = [300, 600, 1200];
+  var DRAIN_MAX_SEND_ATTEMPTS = 3;
+  var drainQueues = {}; // sessionId -> { draining, probing, probeDelayMs, sends: [{payload, attempt}], confirm }
+
+  function drainQueueFor(sessionId) {
+    if (!drainQueues[sessionId]) {
+      drainQueues[sessionId] = { draining: false, probing: false, probeDelayMs: 0, sends: [], confirm: null };
+    }
+    return drainQueues[sessionId];
+  }
+
+  function markSessionDraining(sessionId) {
+    if (!sessionId) return;
+    drainQueueFor(sessionId).draining = true;
+  }
+
+  function isSessionDraining(sessionId) {
+    var queue = drainQueues[sessionId];
+    return !!(queue && queue.draining);
+  }
+
+  function drainQueueHasWork(sessionId) {
+    var queue = drainQueues[sessionId];
+    return !!(queue && (queue.sends.length > 0 || queue.confirm));
+  }
+
+  function scheduleDrainProbe(sessionId) {
+    var queue = drainQueueFor(sessionId);
+    if (queue.probing || !drainQueueHasWork(sessionId)) return;
+    if (sessionId !== window.appStore.currentSessionId) return; // 切走的会话不代发，open() 时重新武装
+    queue.probing = true;
+    var delay = queue.probeDelayMs > 0 ? queue.probeDelayMs : 0;
+    queue.probeDelayMs = 0;
+    window.setTimeout(function () { probeDrainState(sessionId); }, delay);
+  }
+
+  function probeDrainState(sessionId) {
+    var queue = drainQueueFor(sessionId);
+    if (!drainQueueHasWork(sessionId) || sessionId !== window.appStore.currentSessionId) {
+      queue.probing = false;
+      return;
+    }
+    var probe;
+    try {
+      probe = window.api.getStreamState(sessionId);
+    } catch (error) {
+      probe = Promise.reject(error);
+    }
+    Promise.resolve(probe).then(function (state) {
+      queue.probing = false;
+      if (!drainQueueHasWork(sessionId) || sessionId !== window.appStore.currentSessionId) return;
+      var canFlush = window.appStore.stream === null
+        || !!(queue.confirm && window.appStore.stream.phase === 'waitingConfirm');
+      if (state && state.state === 'idle' && canFlush) {
+        flushDrainQueue(sessionId);
+        return;
+      }
+      window.setTimeout(function () { scheduleDrainProbe(sessionId); }, DRAIN_PROBE_INTERVAL_MS);
+    }).catch(function (error) {
+      queue.probing = false;
+      if (error && error.status === 404) { // 会话已不存在：丢弃 pending，不重放
+        queue.sends = [];
+        queue.confirm = null;
+        queue.draining = false;
+        return;
+      }
+      window.setTimeout(function () { scheduleDrainProbe(sessionId); }, DRAIN_PROBE_INTERVAL_MS);
+    });
+  }
+
+  // idle 确认后：先校验 pendingConfirm（失效则丢弃并提示），再从队首取一条 send 发出（每次只发一条）。
+  function flushDrainQueue(sessionId) {
+    var queue = drainQueueFor(sessionId);
+    if (sessionId !== window.appStore.currentSessionId) return;
+    var confirmReady = !!(queue.confirm && window.appStore.stream && window.appStore.stream.phase === 'waitingConfirm');
+    if (window.appStore.stream !== null && !confirmReady) return;
+    if (queue.confirm) {
+      var confirmItem = queue.confirm;
+      queue.confirm = null;
+      window.api.getPending(sessionId).then(function (res) {
+        if (res && res.pending && res.pending.confirmationId === confirmItem.confirmationId) {
+          performQueuedConfirm(sessionId, confirmItem);
+        } else {
+          // 确认已失效：丢弃并提示，回空闲让后续队列 send 继续。
+          hideConfirmModal();
+          goIdle();
+          if (window.toast) window.toast('确认已失效，未发送');
+          scheduleDrainProbe(sessionId);
+        }
+      }).catch(function () {
+        hideConfirmModal();
+        goIdle();
+        if (window.toast) window.toast('确认校验失败，未发送');
+        scheduleDrainProbe(sessionId);
+      });
+      return;
+    }
+    if (queue.sends.length > 0) {
+      var item = queue.sends.shift();
+      if (queue.sends.length === 0 && !queue.confirm) queue.draining = false;
+      send({ retry: true, payload: item.payload, attempt: item.attempt });
+      scheduleDrainProbe(sessionId); // 若仍有排队项，等本轮流结束后继续
+      return;
+    }
+    queue.draining = false;
+  }
+
+  function performQueuedConfirm(sessionId, item) {
+    if (sessionId !== window.appStore.currentSessionId) return;
+    var stream = window.appStore.stream;
+    if (!stream || stream.phase !== 'waitingConfirm' || !stream.pending
+        || stream.pending.confirmationId !== item.confirmationId) {
+      if (window.toast) window.toast('确认已失效，未发送');
+      scheduleDrainProbe(sessionId);
+      return;
+    }
+    startConfirmStream(stream, item.approved);
+    scheduleDrainProbe(sessionId);
+  }
+
+  function enqueueDrainSend(sessionId, payload) {
+    var queue = drainQueueFor(sessionId);
+    queue.sends.push({ payload: payload, attempt: 0 });
+    markSessionDraining(sessionId);
+    if (window.toast) window.toast('上一轮正在收尾，随后发送');
+    scheduleDrainProbe(sessionId);
+  }
 
   function onStreamFailed(error, meta) {
-    // REST 预检失败（400/404/409，未开流）：回空闲态；待确认场景可重进会话经 GET pending 自愈
-    // G4：send 撞 409「活跃流」时 goIdle 后静默重试一次（仅当无新流抢占；confirm 不走此分支）。
+    // REST 预检失败（400/404/409，未开流）：回空闲态；待确认场景可重进会话经 GET pending 自愈。
+    // T7：409 只在 payload 从未被接受时重试——回 per-session 队列，stream-state 探针 + 300/600/1200ms
+    // 有限退避，最多 3 次；不并发、不重放已成功请求。confirm 不走此分支。
     meta = meta || {};
-    if (meta.fromSend && !meta.isRetry && error && error.status === 409 && String(error.message || '').indexOf('活跃流') !== -1) {
+    if (meta.fromSend && error && error.status === 409) {
+      var failedSessionId = window.appStore.currentSessionId;
       var failedStream = window.appStore.stream;
       if (failedStream && failedStream.currentStep && failedStream.currentStep.live && failedStream.currentStep.live.rowEl) {
         failedStream.currentStep.live.rowEl.remove();
       }
       goIdle();
-      if (window.appStore.stream === null && lastUserSend) {
-        var retryPayload = lastUserSend;
-        setTimeout(function () { send({ retry: true, payload: retryPayload }); }, 600);
-        return;
+      var retryPayload = lastUserSend;
+      if (retryPayload && retryPayload.sessionId === failedSessionId) {
+        var nextAttempt = (meta.attempt || 0) + 1;
+        if (nextAttempt <= DRAIN_MAX_SEND_ATTEMPTS) {
+          var queue = drainQueueFor(failedSessionId);
+          queue.sends.unshift({ payload: retryPayload, attempt: nextAttempt });
+          markSessionDraining(failedSessionId);
+          queue.probeDelayMs = DRAIN_RETRY_BACKOFF_MS[nextAttempt - 1] || DRAIN_PROBE_INTERVAL_MS;
+          scheduleDrainProbe(failedSessionId);
+          return;
+        }
       }
     }
     if (meta.fromSend && (error.status === 400 || error.status === 413) && lastUserSend
@@ -1222,11 +1369,15 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var text;
     var attachments;
     var imagePayload = [];
+    var streamAttempt = 0;
     if (isRetry) {
       if (window.appStore.stream !== null) return;
+      if (options.payload.sessionId && options.payload.sessionId !== sessionId) return; // 切会话后不代发旧队列
       text = options.payload.text;
       attachments = options.payload.attachments || [];
       imagePayload = options.payload.images || [];
+      streamAttempt = options.attempt || 0;
+      lastUserSend = options.payload;
     } else {
       if (sendButton.disabled) return; // await 期间挡双击/连按 Enter
       var chip = window.skillChip && window.skillChip.get();
@@ -1303,6 +1454,13 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       text = wireText;
     }
 
+    if (!isRetry && isSessionDraining(sessionId)) {
+      // 上一轮仍在收尾：不直接 POST，入 per-session FIFO，等 stream-state idle 后只发一次。
+      enqueueDrainSend(sessionId, lastUserSend);
+      updateComposer();
+      return;
+    }
+
     var step = createStep();
     var streamState = {
       phase: 'streaming',
@@ -1326,7 +1484,11 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     handle.done.then(function () {
       onStreamClosed(sessionId, streamState, connectionId);
     }).catch(function (error) {
-      onBoundFailed(sessionId, streamState, connectionId, error, { fromSend: true, isRetry: isRetry });
+      onBoundFailed(sessionId, streamState, connectionId, error, {
+        fromSend: true,
+        isRetry: isRetry,
+        attempt: streamAttempt
+      });
     });
   }
 
@@ -1334,9 +1496,21 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var sessionId = window.appStore.currentSessionId;
     var stream = window.appStore.stream;
     if (!sessionId || !stream || stream.phase !== 'waitingConfirm' || !stream.pending) return;
-    var pending = stream.pending;
+    if (isSessionDraining(sessionId)) {
+      // 收尾窗口内排队（T7）：pendingConfirm 先于队列 send；idle 后先校验 pending 再续跑。
+      hideConfirmModal();
+      drainQueueFor(sessionId).confirm = { confirmationId: stream.pending.confirmationId, approved: approved };
+      if (window.toast) window.toast('上一轮正在收尾，随后处理确认');
+      scheduleDrainProbe(sessionId);
+      return;
+    }
     hideConfirmModal();
+    startConfirmStream(stream, approved);
+  }
 
+  function startConfirmStream(stream, approved) {
+    var sessionId = window.appStore.currentSessionId;
+    var pending = stream.pending;
     // [待确认] --批准/拒绝 POST confirm--> [流式中]（续流渲染进同一 assistant 块）
     stream.phase = 'streaming';
     stream.terminalSeen = false;
@@ -1368,6 +1542,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var stream = window.appStore.stream;
     if (!sessionId || !stream || stream.phase !== 'streaming') return;
     stream.phase = 'stopping';
+    markSessionDraining(sessionId); // UI 已是 stopping，但后端可能仍在 draining：下一次 send 走 stream-state 探针
     if (stream.currentStep) {
       flushLivePaint(stream.currentStep); // 进 stopping 前 buffer 强制上屏（D4 清单 3）
       renderFinal(stream.currentStep);
@@ -1500,6 +1675,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       window.fileExplorer.open();
       try {
         await reloadSession(sessionId);
+        scheduleDrainProbe(sessionId); // 该会话有未发完的收尾队列时，回来继续探测
         if (!window.appStore.stream) updateComposer();
         window.statusBar.refresh();
       } catch (error) {

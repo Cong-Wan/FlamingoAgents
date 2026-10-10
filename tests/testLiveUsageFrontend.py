@@ -1,8 +1,9 @@
 '''
 Author: wilbur
-Version: 1.6
-Date: 2026-09-23
+Version: 1.7
+Date: 2026-10-10
 Description: Node assert coverage for statusUsage helpers and statusBar/chatView deferred races. v1.6 同步 styles cache-bust 到 1.27（版本号功能）。
+  v1.7（stopDrain409FixPlan T7）：chatView 收尾队列/stream-state 探针/409 有限退避用例；cache-bust 同步 chatView v1.25。
 '''
 
 from __future__ import annotations
@@ -589,8 +590,12 @@ sandbox.appStore = { currentSessionId: null, stream: null, sessions: [], findSes
 const posts = [];
 const refreshes = [];
 const applies = [];
+const toasts = [];
 let stopDeferred = null;
 let stopCalls = 0;
+let pendingResponse = { pending: null };
+let streamStateResponse = { state: 'idle', canAcceptMessage: true };
+const streamStateCalls = [];
 sandbox.sse = {
   streamPost(path, body, onEvent) {
     const d = deferred();
@@ -607,9 +612,11 @@ sandbox.api = {
     return stopDeferred.promise;
   },
   getMessages() { return Promise.resolve({ messages: [] }); },
-  getPending() { return Promise.resolve({ pending: null }); },
+  getPending() { return Promise.resolve(pendingResponse); },
+  getStreamState(sessionId) { streamStateCalls.push(sessionId); return Promise.resolve(streamStateResponse); },
   getSessionStatus() { return Promise.resolve({}); }
 };
+sandbox.toast = function (message) { toasts.push(message); };
 sandbox.statusBar = {
   applyUsageUpdate(data) { applies.push(data); },
   resetForSession(id) { this._session = id; },
@@ -858,7 +865,7 @@ assert.strictEqual(sandbox.appStore.currentSessionId, 'sA');
 assert.strictEqual(sandbox.appStore.stream.connectionId, connA2);
 assert.strictEqual(sandbox.appStore.stream.phase, 'attaching');
 
-// send 409 meta retry still happens once.
+// send 409 meta retry is bounded: requeued into per-session drain queue, flushed once after idle.
 sandbox.chatView.close();
 sandbox.appStore.currentSessionId = 's1';
 const streamPostsBefore409 = posts.filter(p => p.path === '/api/chat/stream').length;
@@ -873,6 +880,7 @@ await flushN(5);
 const streamPosts = posts.filter(p => p.path === '/api/chat/stream');
 assert.strictEqual(streamPosts.length, streamPostsBefore409 + 2, '409 retries send exactly once');
 assert.strictEqual(lastPost().path, '/api/chat/stream');
+assert.strictEqual(lastPost().body.message, 'conflict');
 assert.ok(sandbox.appStore.stream);
 
 // natural completed vs no-terminal disconnect independently counted.
@@ -902,11 +910,185 @@ console.log('chatView connection: ok');
     runNode(script, [str(rootPath / 'webApp/frontend/js/chatView.js')])
 
 
+drainQueueHarness = nodeHarness + r'''
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+const ids = baseIds();
+const sandbox = {
+  console, setTimeout, clearTimeout, Promise, JSON, Math, Number, Object, Array, String, Boolean, Date, Error,
+  requestAnimationFrame: (cb) => setTimeout(cb, 0)
+};
+sandbox.window = sandbox;
+sandbox.globalThis = sandbox;
+sandbox.document = makeDocument(ids);
+sandbox.appStore = { currentSessionId: 's1', stream: null, sessions: [], findSession() { return { title: 't', providerId: 'p', modelId: 'm' }; } };
+const posts = [];
+const toasts = [];
+const streamStateCalls = [];
+let stopDeferred = null;
+let streamStateResponse = { state: 'draining', canAcceptMessage: false };
+let pendingResponse = { pending: null };
+sandbox.sse = {
+  streamPost(path, body, onEvent) {
+    const d = deferred();
+    const rec = { path, body, onEvent, d, aborted: false };
+    rec.abort = function () { rec.aborted = true; d.resolve('aborted'); };
+    posts.push(rec);
+    return { done: d.promise, abort: rec.abort };
+  }
+};
+sandbox.api = {
+  stopChat() { stopDeferred = deferred(); return stopDeferred.promise; },
+  getMessages() { return Promise.resolve({ messages: [] }); },
+  getPending() { return Promise.resolve(pendingResponse); },
+  getStreamState() { streamStateCalls.push(1); return Promise.resolve(streamStateResponse); },
+  getSessionStatus() { return Promise.resolve({}); }
+};
+sandbox.statusBar = { applyUsageUpdate() {}, resetForSession() {}, hide() {}, refresh() { return Promise.resolve(); } };
+sandbox.fileMention = { getAttachments() { return []; }, clearChips() {}, resetForSession() {} };
+sandbox.fileExplorer = { open() {}, hide() {} };
+sandbox.skillChip = { get() { return null; }, clear() {}, pin() {} };
+sandbox.sidebarView = { refresh() { return Promise.resolve(); } };
+sandbox.renderMarkdown = function (el, text) { el.textContent = text; };
+sandbox.toast = function (message) { toasts.push(message); };
+vm.createContext(sandbox);
+function load(path) { vm.runInContext(fs.readFileSync(path, 'utf8'), sandbox, { filename: path }); }
+load(process.argv[1]);
+function flush() { return new Promise(r => setTimeout(r, 0)); }
+async function flushN(n) { for (let i = 0; i < n; i++) await flush(); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function lastPost() { return posts[posts.length - 1]; }
+function streamPosts() { return posts.filter(p => p.path === '/api/chat/stream'); }
+function confirmPosts() { return posts.filter(p => p.path === '/api/chat/confirm'); }
+function attachPosts() { return posts.filter(p => p.path === '/api/chat/attach'); }
+async function clickSend(text) {
+  ids.composerInput.disabled = false;
+  ids.sendButton.disabled = false;
+  ids.composerInput.value = text;
+  ids.sendButton.click();
+  await flushN(5);
+}
+async function establishDraining() {
+  await clickSend('kick');
+  assert.strictEqual(streamPosts().length, 1);
+  ids.sendButton.click();
+  await flushN(5);
+  assert.strictEqual(sandbox.appStore.stream, null);
+  stopDeferred.resolve({ stopped: true });
+  await flushN(5);
+}
+async function openWaitingConfirm(confirmationId) {
+  await sandbox.chatView.open('s1');
+  const attach = attachPosts().pop();
+  attach.onEvent('streamResume', { baseCount: 0 });
+  await flushN(2);
+  attach.onEvent('confirmationRequired', {
+    confirmationId: confirmationId, reason: 'r', commandPreview: 'p',
+    toolCall: { id: 't1', toolName: 'rm', arguments: {} }
+  });
+  await flushN(2);
+  assert.strictEqual(sandbox.appStore.stream.phase, 'waitingConfirm');
+  return attach;
+}
+'''
+
+
+def testChatViewDrainQueueSendsOnceAfterIdle() -> None:
+    script = drainQueueHarness + r'''
+(async function main() {
+  await establishDraining();
+
+  // draining：send 入队，不 POST；提示收尾；跨会话不串不代发
+  const before = streamPosts().length;
+  const probesBeforeQueue = streamStateCalls.length;
+  await clickSend('queued message');
+  await sleep(80); await flushN(5);
+  assert.strictEqual(streamPosts().length, before, 'draining 时不直接 POST');
+  assert.ok(streamStateCalls.length > probesBeforeQueue, 'draining 发送应触发 stream-state 探针');
+  assert.ok(toasts.some(t => t.indexOf('收尾') >= 0), 'draining 时提示收尾');
+  await sleep(500); await flushN(5);
+  assert.strictEqual(streamPosts().length, before, '服务端仍 draining 时不发送');
+
+  sandbox.appStore.currentSessionId = 's2';
+  streamStateResponse = { state: 'idle', canAcceptMessage: true };
+  await sleep(600); await flushN(5);
+  assert.strictEqual(streamPosts().filter(p => p.body.message === 'queued message').length, 0, '切走后不代发');
+
+  sandbox.appStore.currentSessionId = 's1';
+  await sandbox.chatView.open('s1');
+  const attach = attachPosts().pop();
+  attach.d.reject(Object.assign(new Error('none'), { status: 404 }));
+  await sleep(600); await flushN(5);
+  const queued = streamPosts().filter(p => p.body.message === 'queued message');
+  assert.strictEqual(queued.length, 1, 'idle 后只发一次');
+  assert.ok(sandbox.appStore.stream, '队列 send 已开流');
+  await sleep(600); await flushN(5);
+  assert.strictEqual(streamPosts().filter(p => p.body.message === 'queued message').length, 1, '不重复发送');
+  console.log('chatView drain queue: ok');
+})().catch(function (error) { console.error(error && error.stack ? error.stack : error); process.exit(1); });
+'''
+    runNode(script, [str(rootPath / 'webApp/frontend/js/chatView.js')])
+
+
+def testChatViewDrainQueueConfirmPriorityAndInvalidDrop() -> None:
+    script = drainQueueHarness + r'''
+(async function main() {
+  await establishDraining();
+
+  // 队列先排一条 send（draining → 入队），再排队 pendingConfirm
+  await clickSend('after-confirm');
+  await sleep(80); await flushN(5);
+  assert.strictEqual(streamPosts().filter(p => p.body.message === 'after-confirm').length, 0);
+  await openWaitingConfirm('c1');
+  ids.confirmApprove.click();
+  await flushN(5);
+  assert.strictEqual(confirmPosts().length, 0, 'draining 时 confirm 入队不 POST');
+  assert.ok(toasts.some(t => t.indexOf('随后处理确认') >= 0), 'confirm 排队提示');
+
+  // idle + pending 有效：confirm 先于队列 send 发出
+  streamStateResponse = { state: 'idle', canAcceptMessage: true };
+  pendingResponse = { pending: { confirmationId: 'c1', reason: 'r', commandPreview: 'p', toolCall: { id: 't1', toolName: 'rm', arguments: {} } } };
+  await sleep(700); await flushN(5);
+  assert.strictEqual(confirmPosts().length, 1, 'idle 后 confirm 先发');
+  assert.strictEqual(lastPost().path, '/api/chat/confirm');
+  assert.strictEqual(streamPosts().filter(p => p.body.message === 'after-confirm').length, 0, 'confirm 优先于队列 send');
+
+  // confirm 流结束：队列 send 补发一次
+  lastPost().d.resolve('closed');
+  await sleep(700); await flushN(5);
+  assert.strictEqual(streamPosts().filter(p => p.body.message === 'after-confirm').length, 1, 'confirm 完成后队列 send 只发一次');
+
+  // 失效 confirm：丢弃并提示，不阻塞后续队列 send
+  ids.sendButton.click();
+  await flushN(5);
+  assert.strictEqual(sandbox.appStore.stream, null);
+  streamStateResponse = { state: 'draining', canAcceptMessage: false };
+  await clickSend('second-payload');
+  await sleep(80); await flushN(5);
+  assert.strictEqual(streamPosts().filter(p => p.body.message === 'second-payload').length, 0, 'second-payload 先入队');
+  pendingResponse = { pending: null };
+  await openWaitingConfirm('c2');
+  ids.confirmApprove.click();
+  await flushN(5);
+  assert.strictEqual(confirmPosts().length, 1, 'c2 排队不发');
+  streamStateResponse = { state: 'idle', canAcceptMessage: true };
+  await sleep(700); await flushN(5);
+  assert.strictEqual(confirmPosts().length, 1, '失效 confirm 丢弃不 POST');
+  assert.ok(toasts.some(t => t.indexOf('确认已失效') >= 0), '失效提示');
+  await sleep(700); await flushN(5);
+  assert.strictEqual(streamPosts().filter(p => p.body.message === 'second-payload').length, 1, '失效 confirm 不阻断队列 send');
+  console.log('chatView drain confirm priority: ok');
+})().catch(function (error) { console.error(error && error.stack ? error.stack : error); process.exit(1); });
+'''
+    runNode(script, [str(rootPath / 'webApp/frontend/js/chatView.js')])
+
+
 def testIndexCacheBustOrder() -> None:
     index = (rootPath / 'webApp/frontend/index.html').read_text(encoding='utf-8')
     usagePos = index.find('src="/static/js/statusUsage.js?v=1.1"')
     barPos = index.find('src="/static/js/statusBar.js?v=1.6"')
-    chatPos = index.find('src="/static/js/chatView.js?v=1.24"')
+    chatPos = index.find('src="/static/js/chatView.js?v=1.25"')
     stylesPos = index.find('href="/static/styles.css?v=1.27"')
     markdownPos = index.find('src="/static/js/markdown.js?v=1.2"')
     assert usagePos != -1 and barPos != -1 and chatPos != -1 and stylesPos != -1 and markdownPos != -1

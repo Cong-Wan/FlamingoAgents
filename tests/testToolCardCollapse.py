@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.6
-Date: 2026-09-23
-Description: Verifies tool collapse behavior/styles and cache-busted loading of the updated frontend assets. v1.6 同步 styles cache-bust 到 1.27（版本号功能）。
+Version: 1.7
+Date: 2026-10-10
+Description: Verifies tool collapse behavior/styles and cache-busted loading of the updated frontend assets. v1.6 同步 styles cache-bust 到 1.27（版本号功能）。v1.7 同步 chatView cache-bust 到 1.25（stopDrain409FixPlan T7）。
 '''
 
 from __future__ import annotations
@@ -158,7 +158,7 @@ assert.ok(toolPreRule && /line-height:\s*1\.55/.test(toolPreRule[1]));
 assert.ok(collapsedRule && /max-height:\s*320px/.test(collapsedRule[1]));
 assert.ok(collapsedRule && /overflow-y:\s*auto/.test(collapsedRule[1]));
 assert.ok(indexSource.includes('href="/static/styles.css?v=1.27"'));
-assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.24"'));
+assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.25"'));
 assert.ok(indexSource.includes('src="/static/js/markdown.js?v=1.2"'));
 console.log('tool card collapse: ok');
 '''

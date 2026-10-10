@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.10
-Date: 2026-09-23
-Description: Provides executable handlers (execute/preview) for built-in tools. v1.9 askSubAgent 显式传 usage-source=subagent 与父会话 ID，子进程用量写入统一账本。v1.10（subAgentPipeDrainFixPlan）：_runWithInterrupt 改为每管一个 reader 线程持续排空到 head/tail 有界 spool，活 child 写满 PIPE 不再互等；首领退出 0.5s EOF 宽限语义保留；超时异常附带 pipeStats；askSubAgentTool 生成并传 --session-id，超时返回 childSessionId/childLogPath/partialStderrTail 等诊断，stdout 末行无 reply 时显式报错。
+Version: 1.11
+Date: 2026-10-10
+Description: Provides executable handlers (execute/preview) for built-in tools. v1.9 askSubAgent 显式传 usage-source=subagent 与父会话 ID，子进程用量写入统一账本。v1.10（subAgentPipeDrainFixPlan）：_runWithInterrupt 改为每管一个 reader 线程持续排空到 head/tail 有界 spool，活 child 写满 PIPE 不再互等；首领退出 0.5s EOF 宽限语义保留；超时异常附带 pipeStats；askSubAgentTool 生成并传 --session-id，超时返回 childSessionId/childLogPath/partialStderrTail 等诊断，stdout 末行无 reply 时显式报错。v1.11（stopDrain409FixPlan T1-T3）：中断路径改为立即 TERM → 短 grace → KILL 本轮进程组 → 有界等待 poll()/EOF → 抛 modelInterruptedError；主循环与首领退出等 EOF 半段都检查中断；日志区分 manualStop / normalTimeout，新增 stopProcessOverrun 诊断。
 '''
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ maxSubAgentTimeoutSeconds = 3600
 pipeHeadCapBytes = 256 * 1024      # 每管保留输出前缀上限（bash 头部 clip 语义）
 pipeTailCapBytes = 256 * 1024      # 每管保留输出后缀上限（askSubAgent 尾行 JSON 语义）
 pipeReadChunkBytes = 64 * 1024
+stopTermGraceSeconds = 0.3         # 手动终止：TERM 与 KILL 之间的短 grace 上限（stopDrain409FixPlan T1）
+stopProcessBudgetSeconds = 0.5     # 手动终止：发完信号后有界等待 poll()/EOF 的预算（T1）
 
 
 # --- read ---
@@ -217,6 +219,7 @@ class _pipeSpool:
 
 def _drainPipe(stream, spool: _pipeSpool) -> None:
     # 阻塞读整管到 spool 直到 EOF；异常（含父侧关读端）一律按 EOF 收尾，线程 daemon 兜底。
+    # EOF/异常后由本线程关流：避免主线程在 reader 还阻塞在 read 时 close，抢 buffer 锁等 EOF（B 类子孙持写端事故形）。
     readChunk = getattr(stream, 'read1', None)
     if not callable(readChunk):
         readChunk = stream.read
@@ -231,11 +234,17 @@ def _drainPipe(stream, spool: _pipeSpool) -> None:
             spool.feed(data)
     finally:
         spool.markEof()
+        try:
+            stream.close()
+        except Exception:
+            pass
 
 
-def _closeReadPipes(process: subprocess.Popen) -> None:
-    for stream in (process.stdout, process.stderr):
-        if stream is None:
+def _closeReadPipes(process: subprocess.Popen, outSpool: _pipeSpool, errSpool: _pipeSpool) -> None:
+    # 只兜底关闭已 EOF 的管（reader 已收尾，close 不会阻塞）；reader 仍在阻塞读时不得 close——
+    # BufferedReader.close 会等 buffer 锁到 EOF，B 类子孙持写端时可无限挂起。
+    for stream, spool in ((process.stdout, outSpool), (process.stderr, errSpool)):
+        if stream is None or not spool.eof:
             continue
         try:
             stream.close()
@@ -255,12 +264,45 @@ def _signalGroup(process: subprocess.Popen, sig, fallback) -> None:
 
 def _killProcessGroup(process: subprocess.Popen) -> None:
     # 首领已 reap 时 wait 会立刻成功，不代表进程组已空；TERM 后固定等再无条件 SIGKILL。
+    # 正常 timeout 路径保持既有语义（T2）；手动终止走下面的 T1 快路径。
     _signalGroup(process, signal.SIGTERM, process.terminate)
     time.sleep(0.5)
     _signalGroup(process, getattr(signal, 'SIGKILL', signal.SIGTERM), process.kill)
     try:
         process.wait(timeout=0.5)
     except subprocess.TimeoutExpired:
+        pass
+
+
+def _signalGroupTermThenKill(process: subprocess.Popen, termGraceSeconds: float) -> None:
+    # 手动终止快路径（T1）：立即 TERM 本轮进程组，短 grace 后无条件 KILL；首领已退时不再等满 grace，
+    # 但仍要补 KILL——首领 reap 不代表组内 C 类子孙已死；A/B 类不同组，不受影响。
+    _signalGroup(process, signal.SIGTERM, process.terminate)
+    graceDeadline = time.monotonic() + termGraceSeconds
+    while process.poll() is None and time.monotonic() < graceDeadline:
+        time.sleep(0.02)
+    _signalGroup(process, getattr(signal, 'SIGKILL', signal.SIGTERM), process.kill)
+
+
+def _waitProcessAndReaders(process: subprocess.Popen, outSpool: _pipeSpool, errSpool: _pipeSpool, budgetSeconds: float) -> bool:
+    # 有界等待：poll() 落地且两管 reader EOF 才算 settled；到点返回 False，不做无限等待。
+    deadline = time.monotonic() + budgetSeconds
+    while time.monotonic() < deadline:
+        if process.poll() is not None and outSpool.eof and errSpool.eof:
+            return True
+        time.sleep(0.02)
+    return process.poll() is not None and outSpool.eof and errSpool.eof
+
+
+def _logStopDiagnostic(context: toolContext, eventType: str, **fields) -> None:
+    # T3：manualStop / normalTimeout / stopProcessOverrun 诊断；debug 之外尽力写会话 jsonl，失败不阻断停止路径。
+    if context.debugConsole:
+        context.debugConsole.debug(f'工具停止诊断 {eventType} sessionId={context.sessionId} {fields}')
+    if context.logger is None:
+        return
+    try:
+        context.logger.logEvent({'type': eventType, 'sessionId': context.sessionId, **fields})
+    except Exception:
         pass
 
 
@@ -273,17 +315,42 @@ def _finishStop(
     errSpool: _pipeSpool,
     leaderExitedAt: float | None,
     startedAtWall: float,
+    context: toolContext,
 ) -> None:
+    if reason == 'interrupt':
+        # T1/T2：信号先于等待——立即 TERM → 短 grace → KILL 本轮进程组，再有界等待 poll()/EOF；
+        # 到点仍未 settled 也照常抛 modelInterruptedError（组已收 KILL，不回落工具 timeout、不无限等）。
+        _signalGroupTermThenKill(process, stopTermGraceSeconds)
+        settled = _waitProcessAndReaders(process, outSpool, errSpool, stopProcessBudgetSeconds)
+        _logStopDiagnostic(
+            context, 'manualStop',
+            command=command[0] if command else '',
+            timeout=timeout,
+            leaderExited=leaderExitedAt is not None,
+            processSettled=settled,
+        )
+        if not settled:
+            _logStopDiagnostic(
+                context, 'stopProcessOverrun',
+                command=command[0] if command else '',
+                timeout=timeout,
+                leaderExited=leaderExitedAt is not None,
+            )
+        raise modelInterruptedError('用户已停止')
     _killProcessGroup(process)
     # 杀组后写端全灭，reader 线程将收到 EOF；有界等待其收尾，不与 reader 抢管道（不 communicate）。
     eofDeadline = time.monotonic() + 0.3
     while time.monotonic() < eofDeadline and not (outSpool.eof and errSpool.eof):
         time.sleep(0.02)
-    if reason == 'interrupt':
-        raise modelInterruptedError('用户已停止')
     outStats = outSpool.snapshot()
     errStats = errSpool.snapshot()
     lastActivityAt = max(outStats['lastActivityAt'], errStats['lastActivityAt']) or startedAtWall
+    _logStopDiagnostic(
+        context, 'normalTimeout',
+        command=command[0] if command else '',
+        timeout=timeout,
+        leaderExited=leaderExitedAt is not None,
+    )
     error = subprocess.TimeoutExpired(command, timeout, output=outSpool.text(), stderr=errSpool.text())
     error.pipeStats = {
         'stdoutBytes': outStats['bytes'],
@@ -299,6 +366,8 @@ def _finishStop(
 def _runWithInterrupt(command: list[str], context: toolContext, timeout: int) -> subprocess.CompletedProcess:
     # 持续排空版有界 Popen：每管一个 reader 线程写入 head/tail 有界 spool，活 child 写满 PIPE 不再互等；
     # 首领退出后保留 0.5s EOF 宽限（旧孤儿事故形语义）；EOF + 首领已退才组装返回。
+    # 手动终止：主循环顶部与「首领已退出、等待 EOF」半段都检查 interruptEvent，命中即走 T1 快路径，
+    # 不回落工具 timeout（正常 timeout 语义不变）。
     process = subprocess.Popen(
         command,
         cwd=str(context.workDir),
@@ -318,16 +387,19 @@ def _runWithInterrupt(command: list[str], context: toolContext, timeout: int) ->
     try:
         while True:
             if _isInterrupted(context):
-                _finishStop(process, 'interrupt', command, timeout, outSpool, errSpool, leaderExitedAt, startedAtWall)
+                _finishStop(process, 'interrupt', command, timeout, outSpool, errSpool, leaderExitedAt, startedAtWall, context)
             if time.monotonic() >= deadline:
-                _finishStop(process, 'timeout', command, timeout, outSpool, errSpool, leaderExitedAt, startedAtWall)
+                _finishStop(process, 'timeout', command, timeout, outSpool, errSpool, leaderExitedAt, startedAtWall, context)
             if process.poll() is not None:
                 if leaderExitedAt is None:
                     leaderExitedAt = time.monotonic()
                 if outSpool.eof and errSpool.eof:
                     break
+                # 首领已退、reader 未 EOF 的半段同样响应手动终止，优先于 postLeaderGrace 超时回落。
+                if _isInterrupted(context):
+                    _finishStop(process, 'interrupt', command, timeout, outSpool, errSpool, leaderExitedAt, startedAtWall, context)
                 if time.monotonic() - leaderExitedAt >= 0.5:
-                    _finishStop(process, 'timeout', command, timeout, outSpool, errSpool, leaderExitedAt, startedAtWall)
+                    _finishStop(process, 'timeout', command, timeout, outSpool, errSpool, leaderExitedAt, startedAtWall, context)
             time.sleep(0.1)
         try:
             process.wait(timeout=0.5)
@@ -335,7 +407,7 @@ def _runWithInterrupt(command: list[str], context: toolContext, timeout: int) ->
             pass
         return subprocess.CompletedProcess(command, process.returncode, outSpool.text(), errSpool.text())
     finally:
-        _closeReadPipes(process)
+        _closeReadPipes(process, outSpool, errSpool)
 
 
 def bashTool(arguments: dict[str, Any], context: toolContext) -> toolOutput:

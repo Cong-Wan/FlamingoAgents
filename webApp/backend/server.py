@@ -1,9 +1,10 @@
 '''
 Author: wilbur
-Version: 1.21
-Date: 2026-09-23
+Version: 1.22
+Date: 2026-10-10
 Description: FastAPI application and authenticated REST/SSE routes. v1.20 GET /api/usage 改为单一 period 账本快照；删除 /usage/series；删除会话前必须补齐 usageRecord。
             v1.21（versionDisplayPlan §4.1/§4.3）：/api/health 版本号改由 flamingoAgents/version.py 引用；新增免认证 GET /api/version（登录门展示用）。
+            v1.22（stopDrain409FixPlan T6）：新增只读 GET /api/sessions/{sessionId}/stream-state（idle/active/draining），旧 status 行为不变。
 '''
 
 from __future__ import annotations
@@ -365,6 +366,14 @@ def getSessionStatus(sessionId: str):
         'contextTokens': contextTokens,
         'contextUsedPercent': usedPercent,
     }
+
+
+@authedApi.get('/sessions/{sessionId}/stream-state')
+def getSessionStreamState(sessionId: str):
+    # T6 只读探针（stopDrain409FixPlan）：不建 Agent、不读写 JSONL；idle 才可新开同会话流。
+    checkSessionId(sessionId)
+    requireSession(sessionId)
+    return agentManager.getStreamState(sessionId)
 
 
 @authedApi.patch('/sessions/{sessionId}/model')

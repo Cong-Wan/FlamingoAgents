@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.11
-Date: 2026-09-23
-Description: Authenticated fetch wrapper for Web APIs. v1.10 getUsage 只请求 period 单一统计接口，删除 series，并支持 AbortController。v1.11（versionDisplayPlan §4.4）：新增免认证 getVersion（登录门 footer 也要显示）。
+Version: 1.12
+Date: 2026-10-10
+Description: Authenticated fetch wrapper for Web APIs. v1.10 getUsage 只请求 period 单一统计接口，删除 series，并支持 AbortController。v1.11（versionDisplayPlan §4.4）：新增免认证 getVersion（登录门 footer 也要显示）。v1.12（stopDrain409FixPlan T6/T7）：新增 getStreamState 只读收尾探针（idle/active/draining）。
 */
 (function () {
   'use strict';
@@ -94,6 +94,9 @@ Description: Authenticated fetch wrapper for Web APIs. v1.10 getUsage 只请求 
     },
     getPending: function (sessionId) {
       return request('/api/sessions/' + encodeURIComponent(sessionId) + '/pending');
+    },
+    getStreamState: function (sessionId) {
+      return request('/api/sessions/' + encodeURIComponent(sessionId) + '/stream-state');
     },
     stopChat: function (sessionId) {
       return request('/api/chat/stop', { method: 'POST', body: { sessionId: sessionId } });

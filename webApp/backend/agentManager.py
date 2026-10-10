@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.13
-Date: 2026-09-21
-Description: sessionId → agent 实例缓存、活跃流登记与泵线程结构。v1.13 Web Agent 注入 usageSource=web；状态栏费用改读 usageEvents，泵终态不再写 usageTurns。
+Version: 1.14
+Date: 2026-10-10
+Description: sessionId → agent 实例缓存、活跃流登记与泵线程结构。v1.13 Web Agent 注入 usageSource=web；状态栏费用改读 usageEvents，泵终态不再写 usageTurns。v1.14（stopDrain409FixPlan T6）：新增只读 getStreamState 探针（idle/active/draining），锁内判定、不建 Agent、不读写 JSONL。
 '''
 
 from __future__ import annotations
@@ -179,6 +179,24 @@ def waitForCoreIdle(sessionId: str, timeout: float = CORE_IDLE_WAIT_SECONDS) -> 
             or current.doneEvent.is_set()
         )
         return 'timeout' if stillDraining else 'active'
+
+
+def getStreamState(sessionId: str) -> dict:
+    # T6 只读探针：单锁内读 activeStreams，不建 Agent、不读写 JSONL、不暴露 PID/命令行。
+    # idle 仅当无当前 pump（finishStream 已在锁内 pop 并置 coreDoneEvent）时返回。
+    with managerLock:
+        pump = activeStreams.get(sessionId)
+        if pump is None:
+            return {'state': 'idle', 'canAcceptMessage': True}
+        draining = (
+            pump.stopFlag.is_set()
+            or pump.stopClaimed
+            or pump.terminalSeen
+            or pump.doneEvent.is_set()
+        )
+    if draining:
+        return {'state': 'draining', 'canAcceptMessage': False}
+    return {'state': 'active', 'canAcceptMessage': False}
 
 
 def requestStop(sessionId: str) -> bool:

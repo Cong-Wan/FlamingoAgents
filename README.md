@@ -2,9 +2,9 @@
 
 <!--
 Author: wilbur
-Version: 1.5
-Date: 2026-09-21
-Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history. v1.5：工具并行池是同批屏障汇合并发，不是后台 job。
+Version: 1.6
+Date: 2026-10-10
+Description: Documents centralized session storage under ~/.flamingo and explicit recovery of missing session indexes from existing history. v1.5：工具并行池是同批屏障汇合并发，不是后台 job。 v1.6（stopDrain409FixPlan T8）：停止语义改为本轮进程组快速中止（A/B 存活、C 随杀），新增 stream-state 探针与前端收尾队列。
 -->
 
 ## 现状能力
@@ -23,7 +23,7 @@ Description: Documents centralized session storage under ~/.flamingo and explici
 ### `webApp/` —— Web 程序（单用户、局域网）
 
 - **现代化对话界面**：流式逐字输出、思维链折叠、工具调用卡片（结果可折叠内滚动预览）、**工具确认框**（批准/拒绝续跑）；
-- **随时停止**：停止按钮即时把 UI 收成 `stopped`；Core 会等已启动的工具线程静止后再释放占用。不协作的池内工具无法硬杀，同会话新请求在 draining 期间可能短暂 409；
+- **随时停止**：停止按钮即时把 UI 收成 `stopped`；本轮的 `bash`/`askSubAgent` 进程组立即 SIGTERM → 短 grace → SIGKILL 快速收尾，只杀本轮 `start_new_session` 组（更早轮次遗留进程与 `setsid` 守护进程不受影响，本轮 `&` 后台子孙随本轮被杀）；随后同会话新消息由 `GET /api/sessions/{id}/stream-state` 探到 `idle` 后按队列自动补发，不再盲重试撞 409；不协作的自定义池内工具无法硬杀时，会话保持 draining 由探针继续等待；
 - **多窗口并行流式**：同会话多标签页 attach 回放式重连，互不抢流；
 - **文件树与 @ 路径引用**：侧栏文件树浏览/读文件；输入框 `@` 唤起文件面板，目录可下钻也可整体选为引用（chip 📄/📁 区分）。发送时只把校验后的绝对路径交给模型，不预读内容、不解包；读取由 Agent 按需使用工具完成。能 `@` 不等于能在预览里打开该文件；
 - **图片输入**：模型配置勾选 `image` 后，可通过按钮/粘贴/拖入发送 PNG/JPEG/WebP（单张 5MiB、单条最多 4 张）。图片落在会话日志旁的 `{sessionId}.images/`，JSONL 只记引用；`@` 到图片文件时先确认存在再快照编码进模型请求。未勾选 image 时上传图会被拒绝，`@` 图片回退为路径引用；
