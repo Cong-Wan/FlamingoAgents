@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.6
-Date: 2026-09-08
+Version: 1.8
+Date: 2026-10-12
 Description: 库事件 dataclass → SSE 文本帧（ensure_ascii=False 单行 JSON），以及只消费订阅队列的 SSE 生成器（15s 空闲发 keep-alive 注释帧）。
             v1.1 多窗口并行（multiWindowStreamingPlan §4.2）：sseGen 签名改 (eventQueue, meta, pump)——attach 订阅首发
             streamResume 帧（baseCount/userMessage）；finally 经 pump.unsubscribe 反注册死订阅。
@@ -10,6 +10,8 @@ Description: 库事件 dataclass → SSE 文本帧（ensure_ascii=False 单行 J
             v1.4 logSseGenError 失败不得盖掉真正的生成器异常。
             v1.5 永久编码 Core usageUpdateEvent 与 Web usageUpdateDto 为同一 usageUpdate SSE；DTO 固定定义于此。
             v1.6（imageInputPlan）：encodeResumeFrame 增加 userImages（缺省 []）。
+            v1.7（latencyMetricsDisplayPlan T1.4）：usageUpdateEvent/usageUpdateDto 双分支均携带 timings（缺省 None）。
+            v1.8（latencyDisplayImplementationPlan）：completed 帧携带 totalElapsedMs（缺省 None）；toolCallToDict 增 argumentsStartedAtMs（缺省 None）。
 '''
 
 from __future__ import annotations
@@ -39,12 +41,18 @@ class usageUpdateDto:
     stepUsage: dict[str, int]
     contextTokens: int
     cost: float | None
+    timings: dict | None = None  # T1.4：最近一次模型调用 timings（缺省 None 容旧数据）
 
 keepAliveIntervalSeconds = 15
 
 
 def toolCallToDict(call) -> dict:
-    return {'id': call.id, 'toolName': call.toolName, 'arguments': call.arguments}
+    return {
+        'id': call.id,
+        'toolName': call.toolName,
+        'arguments': call.arguments,
+        'argumentsStartedAtMs': getattr(call, 'argumentsStartedAtMs', None),  # v1.8：参数首片段时点透传（attach 回放同帧；缺省 None）
+    }
 
 
 def eventToFrame(event) -> tuple[str, dict]:
@@ -74,7 +82,7 @@ def eventToFrame(event) -> tuple[str, dict]:
             'toolCall': toolCallToDict(event.toolCall),
         }
     if isinstance(event, completedEvent):
-        return 'completed', {'message': event.message}
+        return 'completed', {'message': event.message, 'totalElapsedMs': getattr(event, 'totalElapsedMs', None)}  # v1.8：整轮总耗时（缺省 None）
     if isinstance(event, retryNoticeEvent):
         return 'retryNotice', {
             'message': event.message,
@@ -89,6 +97,7 @@ def eventToFrame(event) -> tuple[str, dict]:
             'usage': event.usage,
             'stepUsage': event.stepUsage,
             'contextTokens': event.contextTokens,
+            'timings': event.timings,
         }
     if isinstance(event, usageUpdateDto):
         return 'usageUpdate', {
@@ -96,6 +105,7 @@ def eventToFrame(event) -> tuple[str, dict]:
             'stepUsage': event.stepUsage,
             'contextTokens': event.contextTokens,
             'cost': event.cost,
+            'timings': event.timings,
         }
     # 泵线程兜底异常已被包装为 errorEvent；走到这里属于未知事件，按 error 帧兜底。
     return 'error', {'message': f'未知事件类型：{type(event).__name__}', 'errorType': type(event).__name__}

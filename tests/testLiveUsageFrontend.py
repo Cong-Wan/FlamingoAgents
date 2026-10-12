@@ -617,6 +617,11 @@ sandbox.api = {
   getSessionStatus() { return Promise.resolve({}); }
 };
 sandbox.toast = function (message) { toasts.push(message); };
+sandbox.statusUsage = {
+  formatElapsed(ms) { return null; },
+  formatSpeedLine() { return null; },
+  readTimings() { return null; }
+};
 sandbox.statusBar = {
   applyUsageUpdate(data) { applies.push(data); },
   resetForSession(id) { this._session = id; },
@@ -1086,10 +1091,10 @@ def testChatViewDrainQueueConfirmPriorityAndInvalidDrop() -> None:
 
 def testIndexCacheBustOrder() -> None:
     index = (rootPath / 'webApp/frontend/index.html').read_text(encoding='utf-8')
-    usagePos = index.find('src="/static/js/statusUsage.js?v=1.1"')
-    barPos = index.find('src="/static/js/statusBar.js?v=1.6"')
-    chatPos = index.find('src="/static/js/chatView.js?v=1.25"')
-    stylesPos = index.find('href="/static/styles.css?v=1.27"')
+    usagePos = index.find('src="/static/js/statusUsage.js?v=1.7"')
+    barPos = index.find('src="/static/js/statusBar.js?v=1.11"')
+    chatPos = index.find('src="/static/js/chatView.js?v=1.31"')
+    stylesPos = index.find('href="/static/styles.css?v=1.32"')
     markdownPos = index.find('src="/static/js/markdown.js?v=1.2"')
     assert usagePos != -1 and barPos != -1 and chatPos != -1 and stylesPos != -1 and markdownPos != -1
     assert usagePos < barPos < chatPos

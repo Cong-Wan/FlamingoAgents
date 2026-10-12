@@ -157,8 +157,8 @@ const collapsedRule = stylesSource.match(/\.tool-pre\.collapsed\s*\{([^}]*)\}/);
 assert.ok(toolPreRule && /line-height:\s*1\.55/.test(toolPreRule[1]));
 assert.ok(collapsedRule && /max-height:\s*320px/.test(collapsedRule[1]));
 assert.ok(collapsedRule && /overflow-y:\s*auto/.test(collapsedRule[1]));
-assert.ok(indexSource.includes('href="/static/styles.css?v=1.27"'));
-assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.25"'));
+assert.ok(indexSource.includes('href="/static/styles.css?v=1.32"'));
+assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.31"'));
 assert.ok(indexSource.includes('src="/static/js/markdown.js?v=1.2"'));
 console.log('tool card collapse: ok');
 '''

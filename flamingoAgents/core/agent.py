@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.26
-Date: 2026-10-10
-Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.25 每个物理 attempt 在请求前生成 usageKey，合法 terminal usage 先写 JSONL usageRecord 再幂等落入统一账本。v1.26（stopDrain409FixPlan T4/T5）：executeConcurrentSegment 停止时取消未开始 future，已开始 worker 有界 join（STOP_JOIN_BUDGET_SECONDS）；预算耗尽保持 draining 并记 stopJoinOverrun，不提前 shutdown/finishStream；executeToolCall 把会话 logger 注入 toolContext；固化每 call 唯一终态结果语义。
+Version: 1.28
+Date: 2026-10-12
+Description: Coordinates event-stream Agent sessions, tool execution, retry, interruption, persistence, and confirmation state. v1.25 每个物理 attempt 在请求前生成 usageKey，合法 terminal usage 先写 JSONL usageRecord 再幂等落入统一账本。v1.26（stopDrain409FixPlan T4/T5）：executeConcurrentSegment 停止时取消未开始 future，已开始 worker 有界 join（STOP_JOIN_BUDGET_SECONDS）；预算耗尽保持 draining 并记 stopJoinOverrun，不提前 shutdown/finishStream；executeToolCall 把会话 logger 注入 toolContext；固化每 call 唯一终态结果语义。v1.27（latencyMetricsDisplayPlan T1.2/T1.3）：executeToolCall 统一打点 details.elapsedMs；两处 usageUpdateEvent yield 附 timings（缺省 None 容旧数据）。v1.28（latencyDisplayImplementationPlan）：runUserMessageStream 增 turnStartedAt（server 入口 monotonic 起点）；最终 completed 处计算 totalElapsedMs；executeToolCall 结束处打 details.callElapsedMs（含参数生成/排队/确认等待）；driveConfirmation 续流不重置轮次起点。
 '''
 
 from __future__ import annotations
@@ -164,6 +164,7 @@ class agent:
         images=None,
         committedImages=None,
         runEvent: threading.Event | None = None,
+        turnStartedAt: float | None = None,
     ) -> Iterator:
         cleanMessage = message.strip()
         incomingImages = list(images or [])
@@ -171,13 +172,15 @@ class agent:
             yield errorEvent(message='消息不能为空。', errorType='emptyMessage')
             return
         ownedEvent = runEvent if runEvent is not None else threading.Event()
+        # v1.28：用户轮起点（latencyDisplayImplementationPlan §3.4）——server 入口 monotonic；库调用未传时首次迭代取当前时刻。
+        turnStart = turnStartedAt if turnStartedAt is not None else time.monotonic()
         terminal = None
         inner = None
         try:
             with self.getSessionLock(sessionId):
                 self.registerRunEvent(sessionId, ownedEvent)
                 try:
-                    inner = self.driveUserMessage(sessionId, cleanMessage, incomingImages, committedImages, ownedEvent)
+                    inner = self.driveUserMessage(sessionId, cleanMessage, incomingImages, committedImages, ownedEvent, turnStart)
                     try:
                         for event in inner:
                             if isinstance(event, terminalEventTypes):
@@ -245,6 +248,7 @@ class agent:
         incomingImages=None,
         committedImages=None,
         runEvent: threading.Event | None = None,
+        turnStartedAt: float | None = None,
     ) -> Iterator:
         # 调用前提：已持有会话锁。
         activeEvent = runEvent if runEvent is not None else threading.Event()
@@ -298,6 +302,7 @@ class agent:
         if activeEvent.is_set():
             return
         currentConversation.appendUserMessage(cleanMessage, images=storedImages)
+        currentConversation.turnStartedAt = turnStartedAt  # v1.28：用户轮起点写入 conversation（confirm 续流不重置）
         yield from self.driveModelLoop(sessionId, activeEvent)
 
     def driveConfirmation(
@@ -539,6 +544,7 @@ class agent:
                             usage=usageNow,
                             stepUsage={key: max(0, usageNow[key] - stepStart[key]) for key in usageTotalKeys},
                             contextTokens=int(currentConversation.lastTurnTokens or 0),
+                            timings=safePayload.get('timings') if isinstance(safePayload.get('timings'), dict) else None,
                         )
                     if runEvent.is_set():
                         return
@@ -562,7 +568,7 @@ class agent:
                 stepIndex += 1
                 continue
 
-            currentConversation.appendAssistantMessage(assistantMessage, safePayload, usageKey=persistedUsageKey)
+            currentConversation.appendAssistantMessage(assistantMessage, safePayload, usageKey=persistedUsageKey, totalElapsedMs=self.turnTotalElapsedMs(currentConversation))
             if hasTerminalUsage:
                 usageNow = {
                     key: int(currentConversation.usageTotal.get(key, 0) or 0)
@@ -572,10 +578,11 @@ class agent:
                     usage=usageNow,
                     stepUsage={key: max(0, usageNow[key] - stepStart[key]) for key in usageTotalKeys},
                     contextTokens=int(currentConversation.lastTurnTokens or 0),
+                    timings=safePayload.get('timings') if isinstance(safePayload.get('timings'), dict) else None,
                 )
             if self.debugConsole:
                 self.debugConsole.debug(f'模型循环完成 sessionId={sessionId} contentChars={len(assistantMessage.content)}')
-            yield completedEvent(message=assistantMessage.content)
+            yield completedEvent(message=assistantMessage.content, totalElapsedMs=self.turnTotalElapsedMs(currentConversation))
             return
 
     def driveToolBatch(
@@ -763,12 +770,21 @@ class agent:
             if self.debugConsole:
                 self.debugConsole.debug(f'流式回调异常已忽略 error={type(error).__name__}: {error}')
 
+    def turnTotalElapsedMs(self, currentConversation: conversation) -> int | None:
+        # v1.28（latencyDisplayImplementationPlan §3.4）：起点=用户轮 turnStartedAt（server 入口 monotonic），
+        # 终点=本调用可观测时刻（最终 completed 产出前；必然晚于最后一个 toolCallEnd 的 yield）。
+        startedAt = currentConversation.turnStartedAt
+        if startedAt is None:
+            return None
+        return max(0, int((time.monotonic() - startedAt) * 1000))
+
     def executeToolCall(
         self,
         call: toolCall,
         sessionId: str | None = None,
         interruptEvent: threading.Event | None = None,
     ) -> toolResult:
+        startedAt = time.monotonic()
         definition = self.toolRegistry.get(call.toolName)
         if definition is None:
             return self.makeUnknownToolResult(call)
@@ -789,7 +805,18 @@ class agent:
             sessionId=sessionId,
             logger=logger,
         )
-        return executeCallableToolCall(definition, call, context)
+        result = executeCallableToolCall(definition, call, context)
+        if not isinstance(result.details, dict):
+            result.details = {}
+        result.details.setdefault('elapsedMs', max(0, int((time.monotonic() - startedAt) * 1000)))  # T1.2：执行耗时随 details 透传，不覆盖工具自带键
+        # v1.28（latencyDisplayImplementationPlan §3.3）：参数生成开始到执行完成的包含性总耗时（含排队/确认等待）；
+        # 用 worker 返回时刻（非按序落盘时刻）；未知/拒绝/取消结果不经此路径。
+        if isinstance(call.argumentsStartedAtMs, int) and not isinstance(call.argumentsStartedAtMs, bool):
+            endedAtMs = int(time.time() * 1000)
+            callElapsedMs = endedAtMs - call.argumentsStartedAtMs
+            if callElapsedMs >= 0:
+                result.details.setdefault('callElapsedMs', callElapsedMs)
+        return result
 
     def currentProviderId(self) -> str:
         config = getattr(self.modelAdapter, 'config', None)

@@ -23,7 +23,7 @@ def testIndexHasVersionContainers():
     topPos = index.index('class="sidebar-top"')
     assert sidebarStart < versionPos < topPos
     # 静态资源版本参数已递增（破缓存）
-    assert 'styles.css?v=1.27' in index
+    assert 'styles.css?v=1.32' in index
     assert 'api.js?v=1.11' in index
 
 

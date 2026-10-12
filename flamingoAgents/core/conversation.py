@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.16
-Date: 2026-09-21
-Description: Maintains and resumes per-session JSONL conversations. v1.16 独立 usageRecord outbox：新累计只从 usageRecord 加总；assistant 仅在缺少对应 usageKey 时按旧 usage 恢复。
+Version: 1.17
+Date: 2026-10-12
+Description: Maintains and resumes per-session JSONL conversations. v1.16 独立 usageRecord outbox：新累计只从 usageRecord 加总；assistant 仅在缺少对应 usageKey 时按旧 usage 恢复。v1.17（latencyDisplayImplementationPlan）：_resumeFromLog 恢复 toolCall.argumentsStartedAtMs（旧记录缺省 None）；appendAssistantMessage 增可选 totalElapsedMs 落盘；新增运行时 turnStartedAt（用户轮起点，confirm 续流不重置）。
 '''
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ class conversation:
         self.debugConsole = debugConsole
         self.usageTotal: dict[str, int] = {'promptTokens': 0, 'cachedTokens': 0, 'completionTokens': 0}
         self.lastTurnTokens: int = 0  # 最近一次调用的 prompt+completion（下一请求上下文规模估计）
+        self.turnStartedAt: float | None = None  # v1.17：当前用户轮 monotonic 起点（latencyDisplayImplementationPlan §3.4；confirm 续流不重置）
         self._stopRequestedLogged: bool = False
         if resume:
             # system（含创建时注入的时间戳）也从日志恢复，保证 resume 前缀与上次完全一致、缓存可命中。
@@ -85,6 +86,7 @@ class conversation:
                         toolName=tc.get('toolName', ''),
                         arguments=tc.get('arguments', {}) if isinstance(tc.get('arguments'), dict) else {},
                         providerData=normalizeProviderData(tc.get('providerData')),
+                        argumentsStartedAtMs=tc.get('argumentsStartedAtMs') if isinstance(tc.get('argumentsStartedAtMs'), int) and not isinstance(tc.get('argumentsStartedAtMs'), bool) else None,  # v1.17：旧记录缺省 None
                     )
                     if not call.id:
                         raise RuntimeError(
@@ -205,7 +207,7 @@ class conversation:
         self.logger.logEvent({'type': 'usageRecord', **record})
         self._accumulateUsageFromRecord(record)
 
-    def appendAssistantMessage(self, message: chatMessage, responsePayload: dict, usageKey: str | None = None) -> None:
+    def appendAssistantMessage(self, message: chatMessage, responsePayload: dict, usageKey: str | None = None, totalElapsedMs: int | None = None) -> None:
         message.providerData = normalizeProviderData(message.providerData)
         for call in message.toolCalls:
             call.providerData = normalizeProviderData(call.providerData)
@@ -229,6 +231,8 @@ class conversation:
             event['reasoning'] = reasoning
         if usageKey:
             event['usageKey'] = usageKey
+        if totalElapsedMs is not None:
+            event['totalElapsedMs'] = totalElapsedMs  # v1.17：最终 assistant 携带整轮总耗时（latencyDisplayImplementationPlan §3.4）
         self.logger.logEvent(event)
         if not usageKey:
             self._accumulateUsage(responsePayload.get('usage'))

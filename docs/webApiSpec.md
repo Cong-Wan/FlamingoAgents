@@ -1,7 +1,7 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.30
+> Version: 1.33
 > Date: 2026-10-10
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 9 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
@@ -36,6 +36,9 @@
 > v1.28：用量统计改为单一 `GET /api/usage?period=` 账本快照（usageEvents）；删除 `/api/usage/series` 与会话明细；状态栏费用改读已落账记录；删除会话前必须 drain usageRecord。
 > v1.29：版本号单一数据源（docs/plan/260923_versionDisplayPlan.md）——新增免认证 §3.29 GET /api/version（登录门 footer 展示）；§1.1 认证例外更新；§3.13 health 的 version 改随 flamingoAgents/version.py 变化。
 > v1.30（stopDrain409FixPlan T6/T8）：新增 §3.30 只读 stream-state 探针；§4.4 补手动终止的进程组边界（只杀本轮 start_new_session 组，A/B 类存活、C 类随杀）与快速返回语义。
+> v1.31（latencyMetricsDisplayPlan）：§3.14 status 新增 `lastTimings`；`usageUpdate` 帧新增 `timings`（缺省 null 容旧）；`toolResult.details` 约定补 `elapsedMs`（Core executeToolCall 打点）；§2.2 assistant DTO 新增 `timings` 透传。
+> v1.32（thinkingPhaseMetricsPlan）：timings 增加 `reasoningStartMs`/`reasoningEndMs`（思考阶段首末时点，非流式路径缺失为 null）；速度行口径拆 Thinking；**TPS 口径 v2**（分母=思考结束后的 Output），与 v1 数值不可比。
+> v1.33（latencyDisplayImplementationPlan）：§3.14 status 新增 `lastStepUsage`（与 `lastTimings` 同源单次调用用量，缺省 null；旧会话无对子时从 JSONL 最近同事件 assistantMessage 只读恢复并进程内缓存）；`completed` 帧与 §2.2 最终 assistant DTO 新增 `totalElapsedMs`（发消息入口 → 最终 completed 整轮耗时，缺省 null）；`toolCallStart` 帧 / assistant DTO 的 toolCall 新增 `argumentsStartedAtMs`（首个非空参数片段到达时点，缺省 null）；`toolResult.details` 约定补 `callElapsedMs`（参数生成开始 → 执行完成，含排队与确认等待）；前端状态栏改为用量行内 TTFT/TPS-only。
 
 ---
 
@@ -127,6 +130,7 @@
 ```
 
 - **`reasoning`（v1.4 新增，可选）**：该 step 模型输出的思维链全文（来源 jsonl `assistantMessage.reasoning`，仅非空时带）；旧 jsonl 无此字段时前端不渲染 thinking 块；旧客户端忽略未知字段 → 兼容。
+- **`timings`（v1.31 新增，可选）**：该次模型调用耗时（来源 jsonl `assistantMessage.timings`，含 `durationMs`/`ttfbMs` 等；成功 attempt 才有）；前端用于块耗时脚标，缺失/`null` 不显示；旧客户端忽略未知字段 → 兼容。
 
 ```json
 {
@@ -142,7 +146,7 @@
 
 - `assistant.toolCalls` 可能为空数组（纯文本回复）；
 - **`assistant.usage` 归一化映射表（审核 M1，嵌套取值，前后端必须一致）**：`promptTokens ← usage.prompt_tokens`；`cachedTokens ← usage.prompt_tokens_details.cached_tokens`（**嵌套字段**，缺省 0）；`completionTokens ← usage.completion_tokens`；usage 缺失/非对象 → 整个字段为 `null`；
-- **`tool.details` 原样透传**（审核 H2，与 SSE `toolCallEnd.toolResult.details` 同口径）。渲染规则：`details.reason == "userRejectedApproval"`（即 `blocked: true`）→ 呈现「**被拒绝**」；其余 `isError=true` → 呈现「失败」。不得靠匹配 content 文案判别；
+- **`tool.details` 原样透传**（审核 H2，与 SSE `toolCallEnd.toolResult.details` 同口径）。渲染规则：`details.reason == "userRejectedApproval"`（即 `blocked: true`）→ 呈现「**被拒绝**」；其余 `isError=true` → 呈现「失败」。不得靠匹配 content 文案判别；`details.elapsedMs`（v1.31，int 毫秒）为 Core `executeToolCall` 打点的真实执行耗时（含排队后的纯执行段，不含批量 Start 排队），前端在工具卡右下角展示「耗时」；未知工具/未完成/停止路径无此键 → 不显示；
 ```json
 {
   "kind": "error",
@@ -403,7 +407,9 @@
   "cost": 0.000286,
   "contextWindow": 1048576,
   "contextTokens": 1793,
-  "contextUsedPercent": 0.2
+  "contextUsedPercent": 0.2,
+  "lastTimings": { "ttfbMs": 820, "durationMs": 5300 },
+  "lastStepUsage": { "promptTokens": 420, "cachedTokens": 128, "completionTokens": 86 }
 }
 ```
 
@@ -418,6 +424,8 @@
 - `contextWindow`：当前会话模型在 models.yaml 的 `contextWindow`；**yaml 缺失/损坏/模型无该字段 → `null` 且 cost 按 0 计，不影响其余字段**；
 - `contextUsedPercent`（v1.5）：**使用率** `clamp((contextTokens/contextWindow) × 100, 0, 100)` 保留 1 位小数；`contextWindow` 为 `null` 时该字段为 `null`。
   - **破坏性变更**：原 `contextRemainingPercent`（剩余率 `(1 − contextTokens/contextWindow)×100`）已移除，前端须改读 `contextUsedPercent`；
+- `lastTimings`（v1.31，v1.32 扩展）：**最近一轮模型调用 timings**（白名单 `ttfbMs`/`durationMs`/`reasoningStartMs`/`reasoningEndMs`，int 毫秒）。与 `lastStepUsage` 成对：仅泵在收到同时携带有效 timings 与 stepUsage 的 usageUpdate 帧时（帧内即时或终态）成对写入；缺任一保留索引既有对子（不双清）。前端状态栏 TTFT/TPS 的数据源；
+- `lastStepUsage`（v1.33）：**与 `lastTimings` 同源的单次模型调用用量**（`promptTokens`/`cachedTokens`/`completionTokens`，int 非负，bool 拒绝）。TPS 分子（completionTokens）配对来源——切换会话/重启后 TPS 不丢的关键。旧会话索引缺该字段且存在 `lastTimings` 时：从该会话 JSONL 自后向前找最近一条 `timings` 与 `usage` 同时合法的同一 `assistantMessage` 事件，`normalizeUsage` 归一后只读返回（不写索引不写日志，进程内缓存；索引出现新对子后失效）；无合法对子返回 `null`（前端显示真实未知，不编造 TPS）；
 - 404：会话不存在。
 
 ### 3.15 PATCH /api/sessions/{sessionId}/model —— 切换当前会话模型（v1.3 新增，/model 指令）
@@ -753,7 +761,7 @@
 | `toolCallStart` | `{ "toolCall": {"id","toolName","arguments"}, "preview": "path=/xx" }` | 工具进入执行 |
 | `toolCallEnd` | `{ "toolResult": {"toolCallId","toolName","isError","content","details"} }` | 工具完成；**拒绝路径会出现无配对 Start 的孤儿 End**（isError=true） |
 | `retryNotice` | `{ "message": "...", "attempt": 1, "retryAfterMs": 1000, "status": "waiting" }` | 非终态。模型调用连接建立期失败重试通知（v1.8 新增）；attempt 为第几次重试，retryAfterMs 为下次重试倒计时毫秒，status=waiting 为退避心跳；前端在消息下方显示「重试中」提示块，后续 textDelta/reasoningDelta/completed/error 到达时清除 |
-| `usageUpdate` | `{ "usage": {"promptTokens","cachedTokens","completionTokens"}, "stepUsage": {同三字段}, "contextTokens": 1793, "cost": 0.000286 }` | **非终态**（v1.19）。每个模型调用收到含标准输入/输出计数的完整 terminal usage 并 append 成功后恰好一条。`usage` 为会话累计 camelCase；`stepUsage` 为本 step 增量；`contextTokens` 为 `lastTurnTokens`。Core `usageUpdateEvent` 与 Web `usageUpdateDto` 映射为同一 SSE 事件名；正常 Web 路径带 `cost`（liveCost，初始化失败可为 `null`），Core 安全网帧无 `cost`。空/不完整/非法 usage 不发此事件。stopping 可忽略，由 closed 权威 refresh 校准 |
+| `usageUpdate` | `{ "usage": {"promptTokens","cachedTokens","completionTokens"}, "stepUsage": {同三字段}, "contextTokens": 1793, "cost": 0.000286, "timings": {"ttfbMs": 820, "durationMs": 5300} }` | **非终态**（v1.19）。每个模型调用收到含标准输入/输出计数的完整 terminal usage 并 append 成功后恰好一条。`usage` 为会话累计 camelCase；`stepUsage` 为本 step 增量；`contextTokens` 为 `lastTurnTokens`。Core `usageUpdateEvent` 与 Web `usageUpdateDto` 映射为同一 SSE 事件名；正常 Web 路径带 `cost`（liveCost，初始化失败可为 `null`），Core 安全网帧无 `cost`。空/不完整/非法 usage 不发此事件。stopping 可忽略，由 closed 权威 refresh 校准。`timings`（v1.31）为最近一次模型调用耗时（`durationMs` 全程、`ttfbMs` 首 token；成功 attempt 才有，重试/旧会话为 `null`），前端用于块耗时脚标与速度行 |
 | `confirmationRequired` | `{ "confirmationId": "confirm_...", "reason": "删除类命令需确认", "commandPreview": "rm -rf /tmp/x", "toolCall": {"id","toolName","arguments"} }` | **终态**。弹确认框；用 toolCall 先建「待确认」卡片 |
 | `completed` | `{ "message": "完整回复全文" }` | **终态**。message 与已拼接的 textDelta 全文一致（前端可直接用拼接结果，不必替换） |
 | `error` | `{ "message": "...", "errorType": "..." }` | **终态**。errorType 取值见下 |

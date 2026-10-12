@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.12
-Date: 2026-10-10
-Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.8 adds JSON-only providerData to chatMessage/toolCall for Responses opaque item persistence and replay while preserving empty defaults for old sessions. v1.9 adds usageUpdateEvent for per-model-call live usage without Web pricing fields. v1.10（imageInputPlan §3.2）新增 inputImage 与 chatMessage.images（default []，仅 user 消息使用）及 runResult.errorType，供图片输入链路使用。v1.11 toolContext 增加可选 sessionId，供 askSubAgent 把父会话传给子进程账本。v1.12（stopDrain409FixPlan T3）toolContext 增加可选 logger，供工具把 manualStop/normalTimeout/stopProcessOverrun 诊断写入会话 jsonl。
+Version: 1.14
+Date: 2026-10-12
+Description: Defines shared lower-camel-case data structures for messages, tools, runtime context, confirmations, agent results, and callable tool outputs. v1.8 adds JSON-only providerData to chatMessage/toolCall for Responses opaque item persistence and replay while preserving empty defaults for old sessions. v1.9 adds usageUpdateEvent for per-model-call live usage without Web pricing fields. v1.10（imageInputPlan §3.2）新增 inputImage 与 chatMessage.images（default []，仅 user 消息使用）及 runResult.errorType，供图片输入链路使用。v1.11 toolContext 增加可选 sessionId，供 askSubAgent 把父会话传给子进程账本。v1.12（stopDrain409FixPlan T3）toolContext 增加可选 logger，供工具把 manualStop/normalTimeout/stopProcessOverrun 诊断写入会话 jsonl。v1.13（latencyMetricsDisplayPlan T1.1）usageUpdateEvent 增加可选 timings 字段，随帧下发模型调用耗时/TTFT。v1.14（latencyDisplayImplementationPlan）：toolCall 增加可选 argumentsStartedAtMs（参数首片段到达 UNIX 毫秒，不回发模型）；completedEvent 增加可选 totalElapsedMs（发消息入口到最终 completed 轮次总耗时）。
 '''
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ class toolCall:
     toolName: str
     arguments: dict[str, Any]
     providerData: dict[str, Any] = field(default_factory=dict)
+    argumentsStartedAtMs: int | None = None  # v1.14：首个非空参数片段到达时点（UNIX 毫秒）；不回发模型
 
 
 @dataclass
@@ -149,6 +150,7 @@ class confirmationRequiredEvent:
 @dataclass
 class completedEvent:
     message: str
+    totalElapsedMs: int | None = None  # v1.14：发消息入口到本 completed 的整轮耗时（latencyDisplayImplementationPlan §3.4）
 
 
 @dataclass
@@ -170,6 +172,7 @@ class usageUpdateEvent:
     usage: dict[str, int]
     stepUsage: dict[str, int]
     contextTokens: int
+    timings: dict | None = None  # 最近一次模型调用 timings（latencyMetricsDisplayPlan）：缺省 None 容旧数据
 
 
 # 终态事件：消费者收到时会话锁必然已释放（docs/streamOutputPlan.md §6.4）。

@@ -1,8 +1,10 @@
 '''
 Author: wilbur
-Version: 1.14
-Date: 2026-10-10
+Version: 1.16
+Date: 2026-10-12
 Description: sessionId → agent 实例缓存、活跃流登记与泵线程结构。v1.13 Web Agent 注入 usageSource=web；状态栏费用改读 usageEvents，泵终态不再写 usageTurns。v1.14（stopDrain409FixPlan T6）：新增只读 getStreamState 探针（idle/active/draining），锁内判定、不建 Agent、不读写 JSONL。
+         v1.15（latencyMetricsDisplayPlan T1.5）：_toUsageUpdateDto 透传 timings；泵缓存 lastTimings 并在 _recordUsage 回写 session 索引。
+         v1.16（latencyDisplayImplementationPlan §3.1）：泵配对缓存 lastTimings+lastStepUsage（仅完整同源对子才覆盖）；有效配对帧时同步原子更新索引（缺一不覆盖）。
 '''
 
 from __future__ import annotations
@@ -279,6 +281,8 @@ class streamPump:
         self.usageRecorded = False
         self.usageRecordLock = threading.Lock()
         self.usageRecordDone = threading.Event()
+        self.lastTimings: dict | None = None  # T1.5：最近一帧 usageUpdate 的 timings，泵终态回写 session 索引
+        self.lastStepUsage: dict | None = None  # v1.16：与 lastTimings 同源的单次用量（仅完整对子才覆盖；TPS 配对）
         self.historyOverflowed = False
         config = agentInstance.modelAdapter.config
         self.pumpProviderId = str(config.configProviderId or config.provider)
@@ -428,6 +432,7 @@ class streamPump:
             stepUsage={key: int(event.stepUsage.get(key, 0) or 0) for key in usageStore.tokenKeys},
             contextTokens=int(event.contextTokens),
             cost=liveCost,
+            timings=event.timings,
         )
 
     def _pump(self) -> None:
@@ -437,6 +442,13 @@ class streamPump:
                     break
                 if isinstance(event, usageUpdateEvent):
                     event = self._toUsageUpdateDto(event)
+                    if isinstance(event, usageUpdateDto):
+                        if event.timings:
+                            self.lastTimings = event.timings  # 只缓存有效帧，None 不覆盖旧值
+                        if event.timings and isinstance(event.stepUsage, dict):
+                            self.lastStepUsage = event.stepUsage  # v1.16：完整对子才覆盖（缺一不双清）
+                        if event.timings and isinstance(event.stepUsage, dict):
+                            self._writeLatencyPairToIndex()  # v1.16：有效配对帧同步原子更新索引
                 if self.stopFlag.is_set() or self.doneEvent.is_set():
                     break
                 isTerminal = isinstance(event, terminalEventTypes)
@@ -511,6 +523,30 @@ class streamPump:
         usage = currentConversation.usageTotal
         return {key: int(usage.get(key, 0) or 0) for key in ('promptTokens', 'cachedTokens', 'completionTokens')}
 
+    def _writeLatencyPairToIndex(self) -> None:
+        # v1.16（latencyDisplayImplementationPlan §3.1）：有效配对帧到达即原子写索引（不等终态），
+        # 缺 stepUsage 的帧不覆盖既有对子；异常只记诊断不阻断广播。
+        if not (self.lastTimings and isinstance(self.lastStepUsage, dict)):
+            return
+        try:
+            sessionStore.updateUsage(
+                self.sessionId,
+                self._currentUsage(),
+                lastUsage=None,
+                lastTimings=self.lastTimings,
+                lastStepUsage=self.lastStepUsage,
+            )
+            from webApp.backend import server as serverModule
+            try:
+                serverModule.invalidateLegacyLatencyPairCache(self.sessionId)  # 新对子入索引后失效旧日志缓存
+            except Exception:
+                pass
+        except Exception as error:
+            try:
+                self._logDiagEvent('latencyPairIndexError', error, traceback.format_exc())
+            except Exception:
+                pass
+
     def _recordUsage(self) -> None:
         # 锁内只认领，锁外 wait/I/O/set；requestStop 与泵 finally 竞争 at-most-once。
         # 持久化异常只记诊断，不得阻断 unregister/seal。
@@ -541,6 +577,8 @@ class streamPump:
                     finalUsage,
                     contextTokens=int(currentConversation.lastTurnTokens or 0),
                     lastUsage=delta,
+                    lastTimings=self.lastTimings if self.lastStepUsage else None,
+                    lastStepUsage=self.lastStepUsage if self.lastTimings else None,
                 )
             except Exception as error:
                 try:

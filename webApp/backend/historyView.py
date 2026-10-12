@@ -1,12 +1,14 @@
 '''
 Author: wilbur
-Version: 1.5
-Date: 2026-09-15
+Version: 1.7
+Date: 2026-10-12
 Description: 会话 jsonl 事件 → GET messages 的 UI 消息 DTO：过滤 systemMessage/重试中 modelError/timings，usage 按契约 §2.2-M1 嵌套字段归一化，tool.details 原样透传。
             v1.1 随包改名调整 import（webApp.backend.*）。v1.2（fixPlan Phase2）：assistant DTO 透传 event.reasoning（非空才带，供前端 thinking 历史渲染）。
             v1.3 按 sessions 索引 workDir 定位 ~/.flamingo/logs/webData/<folder>/{sessionId}.jsonl；不存在则直接返回 []（不构造 jsonlLog，零 mkdir）。
             v1.4（imageInputPlan）：user DTO 增加 images 引用元数据（无 base64）；严格读取 JSONL。
             v1.5（chatUxImprovePlan）：终态 modelError（willRetry 非 true）下发 kind=error，文案对齐 SSE；request/traceback/diag 不下发。
+            v1.6（latencyMetricsDisplayPlan T1.8）：assistant DTO 透传 timings（块级耗时展示用，缺省 None）。
+            v1.7（latencyDisplayImplementationPlan）：toolCall DTO 增 argumentsStartedAtMs（缺省 None）；最终 assistant 透传 totalElapsedMs（缺省 None）。
 '''
 
 from __future__ import annotations
@@ -61,6 +63,7 @@ def loadMessages(sessionId: str) -> list[dict]:
                     'id': call.get('id', ''),
                     'toolName': call.get('toolName', ''),
                     'arguments': call.get('arguments', {}),
+                    'argumentsStartedAtMs': call.get('argumentsStartedAtMs') if isinstance(call.get('argumentsStartedAtMs'), int) and not isinstance(call.get('argumentsStartedAtMs'), bool) else None,  # v1.7：参数首片段时点（缺省 None 容旧会话）
                 }
                 for call in (event.get('toolCalls') or [])
                 if isinstance(call, dict)
@@ -72,10 +75,14 @@ def loadMessages(sessionId: str) -> list[dict]:
                 'usage': normalizeUsage(event.get('usage')),
                 'model': event.get('model'),
                 'timestamp': timestamp,
+                'timings': event.get('timings'),  # T1.8：块级耗时（缺省 None 容旧会话）
             }
             reasoning = event.get('reasoning')
             if reasoning:
                 assistantItem['reasoning'] = reasoning
+            totalElapsed = event.get('totalElapsedMs')
+            if isinstance(totalElapsed, int) and not isinstance(totalElapsed, bool) and totalElapsed >= 0:
+                assistantItem['totalElapsedMs'] = totalElapsed  # v1.7：最终 assistant 整轮总耗时（缺省不带容旧会话）
             messages.append(assistantItem)
         elif eventType == 'toolResult':
             messages.append({

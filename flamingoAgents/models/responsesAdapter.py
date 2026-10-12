@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.6
-Date: 2026-09-23
-Description: Adapts Flamingo messages/tools to ChatGPT Codex and xAI Responses SSE, including dynamic auth, safe opaque replay, terminal-authoritative item merging, usage normalization, stop, and one zero-output OAuth 401 refresh retry. v1.2 always persists/replays reasoning.summary（empty list if none）so OpenAI Responses does not 400 missing input[n].summary. v1.3 attaches stack-local stream diagnosis on connect/firstByte/streamRead/decode/streamEnd, records authRefresh only on failed 401 refresh, and writes success timings with sawDone. v1.4 connect diag assignment cannot replace the original modelRequestError. v1.5（imageInputPlan）：user 消息含图时追加 input_image，无图保持原 input_text 形状。v1.6（versionDisplayPlan §4.1）：userAgent 版本号改由 flamingoAgents/version.py 引用。
+Version: 1.8
+Date: 2026-10-12
+Description: Adapts Flamingo messages/tools to ChatGPT Codex and xAI Responses SSE, including dynamic auth, safe opaque replay, terminal-authoritative item merging, usage normalization, stop, and one zero-output OAuth 401 refresh retry. v1.2 always persists/replays reasoning.summary（empty list if none）so OpenAI Responses does not 400 missing input[n].summary. v1.3 attaches stack-local stream diagnosis on connect/firstByte/streamRead/decode/streamEnd, records authRefresh only on failed 401 refresh, and writes success timings with sawDone. v1.4 connect diag assignment cannot replace the original modelRequestError. v1.5（imageInputPlan）：user 消息含图时追加 input_image，无图保持原 input_text 形状。v1.6（versionDisplayPlan §4.1）：userAgent 版本号改由 flamingoAgents/version.py 引用。v1.7（thinkingPhaseMetricsPlan T1）：_noteStreamYield 增加 reasoningStartMs/reasoningEndMs 打点（successTimings 共享自 chatCompletions）。v1.8（latencyDisplayImplementationPlan §3.3）：function_call slot 记录首个非空 arguments 时点（delta / done / item 首现），buildCompletion 赋 toolCall.argumentsStartedAtMs。
 '''
 
 from __future__ import annotations
@@ -452,6 +452,11 @@ class responsesAdapter:
             diag['textChars'] = int(diag.get('textChars') or 0) + len(event.text or '')
         elif isinstance(event, reasoningChunk):
             diag['reasoningChars'] = int(diag.get('reasoningChars') or 0) + len(event.text or '')
+            t0 = diag.get('t0')
+            if isinstance(t0, (int, float)):
+                if diag.get('reasoningStartMs') is None:
+                    diag['reasoningStartMs'] = elapsedMs(t0)  # v1.7：首个思考 chunk 时点（thinkingPhaseMetricsPlan T1）
+                diag['reasoningEndMs'] = elapsedMs(t0)   # v1.7：每 chunk 更新，流末即最后思考时点
         else:
             return
         if 'ttfbMs' not in diag:
@@ -577,12 +582,16 @@ class responseState:
             slot = self._slotFor(event, 'function_call')
             delta = event.get('delta')
             if slot is not None and isinstance(delta, str):
+                if delta and slot.get('argumentsStartedAtMs') is None:
+                    slot['argumentsStartedAtMs'] = int(time.time() * 1000)  # v1.8：首个非空参数片段时点（latencyDisplayImplementationPlan §3.3）
                 slot['argumentsText'] += delta
             return
         if eventType == 'response.function_call_arguments.done':
             slot = self._slotFor(event, 'function_call')
             arguments = event.get('arguments')
             if slot is not None and isinstance(arguments, str):
+                if arguments and slot.get('argumentsStartedAtMs') is None:
+                    slot['argumentsStartedAtMs'] = int(time.time() * 1000)  # v1.8：done 首现完整参数分支
                 slot['argumentsText'] = arguments
                 if isinstance(slot.get('item'), dict):
                     slot['item'] = serializeResponseItem({**slot['item'], 'arguments': arguments})
@@ -639,6 +648,7 @@ class responseState:
             'reasoningText': '',
             'argumentsText': rawItem.get('arguments') if isinstance(rawItem.get('arguments'), str) else '',
             'emitted': '',
+            'argumentsStartedAtMs': int(time.time() * 1000) if itemType == 'function_call' and rawItem.get('arguments') else None,  # v1.8：item 首现带完整参数
         }
         self.slots[outputIndex] = slot
         return slot
@@ -785,11 +795,13 @@ class responseState:
                     raise self._protocolError('function_call arguments 必须是 JSON 对象。')
                 itemId = item.get('id')
                 providerData = {'itemId': itemId} if isinstance(itemId, str) and itemId else {}
+                startedAt = slot.get('argumentsStartedAtMs')
                 parsedToolCalls.append(toolCall(
                     id=callId,
                     toolName=name,
                     arguments=arguments,
                     providerData=providerData,
+                    argumentsStartedAtMs=startedAt if isinstance(startedAt, int) and not isinstance(startedAt, bool) else None,
                 ))
 
         providerData = {

@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.27
-Date: 2026-09-23
-Description: FlamingoAgents native Web styles. v1.25 用量页改为下拉筛选、四卡常驻、Provider 趋势卡与质量提示，删除会话表和 Chart.js 容器。v1.26（versionDisplayPlan §4.4）：新增 .login-version 与 .sidebar-version 版本号小字样式。v1.27：侧栏版本号移至顶部「新建会话」上方，字号 14px 与按钮同大。
+Version: 1.32
+Date: 2026-10-12
+Description: FlamingoAgents native Web styles. v1.25 用量页改为下拉筛选、四卡常驻、Provider 趋势卡与质量提示，删除会话表和 Chart.js 容器。v1.26（versionDisplayPlan §4.4）：新增 .login-version 与 .sidebar-version 版本号小字样式。v1.27：侧栏版本号移至顶部「新建会话」上方，字号 14px 与按钮同大。v1.28（latencyMetricsDisplayPlan T2.6）：新增 .tool-elapsed/.step-elapsed 耗时样式。v1.29（latencyUiFixPlan §A）：.tool-elapsed 适配 detail 内部（去横向 padding，避免双重内边距）。v1.30（thinkingPhaseMetricsPlan T4）：cache-bust 提版（样式无变更）。v1.31（thinkingBlockMetricsPlan）：新增 .thinking-elapsed（思考块下方兄弟行，折叠态可见）。v1.32（latencyDisplayImplementationPlan）：删 .step-elapsed（模型级 Elapsed）；新增 .tool-call-total/.total-elapsed；#statusSpeed 行随 HTML 删除。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -327,6 +327,28 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
   margin: 8px 0; font-size: 13px; overflow: hidden;
 }
 .tool-card.dangling { opacity: .65; background: var(--gray-block); }
+/* 工具卡执行耗时（latencyUiFixPlan §A：在 detail 折叠区内部，横向间距交给 .tool-card-detail） */
+.tool-elapsed {
+  display: block; text-align: right; font-size: 12px;
+  color: var(--text-dim); padding: 2px 0 2px;
+}
+.tool-elapsed.hidden { display: none; }
+/* 思考块耗时（thinkingBlockMetricsPlan：thinking details 之后的兄弟行，折叠态可见） */
+.thinking-elapsed {
+  display: block; text-align: right; font-size: 12px;
+  color: var(--text-dim); margin-top: 2px;
+}
+.thinking-elapsed.hidden { display: none; }
+/* 工具卡外部总耗时（latencyDisplayImplementationPlan §3.3：卡片紧邻兄弟节点，折叠详情不隐藏） */
+.tool-call-total {
+  display: block; text-align: right; font-size: 12px;
+  color: var(--text-dim); margin: 3px 0 8px;
+}
+/* 最终 assistant 整轮总耗时（§3.4：稍高对比度，不抢正文） */
+.total-elapsed {
+  display: block; text-align: right; font-size: 12px;
+  color: var(--text); font-weight: 500; margin-top: 10px;
+}
 .tool-card-header {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 12px; cursor: pointer; user-select: none;
@@ -489,6 +511,9 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
 /* 迭代二：composer 状态栏 */
 .composer-status { font-size: 12px; color: var(--text-dim); line-height: 1.7; }
 .status-line { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* v1.32（latencyDisplayImplementationPlan）：用量行末尾追加 TTFT/TPS 后变长，窄屏改为行内横向滚动（不折行不裁剪） */
+#statusUsage { overflow-x: auto; white-space: nowrap; scrollbar-width: none; }
+#statusUsage::-webkit-scrollbar { display: none; }
 .status-workdir { font-family: "SF Mono", Menlo, Consolas, monospace; }
 .status-branch { color: var(--accent); }
 .status-sep { color: var(--border); }

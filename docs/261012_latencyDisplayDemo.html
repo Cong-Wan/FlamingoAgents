@@ -1,0 +1,505 @@
+<!--
+Author: wilbur
+Version: 1.0
+Date: 2026-10-12
+Description: Static latency-display demo for visual confirmation. Shows TTFT/TPS in the usage row, per-thinking elapsed time, tool execution time, tool-call total time, and end-to-end total time without touching production UI.
+-->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FlamingoAgents · Latency display demo</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    :root {
+      --sidebar-bg: #f5f5f7;
+      --sidebar-hover: #e8e8ed;
+      --main-bg: #fff;
+      --gray-block: #f5f5f7;
+      --border: #e5e5ea;
+      --text: #1c1c1e;
+      --text-dim: #8e8e93;
+      --accent: #3b6ef6;
+      --accent-soft: #eaf0fe;
+      --bubble-user: #f0f4ff;
+      --ok: #30a46c;
+      --warn: #b7791f;
+    }
+
+    html, body { min-height: 100%; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background: #f7f7f9;
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+    }
+    button, textarea { font: inherit; }
+    button { cursor: default; }
+    .hidden { display: none; }
+
+    .demo-shell {
+      display: flex;
+      width: min(1440px, 100%);
+      min-height: 100vh;
+      margin: 0 auto;
+      background: var(--main-bg);
+      box-shadow: 0 0 36px rgba(0, 0, 0, .06);
+    }
+
+    /* ---------- sidebar ---------- */
+    .sidebar {
+      display: flex;
+      flex: 0 0 260px;
+      flex-direction: column;
+      min-height: 100vh;
+      background: var(--sidebar-bg);
+      border-right: 1px solid var(--border);
+    }
+    .sidebar-version {
+      padding: 16px 14px 2px;
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .sidebar-top { padding: 16px 12px 10px; }
+    .new-session {
+      width: 100%;
+      padding: 10px;
+      color: var(--text);
+      text-align: left;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .new-session kbd {
+      float: right;
+      padding: 1px 6px;
+      color: var(--text-dim);
+      font-family: inherit;
+      font-size: 11px;
+      line-height: 1.6;
+      background: var(--sidebar-hover);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+    }
+    .session-list { flex: 1; padding: 0 8px 12px; }
+    .session-group-label {
+      padding: 14px 8px 6px;
+      color: var(--text-dim);
+      font-size: 12px;
+    }
+    .session-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 8px;
+      border-radius: 8px;
+    }
+    .session-item.active { background: var(--sidebar-hover); }
+    .session-icon { color: var(--text-dim); font-size: 12px; }
+    .session-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sidebar-bottom { padding: 8px; border-top: 1px solid var(--border); }
+    .sidebar-entry { padding: 9px 8px; color: var(--text); font-size: 14px; }
+    .sidebar-entry + .sidebar-entry { margin-top: 2px; }
+
+    /* ---------- main layout ---------- */
+    .main {
+      display: flex;
+      flex: 1;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 100vh;
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      height: 52px;
+      flex: 0 0 52px;
+      padding: 0 24px;
+      border-bottom: 1px solid var(--border);
+    }
+    .topbar-title { font-weight: 600; }
+    .topbar-model {
+      padding: 2px 10px;
+      color: var(--text-dim);
+      font-size: 12px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+    }
+    .topbar-spacer { flex: 1; }
+    .demo-badge {
+      padding: 3px 9px;
+      color: var(--accent);
+      font-size: 11px;
+      background: var(--accent-soft);
+      border-radius: 999px;
+    }
+
+    .message-list {
+      flex: 1;
+      min-height: 0;
+      padding: 24px;
+      overflow: auto;
+    }
+    .message-list-inner { width: min(860px, 100%); margin: 0 auto; }
+    .demo-note {
+      margin: 0 0 22px 44px;
+      padding: 9px 12px;
+      color: var(--text-dim);
+      font-size: 11px;
+      line-height: 1.6;
+      background: #fafafc;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .demo-note strong { color: var(--text); font-weight: 600; }
+    .demo-timeline {
+      margin-top: 4px;
+      color: var(--text-dim);
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.7;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+
+    /* ---------- messages ---------- */
+    .msg { display: flex; margin-bottom: 22px; }
+    .msg-user { justify-content: flex-end; }
+    .msg-user-bubble {
+      max-width: 70%;
+      padding: 10px 14px;
+      background: var(--bubble-user);
+      border-radius: 14px;
+      line-height: 1.65;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .msg-assistant { align-items: flex-start; }
+    .msg-avatar {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      flex: 0 0 32px;
+      margin-right: 12px;
+      font-size: 17px;
+      background: #ffe9ec;
+      border-radius: 50%;
+    }
+    .msg-body {
+      min-width: 0;
+      flex: 1;
+      padding-right: 48px;
+      line-height: 1.7;
+    }
+
+    /* ---------- thinking blocks ---------- */
+    .thinking-block {
+      margin-bottom: 3px;
+      color: var(--text-dim);
+      font-size: 13px;
+      background: var(--gray-block);
+      border-radius: 10px;
+    }
+    .thinking-block summary {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 12px;
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+    }
+    .thinking-block summary::-webkit-details-marker { display: none; }
+    .thinking-block summary::before {
+      content: "▸";
+      transition: transform .15s;
+    }
+    .thinking-block[open] summary::before { transform: rotate(90deg); }
+    .thinking-content {
+      max-height: 180px;
+      padding: 0 12px 10px 26px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .thinking-elapsed,
+    .tool-call-total,
+    .total-elapsed {
+      display: block;
+      color: var(--text-dim);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .thinking-elapsed { margin: 0 0 12px; text-align: right; }
+
+    /* ---------- tool card ---------- */
+    .tool-group { margin: 2px 0 13px; }
+    .tool-card {
+      overflow: hidden;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .tool-card summary {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+    }
+    .tool-card summary::-webkit-details-marker { display: none; }
+    .tool-card summary::before {
+      content: "▸";
+      color: var(--text-dim);
+      transition: transform .15s;
+    }
+    .tool-card[open] summary::before { transform: rotate(90deg); }
+    .tool-name { font-weight: 600; }
+    .tool-preview {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      color: var(--text-dim);
+      font-size: 12px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .tool-status {
+      flex: 0 0 auto;
+      padding: 1px 8px;
+      color: var(--ok);
+      font-size: 12px;
+      background: #e8f7ef;
+      border-radius: 999px;
+    }
+    .tool-card-detail {
+      padding: 10px 12px;
+      border-top: 1px solid var(--border);
+    }
+    .tool-section { margin-bottom: 9px; }
+    .tool-section:last-child { margin-bottom: 0; }
+    .tool-section h4 {
+      margin: 0 0 4px;
+      color: var(--text-dim);
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .tool-pre {
+      margin: 0;
+      padding: 8px 10px;
+      overflow: auto;
+      color: var(--text);
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-all;
+      background: var(--gray-block);
+      border-radius: 6px;
+    }
+    .tool-execution {
+      padding-top: 2px;
+      color: var(--text-dim);
+      font-size: 12px;
+      text-align: right;
+    }
+    .tool-call-total { margin-top: 3px; text-align: right; }
+
+    /* ---------- final answer ---------- */
+    .answer-content { margin: 14px 0 0; line-height: 1.75; }
+    .answer-content p { margin: 0 0 9px; }
+    .answer-content ul { margin: 8px 0; padding-left: 1.5em; }
+    .answer-content li + li { margin-top: 4px; }
+    .total-elapsed {
+      margin-top: 10px;
+      color: var(--text);
+      font-weight: 500;
+      text-align: right;
+    }
+    .metric-label { color: var(--text-dim); font-weight: 400; }
+
+    /* ---------- composer/status ---------- */
+    .composer {
+      flex: 0 0 auto;
+      padding: 12px 24px 14px;
+      border-top: 1px solid var(--border);
+    }
+    .composer-row { display: flex; align-items: flex-end; gap: 10px; }
+    .composer-input {
+      min-height: 42px;
+      flex: 1;
+      padding: 10px 14px;
+      resize: none;
+      color: var(--text-dim);
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      outline: none;
+    }
+    .send-button {
+      padding: 10px 22px;
+      color: #fff;
+      background: var(--accent);
+      border: 1px solid var(--accent);
+      border-radius: 12px;
+    }
+    .composer-status {
+      margin-top: 8px;
+      color: var(--text-dim);
+      font-size: 12px;
+      line-height: 1.7;
+    }
+    .status-line { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .status-workdir { font-family: "SF Mono", Menlo, Consolas, monospace; }
+    .status-usage {
+      overflow-x: auto;
+      scrollbar-width: none;
+      white-space: nowrap;
+    }
+    .status-usage::-webkit-scrollbar { display: none; }
+    .status-separator { color: var(--border); }
+    .latency-summary { color: var(--text); }
+    .latency-summary strong { font-weight: 600; }
+
+    @media (max-width: 760px) {
+      .demo-shell { display: block; }
+      .sidebar {
+        display: none;
+      }
+      .message-list { padding: 18px 14px; }
+      .demo-note { margin-left: 0; }
+      .msg-body { padding-right: 0; }
+      .msg-user-bubble { max-width: 86%; }
+      .composer { padding: 10px 14px 12px; }
+      .topbar { padding: 0 14px; }
+      .demo-badge { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="demo-shell">
+    <aside class="sidebar" aria-label="会话侧栏示意">
+      <div class="sidebar-version">v1.31 · Demo</div>
+      <div class="sidebar-top">
+        <button class="new-session" type="button">＋ 新建会话 <kbd>Ctrl+K</kbd></button>
+      </div>
+      <div class="session-list">
+        <div class="session-group-label">今天</div>
+        <div class="session-item active"><span class="session-icon">●</span><span class="session-title">耗时展示确认</span></div>
+        <div class="session-item"><span class="session-icon">○</span><span class="session-title">代码审查与修复</span></div>
+        <div class="session-group-label">昨天</div>
+        <div class="session-item"><span class="session-icon">○</span><span class="session-title">接口调研记录</span></div>
+      </div>
+      <div class="sidebar-bottom">
+        <div class="sidebar-entry">⚙ 模型配置</div>
+        <div class="sidebar-entry">✦ 技能</div>
+        <div class="sidebar-entry">📊 用量统计</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <span class="topbar-title">FlamingoAgents</span>
+        <span class="topbar-model">deepseek-flash</span>
+        <span class="topbar-spacer"></span>
+        <span class="demo-badge">静态视觉 Demo</span>
+      </header>
+
+      <section class="message-list" aria-label="耗时展示 demo 对话">
+        <div class="message-list-inner">
+          <div class="demo-note">
+            <strong>本页只确认展示层级，不代表生产计时结果。</strong>
+            半开区间，边界只计一次；Tool execution 是 Tool call 的子区间，非生产文案。
+            <div class="demo-timeline">request → first thinking token: TTFT 1.9s | first → last thinking token: Thinking 1.5s | Tool call 2.9s（含 Tool execution 1.2s）| Thinking 0.8s | Final output 2.1s | Total 9.2s</div>
+          </div>
+
+          <div class="msg msg-user">
+            <div class="msg-user-bubble">请检查这次改动，并总结关键结果。</div>
+          </div>
+
+          <div class="msg msg-assistant">
+            <div class="msg-avatar" aria-hidden="true">🦩</div>
+            <div class="msg-body">
+              <details class="thinking-block" open>
+                <summary>已思考</summary>
+                <div class="thinking-content">我先确认当前会话的改动范围，再读取必要的文件，避免把无关代码带进结论。</div>
+              </details>
+              <div class="thinking-elapsed"><span class="metric-label">Thinking</span> 1.5s</div>
+
+              <div class="tool-group">
+                <details class="tool-card" open>
+                  <summary>
+                    <span class="tool-name">bash</span>
+                    <span class="tool-preview">git diff --stat</span>
+                    <span class="tool-status">完成</span>
+                  </summary>
+                  <div class="tool-card-detail">
+                    <div class="tool-section">
+                      <h4>入参</h4>
+                      <pre class="tool-pre">{
+  "command": "git diff --stat"
+}</pre>
+                    </div>
+                    <div class="tool-section">
+                      <h4>结果</h4>
+                      <pre class="tool-pre">webApp/frontend/          14 files changed
+flamingoAgents/core/      3 files changed
+tests/                    8 files changed</pre>
+                    </div>
+                    <div class="tool-execution"><span class="metric-label">Tool execution</span> 1.2s</div>
+                  </div>
+                </details>
+                <div class="tool-call-total"><span class="metric-label">Tool call</span> 2.9s</div>
+              </div>
+
+              <details class="thinking-block">
+                <summary>已思考</summary>
+                <div class="thinking-content">我再把结果和用户真正关心的展示边界对齐，确认每类耗时只在一个位置出现。</div>
+              </details>
+              <div class="thinking-elapsed"><span class="metric-label">Thinking</span> 0.8s</div>
+
+              <div class="answer-content">
+                <p>检查完成。当前结果可以按四个层级展示：</p>
+                <ul>
+                  <li>思考块下方只显示该块自己的 Thinking 耗时。</li>
+                  <li>工具详情里显示实际执行耗时，工具卡下方显示完整 Tool call 耗时。</li>
+                  <li>回答末尾显示从用户发消息到最后一个 token 的 Total 耗时。</li>
+                </ul>
+                <p>顶部状态栏只保留 TTFT 和 TPS，并接在用量信息之后。</p>
+              </div>
+              <div class="total-elapsed"><span class="metric-label">Total</span> 9.2s</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <footer class="composer">
+        <div class="composer-row">
+          <textarea class="composer-input" rows="1" aria-label="消息输入框示意" readonly>输入消息，Enter 发送，Shift+Enter 换行</textarea>
+          <button class="send-button" type="button">发送</button>
+        </div>
+        <div class="composer-status" aria-label="会话状态示意">
+          <div class="status-line status-workdir">📁 /home/wilburwan/FlamingoAgents　⎇ dev</div>
+          <div class="status-line status-usage">
+            ↑ 2.9k <span class="status-separator">·</span>
+            ↓ 443 <span class="status-separator">·</span>
+            ⚡ 2.0k cached <span class="status-separator">·</span>
+            $0.0013 <span class="status-separator">·</span>
+            0.3% / 1.0M <span class="status-separator">·</span>
+            <span class="latency-summary"><strong>TTFT</strong> 1.9s <span class="status-separator">·</span> <strong>TPS</strong> 42.6 tok/s</span>
+          </div>
+        </div>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

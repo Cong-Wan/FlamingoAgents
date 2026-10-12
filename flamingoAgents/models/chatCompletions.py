@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.21
-Date: 2026-09-08
-Description: Adapts internal messages/tools to OpenAI-compatible Chat Completions. v1.19 adds stack-local stream diagnosis: modelRequestError.diag, connect/firstByte/streamRead/decode stages, response-header whitelist, and success timings including sawDone. v1.20 swallows mergeErrorDiag failures so diagnosis cannot replace the original modelRequestError. v1.21（imageInputPlan）：user 消息含图时转为 image_url 多模态 content，无图保持原字符串形状。
+Version: 1.28
+Date: 2026-10-12
+Description: Adapts internal messages/tools to OpenAI-compatible Chat Completions. v1.19 adds stack-local stream diagnosis: modelRequestError.diag, connect/firstByte/streamRead/decode stages, response-header whitelist, and success timings including sawDone. v1.20 swallows mergeErrorDiag failures so diagnosis cannot replace the original modelRequestError. v1.21（imageInputPlan）：user 消息含图时转为 image_url 多模态 content，无图保持原字符串形状。v1.28（latencyDisplayImplementationPlan §3.3）：toolCallAccum 记录首个非空 arguments 片段到达 UNIX 毫秒，合成 toolCall 时赋 argumentsStartedAtMs。
 '''
 
 from __future__ import annotations
@@ -173,6 +173,8 @@ def successTimings(diag: dict[str, Any], *, textChars: int, reasoningChars: int,
     return {
         'ttfbMs': diag.get('ttfbMs'),
         'durationMs': durationMs,
+        'reasoningStartMs': diag.get('reasoningStartMs'),  # v1.22：首个 reasoning chunk 时点（thinkingPhaseMetricsPlan T1）
+        'reasoningEndMs': diag.get('reasoningEndMs'),      # v1.22：最后一个 reasoning chunk 时点
         'chunks': int(diag.get('chunks') or 0),
         'textChars': textChars,
         'reasoningChars': reasoningChars,
@@ -414,6 +416,7 @@ class chatCompletionsAdapter:
                     'name': accum['name'],
                     'arguments': ''.join(accum['argumentsParts']),
                 },
+                'argumentsStartedAtMs': accum.get('argumentsStartedAtMs'),  # v1.28：首个非空参数片段时点（latencyDisplayImplementationPlan §3.3）
             }
             for index, accum in sorted(toolCallAccum.items())
         ]
@@ -448,6 +451,11 @@ class chatCompletionsAdapter:
             diag['textChars'] = int(diag.get('textChars') or 0) + len(event.text or '')
         elif isinstance(event, reasoningChunk):
             diag['reasoningChars'] = int(diag.get('reasoningChars') or 0) + len(event.text or '')
+            t0 = diag.get('t0')
+            if isinstance(t0, (int, float)):
+                if diag.get('reasoningStartMs') is None:
+                    diag['reasoningStartMs'] = elapsedMs(t0)  # v1.22：首个思考 chunk 时点（thinkingPhaseMetricsPlan T1）
+                diag['reasoningEndMs'] = elapsedMs(t0)   # v1.22：每 chunk 更新，流末即最后思考时点
         else:
             return
         if 'ttfbMs' not in diag:
@@ -557,8 +565,11 @@ class chatCompletionsAdapter:
             if isinstance(functionValue, dict):
                 if functionValue.get('name'):
                     accum['name'] = functionValue['name']
-                if functionValue.get('arguments'):
-                    accum['argumentsParts'].append(functionValue['arguments'])
+                argumentFragment = functionValue.get('arguments')
+                if argumentFragment:
+                    if accum.get('argumentsStartedAtMs') is None:
+                        accum['argumentsStartedAtMs'] = int(time.time() * 1000)  # v1.28：首个非空片段时点
+                    accum['argumentsParts'].append(argumentFragment)
 
     def convertMessage(self, message: chatMessage) -> dict[str, Any]:
         if message.role == 'tool':
@@ -627,6 +638,7 @@ class chatCompletionsAdapter:
                 id=rawCall.get('id') or f'call_{index + 1}',
                 toolName=functionValue.get('name') or '',
                 arguments=arguments,
+                argumentsStartedAtMs=rawCall.get('argumentsStartedAtMs') if isinstance(rawCall.get('argumentsStartedAtMs'), int) and not isinstance(rawCall.get('argumentsStartedAtMs'), bool) else None,
             ))
 
         content = rawMessage.get('content') or ''

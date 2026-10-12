@@ -1,10 +1,12 @@
 '''
 Author: wilbur
-Version: 1.22
-Date: 2026-10-10
+Version: 1.24
+Date: 2026-10-12
 Description: FastAPI application and authenticated REST/SSE routes. v1.20 GET /api/usage 改为单一 period 账本快照；删除 /usage/series；删除会话前必须补齐 usageRecord。
             v1.21（versionDisplayPlan §4.1/§4.3）：/api/health 版本号改由 flamingoAgents/version.py 引用；新增免认证 GET /api/version（登录门展示用）。
             v1.22（stopDrain409FixPlan T6）：新增只读 GET /api/sessions/{sessionId}/stream-state（idle/active/draining），旧 status 行为不变。
+            v1.23（latencyMetricsDisplayPlan T1.7）：status 响应增加 lastTimings（最近一轮模型 timings，缺省 None）。
+            v1.24（latencyDisplayImplementationPlan）：chatStreamSync 入口记 monotonic 起点传 runUserMessageStream（Total 起点含验证/拼接/等待）；status 响应增 lastStepUsage（与 lastTimings 同源；旧会话无对子时从 JSONL 只读 fallback 并缓存）。
 '''
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -310,6 +313,89 @@ def createSession(body: dict = Body(...)):
     return sessionStore.createSession(str(workPath.resolve()), providerId, resolved.config.model)
 
 
+legacyLatencyPairCache: dict[str, dict | None] = {}  # v1.24：旧会话只读 fallback 进程内缓存（sessionId → 同源 stepUsage 或 None）
+legacyLatencyPairWatermark: dict[str, tuple] = {}  # v1.24：缓存对应的日志水位（size, mtime_ns）
+legacyLatencyPairLock = threading.Lock()
+
+
+def _validStepUsageInt(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _legacyLogWatermark(sessionId: str, session: dict) -> tuple | None:
+    # 缓存水位 = 日志 (size, mtime_ns)；日志变化（新增 assistantMessage 等）即视为缓存失效。
+    try:
+        logPath = resolveSessionLogDir('webData', Path(session.get('workDir', ''))) / f'{sessionId}.jsonl'
+        if not logPath.exists():
+            return None
+        stat = logPath.stat()
+        return (stat.st_size, stat.st_mtime_ns)
+    except Exception:
+        return None
+
+
+def legacyLatencyPairFallback(sessionId: str, session: dict):
+    # v1.24（latencyDisplayImplementationPlan §3.1）：索引缺 lastStepUsage 的旧会话，
+    # 自 JSONL 向后找最近一条 timings+usage 同事件的 assistantMessage，只读归一成 stepUsage；
+    # 不写日志、不写索引；索引出现新对子或日志新增 assistantMessage（水位变化）后失效。
+    watermark = _legacyLogWatermark(sessionId, session)
+    with legacyLatencyPairLock:
+        if sessionId in legacyLatencyPairCache:
+            if watermark is None or legacyLatencyPairWatermark.get(sessionId) == watermark:
+                return legacyLatencyPairCache[sessionId]
+            # 日志已变化：丢弃缓存重扫（负缓存不钉死）
+            legacyLatencyPairCache.pop(sessionId, None)
+            legacyLatencyPairWatermark.pop(sessionId, None)
+    pair = None
+    try:
+        pair = _readLegacyLatencyPair(sessionId, session)
+    except Exception:
+        pair = None
+    with legacyLatencyPairLock:
+        legacyLatencyPairCache[sessionId] = pair
+        if watermark is not None:
+            legacyLatencyPairWatermark[sessionId] = watermark
+    return pair
+
+
+def _readLegacyLatencyPair(sessionId: str, session: dict):
+    from flamingoAgents.utils.jsonl import jsonlLog
+    from flamingoAgents.utils.logPaths import resolveSessionLogDir
+
+    logPath = resolveSessionLogDir('webData', Path(session.get('workDir', ''))) / f'{sessionId}.jsonl'
+    if not logPath.exists():
+        return None
+    events = jsonlLog(logPath).readEvents(strict=True)
+    for event in reversed(events):
+        if event.get('type') != 'assistantMessage':
+            continue
+        timings = event.get('timings')
+        rawUsage = event.get('usage')
+        if not isinstance(timings, dict) or not isinstance(rawUsage, dict):
+            continue
+        ttfb = timings.get('ttfbMs')
+        duration = timings.get('durationMs')
+        if not (_validStepUsageInt(ttfb) and _validStepUsageInt(duration)):
+            continue
+        prompt = rawUsage.get('prompt_tokens')
+        completion = rawUsage.get('completion_tokens')
+        details = rawUsage.get('prompt_tokens_details')
+        cached = details.get('cached_tokens') if isinstance(details, dict) else 0
+        if not (_validStepUsageInt(prompt) and _validStepUsageInt(completion) and _validStepUsageInt(cached)):
+            continue
+        if completion <= 0:
+            continue  # 0 分子不构成可显示 TPS 对子
+        return {'promptTokens': prompt, 'cachedTokens': cached, 'completionTokens': completion}
+    return None
+
+
+def invalidateLegacyLatencyPairCache(sessionId: str) -> None:
+    # 供泵写入新配对/删除会话时显式失效（水位机制兜底防漏）。
+    with legacyLatencyPairLock:
+        legacyLatencyPairCache.pop(sessionId, None)
+        legacyLatencyPairWatermark.pop(sessionId, None)
+
+
 @authedApi.get('/sessions/{sessionId}/status')
 def getSessionStatus(sessionId: str):
     # 状态栏聚合（迭代二 §3.2）：usage/contextTokens 单一数据源为 sessions 索引；yaml 异常时 cost=0、contextWindow=null 降级（评审 M1）。
@@ -365,6 +451,8 @@ def getSessionStatus(sessionId: str):
         'contextWindow': contextWindow,
         'contextTokens': contextTokens,
         'contextUsedPercent': usedPercent,
+        'lastTimings': session.get('lastTimings'),  # T1.7：最近一轮模型 timings（缺省 None 容旧会话）
+        'lastStepUsage': session.get('lastStepUsage') or legacyLatencyPairFallback(sessionId, session),  # v1.24：与 lastTimings 同源单次用量；旧会话只读 fallback
     }
 
 
@@ -456,6 +544,7 @@ def deleteSession(sessionId: str):
         except usageLedger.usageLedgerError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
     sessionStore.deleteSession(sessionId)
+    invalidateLegacyLatencyPairCache(sessionId)  # v1.24：删除会话同时失效只读 fallback 缓存
     try:
         logPath.unlink(missing_ok=True)
     except OSError as error:
@@ -654,6 +743,7 @@ async def chatStream(request: Request):
 
 
 def chatStreamSync(body: dict):
+    turnStartedAt = time.monotonic()  # v1.24（latencyDisplayImplementationPlan §3.4）：入口起点，验证/附件拼接/idle 等待全计入
     sessionId = checkSessionId(body.get('sessionId') if isinstance(body, dict) else None)
     requireSession(sessionId)
     message = body.get('message')
@@ -696,6 +786,7 @@ def chatStreamSync(body: dict):
     runEvent = threading.Event()
     stream = agentInstance.runUserMessageStream(
         cleanMessage, sessionId, images=outgoingImages, committedImages=userImagesMeta, runEvent=runEvent,
+        turnStartedAt=turnStartedAt,
     )
     # baseCount 水位线（multiWindowStreamingPlan §4.3）：生成器惰性，appendUserMessage 在泵线程首次迭代才发生，采样必然先于写盘。
     baseCount = len(historyView.loadMessages(sessionId))

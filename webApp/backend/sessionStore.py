@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.6
-Date: 2026-09-07
+Version: 1.9
+Date: 2026-10-12
 Description: ~/.flamingo/logs/webData/sessions.json 会话索引 CRUD：进程内锁 + 临时文件 rename 原子写；updatedAt/usage/标题的刷新时机对齐契约 §2.1。
             v1.1 随包改名调整：webDataDir 因目录加深一级改为 parents[2]。
             v1.2 迭代二（方案 §3.3/§3.6）：updateUsage 增加可选 contextTokens 字段回写；新增 updateSessionModel（/model 指令）。
@@ -9,6 +9,9 @@ Description: ~/.flamingo/logs/webData/sessions.json 会话索引 CRUD：进程�
             v1.4 移除 sessionLogsDir（日志已迁至 ~/.flamingo/logs/webData/，本模块只保留 sessions.json 索引）。
             v1.5 新会话 sessionId 改为 YYMMDDHHmmss-xxxxxxxx（存量 session_* 仍合法）。
             v1.6 索引统一从家目录读写；新索引缺失时无损复制旧索引，新索引始终优先；损坏/不可读索引报错，防止当空索引覆盖。
+            v1.7（latencyMetricsDisplayPlan T1.6）updateUsage 增加可选 lastTimings（白名单 ttfbMs/durationMs，仅有效值写入）。
+            v1.8（thinkingPhaseMetricsPlan T2）lastTimings 白名单增加 reasoningStartMs/reasoningEndMs。
+            v1.9（latencyDisplayImplementationPlan §3.1）updateUsage 增加可选 lastStepUsage（与 lastTimings 同源单次用量；仅完整合法对子写入，缺一不覆盖）。
 '''
 
 from __future__ import annotations
@@ -135,10 +138,16 @@ def updateUsage(
     usage: dict,
     contextTokens: int | None = None,
     lastUsage: dict | None = None,
+    lastTimings: dict | None = None,
+    lastStepUsage: dict | None = None,
 ) -> None:
     # 泵线程结束时回写累计用量并刷新 updatedAt（契约 §2.1）；
     # contextTokens 为最近一轮 prompt+completion（迭代二 §3.6）；
-    # lastUsage 为本轮 token 增量（状态栏 ↑↓⚡ 展示用，与 usageTurns 一致）。
+    # lastUsage 为本轮 token 增量（状态栏 ↑↓⚡ 展示用，与 usageTurns 一致）；
+    # lastTimings 为最近一轮模型调用 timings（latencyMetricsDisplayPlan T1.6，白名单 ttfbMs/durationMs）；
+    # lastStepUsage 为与 lastTimings 同源的单次调用用量（latencyDisplayImplementationPlan §3.1）。
+    # v1.9 成对规则：仅当 lastTimings 与 lastStepUsage 同时合法时才作为对子写入；
+    # 缺任一（None 或非法）时保留索引里既有对子，不双清不覆盖（TPS 丢失根因修复）。
     with indexLock:
         sessions = loadIndex()
         session = sessions.get(sessionId)
@@ -157,6 +166,30 @@ def updateUsage(
                 'cachedTokens': int(lastUsage.get('cachedTokens', 0) or 0),
                 'completionTokens': int(lastUsage.get('completionTokens', 0) or 0),
             }
+        if lastTimings is not None:
+            nextTimings: dict[str, int] = {}
+            ttfb = lastTimings.get('ttfbMs')
+            duration = lastTimings.get('durationMs')
+            if isinstance(ttfb, int) and not isinstance(ttfb, bool) and ttfb >= 0:
+                nextTimings['ttfbMs'] = ttfb
+            if isinstance(duration, int) and not isinstance(duration, bool) and duration >= 0:
+                nextTimings['durationMs'] = duration
+            reasoningStart = lastTimings.get('reasoningStartMs')
+            reasoningEnd = lastTimings.get('reasoningEndMs')
+            if isinstance(reasoningStart, int) and not isinstance(reasoningStart, bool) and reasoningStart >= 0:
+                nextTimings['reasoningStartMs'] = reasoningStart
+            if isinstance(reasoningEnd, int) and not isinstance(reasoningEnd, bool) and reasoningEnd >= 0:
+                nextTimings['reasoningEndMs'] = reasoningEnd
+            if nextTimings:
+                session['lastTimings'] = nextTimings
+        if lastStepUsage is not None:
+            nextStepUsage: dict[str, int] = {}
+            for stepKey in ('promptTokens', 'cachedTokens', 'completionTokens'):
+                stepValue = lastStepUsage.get(stepKey)
+                if isinstance(stepValue, int) and not isinstance(stepValue, bool) and stepValue >= 0:
+                    nextStepUsage[stepKey] = stepValue
+            if len(nextStepUsage) == 3 and 'lastTimings' in session:
+                session['lastStepUsage'] = nextStepUsage  # v1.9：仅完整对子写入（当前调用层已在带 timings 帧时同步调用）
         session['updatedAt'] = nowIso()
         saveIndex(sessions)
 

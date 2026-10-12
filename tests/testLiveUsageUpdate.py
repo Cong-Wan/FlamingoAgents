@@ -432,9 +432,9 @@ def testPumpConvertsDtoAndLazyCost(tmp_path, monkeypatch, isolatedStores) -> Non
 
     realUpdate = sessionStore.updateUsage
 
-    def updateUsage(sessionId, usage, contextTokens=None, lastUsage=None):
+    def updateUsage(sessionId, usage, contextTokens=None, lastUsage=None, lastTimings=None, lastStepUsage=None):
         order.append(('update', lastUsage, dict(usage), contextTokens))
-        return realUpdate(sessionId, usage, contextTokens=contextTokens, lastUsage=lastUsage)
+        return realUpdate(sessionId, usage, contextTokens=contextTokens, lastUsage=lastUsage, lastTimings=lastTimings, lastStepUsage=lastStepUsage)
 
     def query(sessionId):
         order.append(('query', sessionId))

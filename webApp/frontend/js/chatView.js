@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.25
-Date: 2026-10-10
+Version: 1.31
+Date: 2026-10-12
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
@@ -53,7 +53,23 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              v1.25（stopDrain409FixPlan T7）：停止后 per-session FIFO 收尾队列（pendingSend/pendingConfirm，confirm 优先）；
              stream-state idle 探针后才发送，409 只在未接受时 300/600/1200ms 有限退避；切会话分桶、刷新不静默重放；
              stopped 广播不再直接推断 idle。
-*/
+             v1.26（latencyMetricsDisplayPlan T2.2/T2.3）：工具卡右下角耗时（details.elapsedMs）；assistant 块右下角
+             耗时脚标（usageUpdate 帧 timings.durationMs 写入当前 step；历史回放读 msg.timings）；缺数据不显示。
+             v1.27：①工具卡耗时移到卡片本体末尾；②块脚标加 stepDirty 门槛。
+             v1.28（latencyUiFixPlan §A）：①工具卡 Elapsed 挂回 detail 折叠区（默认隐藏，展开可见，
+             不在卡片 root 常驻）；②块脚标一次性归属（timingPainted 锁定，纯工具轮 usageUpdate 不覆盖）；
+             ③空白 delta 不置 dirty；toolCallStart/confirmationRequired 边界清 dirty；④历史回放仅
+             正文/思考非空的消息插模型脚标（纯 toolCalls 消息无孤立耗时）；⑤文案统一 Elapsed。
+             v1.29（thinkingPhaseMetricsPlan T3）：块脚标改组合口径 formatStepElapsedLine（有思考拆
+             Thinking/Output，与状态栏同源互相印证）；title 同步新口径。
+             v1.30（thinkingBlockMetricsPlan）：①每个思考块下方独立 Thinking 耗时（本地计时，
+             收口 flushAndCollapseThinking；stop/goIdle 兑底；历史回放用 reasoningStart/End）；
+             ②块脚标回退 Elapsed-only；③live TTFT：发出即计基准、首输出即上报状态栏，
+             retry 重置、权威帧/goIdle 清除。
+             v1.31（latencyDisplayImplementationPlan）：①删除模型级 Elapsed 脚标（stepDirty/timingPainted/footnoteEl）；
+             ②thinking 块紧邻自己的 Thinking 行（历史顺序同步）；③工具卡内 Tool execution + 卡片外紧邻 Tool call
+             （details.callElapsedMs，attach/历史同链路）；④最终 completed 后画 Total（帧携带 totalElapsedMs，与历史同值）；
+             ⑤usageUpdate.timings 帧权威覆盖本地思考计时。*/
 (function () {
   'use strict';
 
@@ -283,6 +299,15 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     card.resultSection = resultSection;
     card.resultPre = resultPre;
 
+    // T2.2 执行耗时（后端 details.elapsedMs 权威值）。
+    // v1.28（latencyUiFixPlan §A）：挂回 detail 末尾，随折叠隐藏；不在卡片 root 增加常驻行。
+    // v1.31（latencyDisplayImplementationPlan §3.3）：文案改 Tool execution（已确认 demo 口径）。
+    var elapsedEl = document.createElement('span');
+    elapsedEl.className = 'tool-elapsed hidden';
+    elapsedEl.title = '本工具实际执行时间（不含参数生成与排队）';
+    detail.appendChild(elapsedEl);
+    card.elapsedEl = elapsedEl;
+
     header.addEventListener('click', function () {
       var expanded = el.classList.toggle('expanded');
       detail.classList.toggle('hidden', !expanded);
@@ -333,6 +358,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     setCardStatus(card, statusFromResult(toolResult));
     card.resultSection.classList.remove('hidden');
     setCollapsibleText(card.resultPre, toolResult.content || '', card.resultSection);
+    setCardElapsed(card, toolResult.details);
     maybeScrollToBottom();
     return card;
   }
@@ -352,10 +378,49 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       if (card.status !== 'running') return;
       setCardStatus(card, 'error');
       card.resultSection.classList.remove('hidden');
+      setCardElapsed(card, null); // 未完成不显示耗时
       // 文案锚点：与 flamingoAgents/core/agent.py closeUnfinishedToolCalls contents['userStopped'] 保持一致，改文案需同步
       setCollapsibleText(card.resultPre, '该工具调用因用户停止未完成；停止前可能已产生文件或命令副作用。', card.resultSection);
     });
     maybeScrollToBottom();
+  }
+
+  // v1.28（latencyUiFixPlan §A）：填充/隐藏工具卡耗时（details.elapsedMs 缺失或非法不显示）
+  function setCardElapsed(card, details) {
+    if (!card || !card.elapsedEl) return;
+    var ms = details && typeof details === 'object' ? details.elapsedMs : null;
+    var text = window.statusUsage.formatElapsed(ms);
+    if (text === null) {
+      card.elapsedEl.classList.add('hidden');
+      card.elapsedEl.textContent = '';
+      return;
+    }
+    card.elapsedEl.textContent = 'Tool execution ' + text;
+    card.elapsedEl.classList.remove('hidden');
+  }
+
+  // v1.31（latencyDisplayImplementationPlan §3.3）：工具卡外部紧邻的 Tool call 总耗时
+  // （LLM 开始产出该工具参数 → 执行完成，含排队与确认等待）；details.callElapsedMs 缺失/非法不显示。
+  // 流式侧在卡片 append 后插入；同一 toolCallId 只更新文本不重复建节点。
+  function attachToolCallTotal(card, details) {
+    if (!card || !card.el || !card.el.parentNode) return;
+    var ms = details && typeof details === 'object' ? details.callElapsedMs : null;
+    var text = window.statusUsage.formatElapsed(ms);
+    if (text === null) return;
+    if (card.callTotalEl) {
+      card.callTotalEl.textContent = 'Tool call ' + text;
+      return;
+    }
+    var callTotalEl = document.createElement('span');
+    callTotalEl.className = 'tool-call-total';
+    callTotalEl.title = '从模型开始产出该工具参数到执行完成的总耗时（含参数生成、排队与确认等待）';
+    callTotalEl.textContent = 'Tool call ' + text;
+    if (typeof card.el.parentNode.insertBefore === 'function') {
+      card.el.parentNode.insertBefore(callTotalEl, card.el.nextSibling);
+    } else {
+      card.el.parentNode.appendChild(callTotalEl); // 环境兜底（无 insertBefore 的测试 stub）
+    }
+    card.callTotalEl = callTotalEl;
   }
 
   /* ---------- 消息块 ---------- */
@@ -518,6 +583,12 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var contentEl = document.createElement('div');
     contentEl.className = 'markdown-content';
     shell.body.appendChild(thinking.el);
+    // v1.30（thinkingBlockMetricsPlan §A）：思考块耗时兄弟行（details 之后，折叠态可见）
+    var thinkingElapsedEl = document.createElement('span');
+    thinkingElapsedEl.className = 'thinking-elapsed';
+    thinkingElapsedEl.classList.add('hidden');
+    thinkingElapsedEl.title = '本段思考耗时：首个到最后一个思考增量';
+    shell.body.appendChild(thinkingElapsedEl);
     shell.body.appendChild(contentEl);
     messageListEl.appendChild(shell.row);
     maybeScrollToBottom();
@@ -527,6 +598,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       thinkingEl: thinking.el,
       thinkingSummaryEl: thinking.summaryEl,
       thinkingContentEl: thinking.contentEl,
+      thinkingElapsedEl: thinkingElapsedEl,
       thinkingOpen: false,
       userToggledThinking: false,
       reasoningSeen: false,
@@ -545,8 +617,54 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       textBuf: '',
       reasoningBuf: '',
       sawToolEnd: false,
-      paintScheduled: false
+      paintScheduled: false,
+      reasoningStartedAt: null, // v1.30：本段思考首个增量时刻（Date.now，本地计时）
+      reasoningEndedAt: null,   // v1.30：本段思考最后增量时刻
+      thinkingPainted: false    // v1.30：思考块耗时是否已写入（一次性）
     };
+  }
+
+  // v1.30（thinkingBlockMetricsPlan §A）：写入本 step 思考块耗时（一次性；收口于 flushAndCollapseThinking）
+  function paintThinkingElapsed(step) {
+    if (!step || !step.live || !step.live.thinkingElapsedEl) return;
+    if (step.thinkingPainted) return;
+    if (step.reasoningStartedAt === null || step.reasoningEndedAt === null) return;
+    var ms = Math.max(0, step.reasoningEndedAt - step.reasoningStartedAt);
+    var text = window.statusUsage.formatElapsed(ms);
+    if (text === null) return;
+    step.live.thinkingElapsedEl.textContent = 'Thinking ' + text;
+    step.live.thinkingElapsedEl.classList.remove('hidden');
+    step.thinkingPainted = true;
+  }
+
+  // v1.31（latencyDisplayImplementationPlan §3.2）：权威思考耗时覆盖本地计时——
+  // usageUpdate.timings 帧带合法 reasoningStart/End 时，以服务端值覆盖本窗口即时值（历史同源）。
+  function applyAuthoritativeThinkingElapsed(timings) {
+    var stream = window.appStore.stream;
+    if (!stream || !stream.currentStep || !stream.currentStep.live) return;
+    var live = stream.currentStep.live;
+    if (!live.thinkingElapsedEl) return;
+    var parsed = window.statusUsage.readTimings(timings);
+    if (!parsed) return;
+    var value = window.statusUsage.thinkingMs(parsed);
+    if (value === null) return;
+    var text = window.statusUsage.formatElapsed(value);
+    if (text === null) return;
+    live.thinkingElapsedEl.textContent = 'Thinking ' + text;
+    live.thinkingElapsedEl.classList.remove('hidden');
+  }
+
+  // v1.31（latencyDisplayImplementationPlan §3.4）：最终 assistant 末尾 Total（completed 帧携带，与历史同值）。
+  function appendTurnTotal(step, totalElapsedMs) {
+    if (!step || !step.live || !step.live.bodyEl) return;
+    if (typeof totalElapsedMs !== 'number' || !isFinite(totalElapsedMs) || totalElapsedMs < 0) return;
+    if (step.live.totalEl) return;
+    var totalEl = document.createElement('span');
+    totalEl.className = 'total-elapsed';
+    totalEl.title = '本回答总耗时：从发出消息到回答完成（含模型、工具与确认等待）';
+    totalEl.textContent = 'Total ' + window.statusUsage.formatElapsed(totalElapsedMs);
+    step.live.bodyEl.appendChild(totalEl);
+    step.live.totalEl = totalEl;
   }
 
   // rAF paint 合并（D4）：把本 step 的 reasoningBuf/textBuf 一次性写入 DOM 并清除调度标记。
@@ -617,6 +735,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     if (!step || !step.live) return;
     flushLivePaint(step);
     collapseThinkingIfOpen(step.live);
+    paintThinkingElapsed(step); // v1.30：思考耗时写入收口（textDelta 折叠/toolCallStart/三终态全覆盖，thinkingBlockMetricsPlan D6）
   }
 
   // D6 隐式 step 边界：当前 step 已走过工具阶段（sawToolEnd=true）后又有模型输出（textDelta/reasoningDelta）
@@ -762,6 +881,23 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       thinking.contentEl.textContent = msg.reasoning;
       shell.body.appendChild(thinking.el);
     }
+    // v1.31（latencyDisplayImplementationPlan §3.2）：thinking 块紧邻自己的 Thinking 耗时行（在正文之前），
+    // 不再渲染模型级 Elapsed 脚标。
+    if (msg.reasoning) {
+      var thinkingElapsedText = null;
+      var parsedTimings = window.statusUsage.readTimings(msg.timings);
+      if (parsedTimings) {
+        var thinkingValue = window.statusUsage.thinkingMs(parsedTimings);
+        if (thinkingValue !== null) thinkingElapsedText = window.statusUsage.formatElapsed(thinkingValue);
+      }
+      if (thinkingElapsedText !== null) {
+        var thinkingElapsedEl = document.createElement('span');
+        thinkingElapsedEl.className = 'thinking-elapsed';
+        thinkingElapsedEl.title = '本段思考耗时：首个到最后一个思考增量';
+        thinkingElapsedEl.textContent = 'Thinking ' + thinkingElapsedText;
+        shell.body.appendChild(thinkingElapsedEl);
+      }
+    }
     shell.body.appendChild(contentEl);
     window.renderMarkdown(contentEl, msg.content || '', { breaks: true, highlight: true });
     attachMessageCopy(shell.body, msg.content || '');
@@ -773,6 +909,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         card = buildToolCard(toolCall, statusFromResult(result), '');
         card.resultSection.classList.remove('hidden');
         setCollapsibleText(card.resultPre, result.content || '', card.resultSection);
+        setCardElapsed(card, result.details); // T2.2：历史工具卡执行耗时（详情内）
       } else if (pending && pending.toolCall && pending.toolCall.id === toolCall.id) {
         // pending 中的 toolCall 不按 dangling 渲染，而是「待确认」卡片（契约 §3.8/§5）
         card = buildToolCard(toolCall, 'pending', pending.commandPreview || '');
@@ -782,7 +919,19 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       }
       toolCards[toolCall.id] = card;
       shell.body.appendChild(card.el);
+      // v1.31（latencyDisplayImplementationPlan §3.3）：卡片外紧邻 Tool call 脚标（参数生成→执行完成）；
+      // pending 卡无 callElapsedMs 不插，不挤位。
+      if (result) attachToolCallTotal(card, result.details);
     });
+
+    // v1.31（latencyDisplayImplementationPlan §3.4）：最终 assistant 末尾 Total（历史只读展示）
+    if (typeof msg.totalElapsedMs === 'number' && msg.totalElapsedMs >= 0) {
+      var totalEl = document.createElement('span');
+      totalEl.className = 'total-elapsed';
+      totalEl.title = '本回答总耗时：从发出消息到回答完成（含模型、工具与确认等待）';
+      totalEl.textContent = 'Total ' + window.statusUsage.formatElapsed(msg.totalElapsedMs);
+      shell.body.appendChild(totalEl);
+    }
 
     messageListEl.appendChild(shell.row);
     // 返回 thinking 壳引用（供 buildLiveFromHistory 复用，避免双壳--审核 M1）；无 reasoning 时为 null
@@ -874,6 +1023,40 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
   /* ---------- 流式事件处理（契约 §4.3 事件集） ---------- */
 
+  // v1.30（thinkingBlockMetricsPlan §B）：live TTFT——请求发出记基准，首个非空 delta 即上报状态栏；
+  // retryNotice 视为新 attempt 重置；权威 usageUpdate 帧到达由 statusBar 清 live（见 applyIncomingUsage）；goIdle 兑底清。
+  var liveTtfbState = { startedAt: null, reported: false };
+
+  function beginLiveTtfb() {
+    liveTtfbState.startedAt = Date.now();
+    liveTtfbState.reported = false;
+  }
+
+  function reportLiveTtfbIfNeeded(eventKind, data) {
+    if (liveTtfbState.startedAt === null || liveTtfbState.reported) return;
+    if (eventKind !== 'textDelta' && eventKind !== 'reasoningDelta') return;
+    if (!data || !((data.text || '').length > 0)) return;
+    liveTtfbState.reported = true;
+    var ms = Date.now() - liveTtfbState.startedAt;
+    if (window.statusBar && typeof window.statusBar.applyLiveTtfb === 'function') {
+      window.statusBar.applyLiveTtfb(ms);
+    }
+  }
+
+  function resetLiveTtfbForRetry() {
+    if (liveTtfbState.startedAt === null) return;
+    liveTtfbState.startedAt = Date.now();
+    liveTtfbState.reported = false;
+  }
+
+  function clearLiveTtfb() {
+    liveTtfbState.startedAt = null;
+    liveTtfbState.reported = false;
+    if (window.statusBar && typeof window.statusBar.clearLiveTtfb === 'function') {
+      window.statusBar.clearLiveTtfb();
+    }
+  }
+
   function onStreamEvent(event, data) {
     var stream = window.appStore.stream;
     if (!stream) return;
@@ -892,6 +1075,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       case 'textDelta':
         beginNewStepIfNeeded('textDelta');
         clearRetryNotice(stream.currentStep);
+        reportLiveTtfbIfNeeded('textDelta', data); // v1.30：首输出即时 TTFT
         stream.currentStep.textBuf += data.text || '';
         // 即将折叠 thinking 时先 flush 双 buffer（collapse 只发生一次，不破坏 rAF 合并）
         if (stream.currentStep.live.reasoningSeen && stream.currentStep.live.thinkingOpen) {
@@ -903,7 +1087,13 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       case 'reasoningDelta':
         beginNewStepIfNeeded('reasoningDelta');
         clearRetryNotice(stream.currentStep);
+        reportLiveTtfbIfNeeded('reasoningDelta', data); // v1.30：首思考输出即时 TTFT
         stream.currentStep.reasoningBuf += data.text || '';
+        if ((data.text || '').length > 0) {
+          var now = Date.now(); // v1.30：思考块本地计时首末（thinkingBlockMetricsPlan）
+          if (stream.currentStep.reasoningStartedAt === null) stream.currentStep.reasoningStartedAt = now;
+          stream.currentStep.reasoningEndedAt = now;
+        }
         stream.currentStep.live.thinkingEl.classList.remove('hidden');
         stream.currentStep.live.reasoningSeen = true;
         setThinkingState(stream.currentStep.live, '思考中…', true);
@@ -911,6 +1101,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         break;
 
       case 'retryNotice': // 非终态：消息下方「重试中」提示块（modelUxImprovePlan D6/T9）
+        resetLiveTtfbForRetry(); // v1.30：新 attempt 重置 TTFT 基准
         if (stream.currentStep && stream.currentStep.live) {
           upsertRetryNotice(stream.currentStep, data);
         }
@@ -918,11 +1109,15 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
       case 'usageUpdate': // 非终态：只重绘状态栏，不迁移 phase
         window.statusBar.applyUsageUpdate(data);
+        // v1.31（latencyDisplayImplementationPlan §3.2）：权威思考耗时随帧覆盖本地计时
+        applyAuthoritativeThinkingElapsed(data.timings);
         break;
 
       case 'toolCallStart':
         if (data.toolCall) {
-          if (stream.currentStep) flushAndCollapseThinking(stream.currentStep); // attach 首事件可能无 step（§5.2）
+          if (stream.currentStep) {
+            flushAndCollapseThinking(stream.currentStep); // attach 首事件可能无 step（§5.2）
+          }
           upsertToolCardOnStart(data.toolCall, data.preview || '');
         }
         break;
@@ -931,13 +1126,17 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
         if (data.toolResult) {
           // 仅本块新建卡片（非注册表归位）参与 step 归属判定（fixPlan Phase4 T4.5/审核 S1）
           var resolved = resolveToolCardOnEnd(data.toolResult);
+          // v1.31（latencyDisplayImplementationPlan §3.3）：卡片外部紧邻 Tool call 脚标
+          attachToolCallTotal(resolved, data.toolResult.details);
           if (resolved.ownedByLiveBlock) stream.currentStep.sawToolEnd = true;
         }
         break;
 
       case 'confirmationRequired': // 终态：弹框 + 用帧内 toolCall 建「待确认」卡片
         stream.terminalSeen = true;
-        if (stream.currentStep) flushAndCollapseThinking(stream.currentStep); // 终态入口强制 flush（D4 清单 2）；attach 回放可能无 step（§5.2）
+        if (stream.currentStep) {
+          flushAndCollapseThinking(stream.currentStep); // 终态入口强制 flush（D4 清单 2）；attach 回放可能无 step（§5.2）
+        }
         if (data.toolCall) {
           var card = toolCards[data.toolCall.id];
           if (card) {
@@ -963,6 +1162,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
           clearRetryNotice(stream.currentStep);
           flushAndCollapseThinking(stream.currentStep); // 终态入口强制 flush（D4 清单 2）
           renderFinal(stream.currentStep);
+          // v1.31（latencyDisplayImplementationPlan §3.4）：最终 assistant 末尾 Total（与历史同值）
+          appendTurnTotal(stream.currentStep, data.totalElapsedMs);
         }
         goIdle();
         window.sidebarView.refresh().then(function () { window.chatView.syncTopbar(); });
@@ -1296,7 +1497,11 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
 
   function goIdle() {
     var stream = window.appStore.stream;
-    if (stream && stream.currentStep) flushLivePaint(stream.currentStep); // 双保险（D4 清单 4）
+    if (stream && stream.currentStep) {
+      flushLivePaint(stream.currentStep); // 双保险（D4 清单 4）
+      paintThinkingElapsed(stream.currentStep); // v1.30：终态兑底（纯思考无正文的块）
+    }
+    clearLiveTtfb(); // v1.30：终态清 live TTFT（权威帧未到的极端情况防残留）
     window.appStore.stream = null;
     stickToBottom = true;
     hideJumpToBottom();
@@ -1471,6 +1676,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       pending: null
     };
     window.appStore.stream = streamState;
+    beginLiveTtfb(); // v1.30：请求发出记 TTFT 基准（thinkingBlockMetricsPlan §B）
     updateComposer();
 
     var body = { sessionId: sessionId, message: text };
@@ -1514,6 +1720,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     // [待确认] --批准/拒绝 POST confirm--> [流式中]（续流渲染进同一 assistant 块）
     stream.phase = 'streaming';
     stream.terminalSeen = false;
+    beginLiveTtfb(); // v1.30：confirm 续流同样记 TTFT 基准
     if (!stream.currentStep) {
       var step = createStep();
       stream.currentStep = step;
@@ -1545,6 +1752,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     markSessionDraining(sessionId); // UI 已是 stopping，但后端可能仍在 draining：下一次 send 走 stream-state 探针
     if (stream.currentStep) {
       flushLivePaint(stream.currentStep); // 进 stopping 前 buffer 强制上屏（D4 清单 3）
+      paintThinkingElapsed(stream.currentStep); // v1.30：停止时兑底思考耗时（thinkingBlockMetricsPlan）
       renderFinal(stream.currentStep);
     }
     markInterrupted(); // 立即停渲染 + 半截消息加「已中断」标记
