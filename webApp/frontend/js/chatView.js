@@ -1,7 +1,7 @@
 /*
 Author: wilbur
-Version: 1.31
-Date: 2026-10-12
+Version: 1.33
+Date: 2026-10-13
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
              v1.2 迭代二（方案 §4.5/§4.6）：头像换 flamingo2.png；send 支持 attachments（纯附件可发，气泡显示 chip 行）；
@@ -69,7 +69,9 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              v1.31（latencyDisplayImplementationPlan）：①删除模型级 Elapsed 脚标（stepDirty/timingPainted/footnoteEl）；
              ②thinking 块紧邻自己的 Thinking 行（历史顺序同步）；③工具卡内 Tool execution + 卡片外紧邻 Tool call
              （details.callElapsedMs，attach/历史同链路）；④最终 completed 后画 Total（帧携带 totalElapsedMs，与历史同值）；
-             ⑤usageUpdate.timings 帧权威覆盖本地思考计时。*/
+             ⑤usageUpdate.timings 帧权威覆盖本地思考计时。
+             v1.32（assistantCardCopyFix）：多 step 的已封口文字块在切换前执行终态渲染，确保每个助手卡片都有复制按钮。
+             v1.33（assistantCardCopyPositionFix）：正文复制按钮挂到 markdown 正文容器，位于思考卡片下方的正文右上角，按钮文案改为 copy。*/
 (function () {
   'use strict';
 
@@ -603,6 +605,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       userToggledThinking: false,
       reasoningSeen: false,
       contentEl: contentEl,
+      messageCopyEnabled: false,
       interrupted: false
     };
     thinking.summaryEl.addEventListener('click', function () { live.userToggledThinking = true; });
@@ -677,12 +680,13 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     }
     if (step.textBuf) {
       window.renderMarkdown(step.live.contentEl, step.textBuf, { breaks: true, highlight: false });
+      if (step.live.messageCopyEnabled) attachMessageCopy(step.live.contentEl, step.textBuf);
     }
   }
 
-  function attachMessageCopy(bodyEl, rawText) {
-    if (!bodyEl) return;
-    var existing = bodyEl.querySelector('.msg-copy-btn');
+  function attachMessageCopy(contentEl, rawText) {
+    if (!contentEl) return;
+    var existing = contentEl.querySelector('.msg-copy-btn');
     if (!rawText) {
       if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
       return;
@@ -694,7 +698,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     var btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'msg-copy-btn';
-    btn.textContent = '复制';
+    btn.textContent = 'copy';
     btn._rawMarkdown = rawText;
     btn.addEventListener('click', function (event) {
       event.preventDefault();
@@ -703,20 +707,21 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       var done = copyFn ? copyFn(btn._rawMarkdown) : Promise.reject(new Error('copyText missing'));
       done.then(function () {
         btn.textContent = '已复制';
-        setTimeout(function () { btn.textContent = '复制'; }, 1500);
+        setTimeout(function () { btn.textContent = 'copy'; }, 1500);
       }).catch(function () {
         btn.textContent = '复制失败';
-        setTimeout(function () { btn.textContent = '复制'; }, 1500);
+        setTimeout(function () { btn.textContent = 'copy'; }, 1500);
       });
     });
-    bodyEl.appendChild(btn);
+    contentEl.appendChild(btn);
   }
 
   // 终态高亮：只重渲 contentEl，不碰 bodyEl 上的 thinking / 工具卡 / retry / interrupted / inline error
   function renderFinal(step) {
     if (!step || !step.live || !step.live.contentEl || !step.textBuf) return;
     window.renderMarkdown(step.live.contentEl, step.textBuf, { breaks: true, highlight: true });
-    attachMessageCopy(step.live.bodyEl, step.textBuf);
+    step.live.messageCopyEnabled = true;
+    attachMessageCopy(step.live.contentEl, step.textBuf);
   }
 
   // delta 只进 buffer，每帧最多一次 DOM 写；scroll 合入 paint 回调末尾
@@ -751,6 +756,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     }
     if (step.sawToolEnd && (eventKind === 'textDelta' || eventKind === 'reasoningDelta')) {
       flushLivePaint(step); // 旧 step 封眼前强制上屏（D4 清单 1）
+      renderFinal(step); // 旧 step 已封口：补终态增强和助手卡片复制按钮
       stream.currentStep = createStep();
       stream.steps.push(stream.currentStep);
     }
@@ -900,7 +906,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
     }
     shell.body.appendChild(contentEl);
     window.renderMarkdown(contentEl, msg.content || '', { breaks: true, highlight: true });
-    attachMessageCopy(shell.body, msg.content || '');
+    attachMessageCopy(contentEl, msg.content || '');
 
     (msg.toolCalls || []).forEach(function (toolCall) {
       var result = toolResults[toolCall.id];
@@ -1273,6 +1279,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       userToggledThinking: false,
       reasoningSeen: false,
       contentEl: lastAssistant.contentEl,
+      messageCopyEnabled: !!lastAssistant.content,
       interrupted: false
     };
     if (live.thinkingSummaryEl) {

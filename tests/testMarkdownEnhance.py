@@ -1,9 +1,9 @@
 '''
 Author: wilbur
-Version: 1.0
-Date: 2026-09-15
+Version: 1.1
+Date: 2026-10-13
 Description: Node harness for markdown.js 终态增强（复制按钮 / mermaid 占位 / live 帧不增强）
-             以及 chatView ↑ 召回不得挂进 renderHistory/attach（chatUxImprovePlan T11）。
+             以及 chatView ↑ 召回不得挂进 renderHistory/attach（chatUxImprovePlan T11）。v1.1：断言代码块复制按钮使用 copy 文案。
 '''
 
 from __future__ import annotations

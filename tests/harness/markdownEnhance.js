@@ -141,6 +141,7 @@ assert.ok(liveRoot.querySelectorAll('pre code').length >= 1);
 const finalRoot = new El('div');
 sandbox.renderMarkdown(finalRoot, 'hello\n\n```javascript\nconst a = 1;\n```\n', { breaks: true, highlight: true });
 assert.strictEqual(finalRoot.querySelectorAll('.copy-btn').length, 1);
+assert.strictEqual(finalRoot.querySelectorAll('.copy-btn')[0].textContent, 'copy');
 assert.strictEqual(finalRoot.querySelectorAll('.mermaid-block').length, 0);
 
 const mermaidRoot = new El('div');

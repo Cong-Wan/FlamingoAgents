@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.32
-Date: 2026-10-12
-Description: FlamingoAgents native Web styles. v1.25 用量页改为下拉筛选、四卡常驻、Provider 趋势卡与质量提示，删除会话表和 Chart.js 容器。v1.26（versionDisplayPlan §4.4）：新增 .login-version 与 .sidebar-version 版本号小字样式。v1.27：侧栏版本号移至顶部「新建会话」上方，字号 14px 与按钮同大。v1.28（latencyMetricsDisplayPlan T2.6）：新增 .tool-elapsed/.step-elapsed 耗时样式。v1.29（latencyUiFixPlan §A）：.tool-elapsed 适配 detail 内部（去横向 padding，避免双重内边距）。v1.30（thinkingPhaseMetricsPlan T4）：cache-bust 提版（样式无变更）。v1.31（thinkingBlockMetricsPlan）：新增 .thinking-elapsed（思考块下方兄弟行，折叠态可见）。v1.32（latencyDisplayImplementationPlan）：删 .step-elapsed（模型级 Elapsed）；新增 .tool-call-total/.total-elapsed；#statusSpeed 行随 HTML 删除。
+Version: 1.33
+Date: 2026-10-13
+Description: FlamingoAgents native Web styles. v1.25 用量页改为下拉筛选、四卡常驻、Provider 趋势卡与质量提示，删除会话表和 Chart.js 容器。v1.26（versionDisplayPlan §4.4）：新增 .login-version 与 .sidebar-version 版本号小字样式。v1.27：侧栏版本号移至顶部「新建会话」上方，字号 14px 与按钮同大。v1.28（latencyMetricsDisplayPlan T2.6）：新增 .tool-elapsed/.step-elapsed 耗时样式。v1.29（latencyUiFixPlan §A）：.tool-elapsed 适配 detail 内部（去横向 padding，避免双重内边距）。v1.30（thinkingPhaseMetricsPlan T4）：cache-bust 提版（样式无变更）。v1.31（thinkingBlockMetricsPlan）：新增 .thinking-elapsed（思考块下方兄弟行，折叠态可见）。v1.32（latencyDisplayImplementationPlan）：删 .step-elapsed（模型级 Elapsed）；新增 .tool-call-total/.total-elapsed；#statusSpeed 行随 HTML 删除。v1.33（assistantCardCopyPositionFix）：正文复制按钮定位到正文容器右上角，不占用思考卡片位置。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -231,7 +231,7 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
   background: #ffe9ec; display: flex; align-items: center; justify-content: center;
   font-size: 17px; margin-right: 12px;
 }
-.msg-body { flex: 1; min-width: 0; font-size: 14px; line-height: 1.7; position: relative; padding-right: 48px; }
+.msg-body { flex: 1; min-width: 0; font-size: 14px; line-height: 1.7; position: relative; }
 .msg-interrupted {
   display: inline-block; font-size: 12px; color: var(--warn);
   border: 1px solid var(--warn); border-radius: 999px; padding: 1px 8px; margin-top: 8px;
@@ -255,6 +255,7 @@ code { background: var(--gray-block); padding: 1px 5px; border-radius: 4px; font
 
 /* markdown 正文（D2=B：补被 * reset 清掉的标题/段落/列表，保留原 pre/table/blockquote） */
 .markdown-content { line-height: 1.7; word-wrap: break-word; }
+.msg-body > .markdown-content { position: relative; padding-right: 48px; }
 .markdown-content > :first-child { margin-top: 0; }
 .markdown-content h1, .markdown-content h2, .markdown-content h3,
 .markdown-content h4, .markdown-content h5, .markdown-content h6 {

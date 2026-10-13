@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 2.0
-Date: 2026-10-10
+Version: 2.1
+Date: 2026-10-13
 Description: latencyUiFixPlan P1 前端 Node 单测——完整 vm 加载 chatView.js + 真实 statusUsage.js，覆盖：
              ①工具卡 Elapsed 回归折叠详情（默认隐藏、展开可见、不在卡片 root）；
              ②模型耗时一次性归属（纯工具轮 usageUpdate 不覆盖文字块脚标）；
@@ -9,6 +9,7 @@ Description: latencyUiFixPlan P1 前端 Node 单测——完整 vm 加载 chatVi
              ④历史回放（纯工具 assistant 无模型脚标；孤儿 toolCallEnd 兜底卡显示 elapsed）；
              ⑤formatSpeedLine 两形态（TTFT/Output/TPS 与 TTFT—/Total/TPS—）。
              v2.0 替换 v1.0 的 extractFunction+eval 截取与恒真断言（复审 M3）。
+             v2.1：补充多 step 助手卡片均插入文字复制按钮的回归测试。
 '''
 
 from __future__ import annotations
@@ -330,6 +331,86 @@ function textStepFootnotes() {
     runNode(script, [chatPath, usagePath])
 
 
+def testChatViewMultiStepMessageCopy() -> None:
+    script = nodeHarness + r'''
+const ids = baseIds();
+const sandbox = {
+  console, setTimeout, clearTimeout, setInterval, clearInterval, Promise, JSON, Math, Number, Object, Array, String, Boolean, Date, Error,
+  requestAnimationFrame: (cb) => setTimeout(cb, 0)
+};
+sandbox.window = sandbox;
+sandbox.globalThis = sandbox;
+sandbox.document = makeDocument(ids);
+sandbox.appStore = { currentSessionId: 's1', stream: null, sessions: [], findSession() { return { title: 't', providerId: 'p', modelId: 'm' }; } };
+const posts = [];
+sandbox.sse = {
+  streamPost(path, body, onEvent) {
+    const d = deferred();
+    const record = { path, body, onEvent, d };
+    record.abort = function () { d.resolve('aborted'); };
+    posts.push(record);
+    return { done: d.promise, abort: record.abort };
+  }
+};
+sandbox.api = {
+  stopChat() { return Promise.resolve({ stopped: true }); },
+  getMessages() { return Promise.resolve({ messages: [] }); },
+  getPending() { return Promise.resolve({ pending: null }); },
+  getStreamState() { return Promise.resolve({ state: 'idle' }); },
+  getSessionStatus() { return Promise.resolve({}); }
+};
+sandbox.toast = function () {};
+sandbox.statusBar = {
+  applyUsageUpdate() {}, resetForSession() {}, hide() {},
+  refresh() { return Promise.resolve(); },
+  applyLiveTtfb() {}, clearLiveTtfb() {}
+};
+sandbox.fileMention = { getAttachments() { return []; }, clearChips() {}, resetForSession() {} };
+sandbox.fileExplorer = { open() {}, hide() {} };
+sandbox.skillChip = { get() { return null; }, clear() {}, resetForSession() {} };
+sandbox.sidebarView = { refresh() { return Promise.resolve(); } };
+sandbox.renderMarkdown = function (el, text) { el.textContent = text; };
+sandbox.copyText = function () { return Promise.resolve(); };
+vm.createContext(sandbox);
+function load(path) { vm.runInContext(fs.readFileSync(path, 'utf8'), sandbox, { filename: path }); }
+load(process.argv[2]); // 真实 statusUsage.js
+load(process.argv[1]); // chatView.js
+function flush() { return new Promise(r => setTimeout(r, 0)); }
+async function flushN(n) { for (let i = 0; i < n; i++) await flush(); }
+
+(async function main() {
+  ids.composerInput.disabled = false;
+  ids.sendButton.disabled = false;
+  ids.composerInput.value = 'multi-step';
+  ids.sendButton.click();
+  await flushN(4);
+  const post = posts[0];
+
+  // 第一段正文后经过工具调用，第二段正文会落到新的助手卡片。
+  post.onEvent('textDelta', { text: '第一段回答' });
+  await flushN(2);
+  post.onEvent('toolCallStart', { toolCall: { id: 'tool-1', toolName: 'bash', arguments: {} }, preview: 'echo' });
+  await flushN(1);
+  post.onEvent('toolCallEnd', { toolResult: { toolCallId: 'tool-1', toolName: 'bash', isError: false, content: 'ok', details: {} } });
+  await flushN(1);
+  post.onEvent('textDelta', { text: '第二段回答' });
+  await flushN(2);
+  post.onEvent('completed', { totalElapsedMs: 10 });
+  await flushN(4);
+
+  const rows = sandbox.document.querySelectorAll('.msg-assistant');
+  const buttons = sandbox.document.querySelectorAll('.msg-copy-btn');
+  assert.strictEqual(rows.length, 2, 'tool round creates two assistant cards');
+  assert.strictEqual(buttons.length, 2, 'every assistant card has a copy button');
+  assert.deepStrictEqual(buttons.map(button => button._rawMarkdown), ['第一段回答', '第二段回答']);
+  assert.strictEqual(buttons[0].textContent, 'copy', 'assistant copy button uses copy label');
+  assert.strictEqual(buttons[0].parentNode.className, 'markdown-content', 'copy button belongs to response content');
+  console.log('multi-step assistant copy: ok');
+})().catch(error => { console.error(error); process.exit(1); });
+'''
+    runNode(script, [chatPath, usagePath])
+
+
 def testChatViewDirtyBoundariesAndHistory() -> None:
     script = nodeHarness + r'''
 const ids = baseIds();
@@ -574,12 +655,12 @@ function usagePayload(over) {
   // cache-bust 同步（latencyDisplayImplementationPlan §3.3/P2.8）
   const fs = require('fs');
   const indexSource = fs.readFileSync(process.argv[4], 'utf8');
-  assert.ok(indexSource.includes('href="/static/styles.css?v=1.32"'));
-  assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.31"'));
+  assert.ok(indexSource.includes('href="/static/styles.css?v=1.33"'));
+  assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.33"'));
   assert.ok(indexSource.includes('src="/static/js/statusBar.js?v=1.11"'));
   assert.ok(indexSource.includes('src="/static/js/statusUsage.js?v=1.7"'));
   const chatSource = fs.readFileSync(process.argv[1], 'utf8');
-  assert.ok(chatSource.includes('Version: 1.31'));
+  assert.ok(chatSource.includes('Version: 1.33'));
   const usageSource = fs.readFileSync(process.argv[2], 'utf8');
   assert.ok(usageSource.includes('Version: 1.7'));
   const barSource = fs.readFileSync(process.argv[3], 'utf8');

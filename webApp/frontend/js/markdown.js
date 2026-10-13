@@ -1,13 +1,14 @@
 /*
 Author: wilbur
-Version: 1.2
-Date: 2026-09-15
+Version: 1.3
+Date: 2026-10-13
 Description: 公共 markdown 同步渲染：marked.parse → DOMPurify → innerHTML；
              可选 highlight.js 围栏高亮（与 fileExplorer.highlightCode 同路径，禁用 highlightElement）。
              聊天 / 文件预览共用。禁止 marked.setOptions，breaks/highlight 由调用方传入。
              v1.1（chatUxImprovePlan）：opts.highlight 时附加代码复制按钮 + 懒加载 mermaid（SVG 再消毒）；
              copyText 含 LAN HTTP 的 execCommand 降级。
              v1.2：流程图 htmlLabels=false，标签走 SVG text；消毒保留 SVG/foreignObject，避免逻辑图只剩框看不见字。
+             v1.3（assistantCardCopyLabelFix）：代码块复制按钮文案统一为 copy/copied/copy failed。
 */
 (function () {
   'use strict';
@@ -60,16 +61,16 @@ Description: 公共 markdown 同步渲染：marked.parse → DOMPurify → inner
     var btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'copy-btn';
-    btn.textContent = '复制';
+    btn.textContent = 'copy';
     btn.addEventListener('click', function (event) {
       event.preventDefault();
       event.stopPropagation();
       copyText(text).then(function () {
-        btn.textContent = '已复制';
-        setTimeout(function () { btn.textContent = '复制'; }, 1500);
+        btn.textContent = 'copied';
+        setTimeout(function () { btn.textContent = 'copy'; }, 1500);
       }).catch(function () {
-        btn.textContent = '复制失败';
-        setTimeout(function () { btn.textContent = '复制'; }, 1500);
+        btn.textContent = 'copy failed';
+        setTimeout(function () { btn.textContent = 'copy'; }, 1500);
       });
     });
     pre.appendChild(btn);
