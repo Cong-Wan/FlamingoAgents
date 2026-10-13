@@ -1,12 +1,13 @@
 '''
 Author: wilbur
-Version: 1.24
-Date: 2026-10-12
+Version: 1.25
+Date: 2026-10-13
 Description: FastAPI application and authenticated REST/SSE routes. v1.20 GET /api/usage 改为单一 period 账本快照；删除 /usage/series；删除会话前必须补齐 usageRecord。
             v1.21（versionDisplayPlan §4.1/§4.3）：/api/health 版本号改由 flamingoAgents/version.py 引用；新增免认证 GET /api/version（登录门展示用）。
             v1.22（stopDrain409FixPlan T6）：新增只读 GET /api/sessions/{sessionId}/stream-state（idle/active/draining），旧 status 行为不变。
             v1.23（latencyMetricsDisplayPlan T1.7）：status 响应增加 lastTimings（最近一轮模型 timings，缺省 None）。
             v1.24（latencyDisplayImplementationPlan）：chatStreamSync 入口记 monotonic 起点传 runUserMessageStream（Total 起点含验证/拼接/等待）；status 响应增 lastStepUsage（与 lastTimings 同源；旧会话无对子时从 JSONL 只读 fallback 并缓存）。
+            v1.25（imageFilePreviewPlan）：新增 GET /sessions/{sessionId}/fileImage，返回工作区 PNG/JPEG/WebP 原字节；显式映射图片超限为 413。
 '''
 
 from __future__ import annotations
@@ -502,6 +503,19 @@ def getFileContent(sessionId: str, path: str = ''):
     if not path:
         raise HTTPException(status_code=400, detail='path 不能为空。')
     return fileBrowser.readTextFile(session['workDir'], path)
+
+
+@authedApi.get('/sessions/{sessionId}/fileImage')
+def getFileImage(sessionId: str, path: str = ''):
+    checkSessionId(sessionId)
+    session = requireSession(sessionId)
+    if not path:
+        raise HTTPException(status_code=400, detail='path 不能为空。')
+    try:
+        raw, mimeType = fileBrowser.readImageFile(session['workDir'], path)
+    except imageInputError as error:
+        mapImageError(error)
+    return Response(content=raw, media_type=mimeType, headers={'Cache-Control': 'no-store'})
 
 
 @authedApi.get('/sessions/{sessionId}/images/{ref}')

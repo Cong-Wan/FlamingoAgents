@@ -1,12 +1,13 @@
 /*
 Author: wilbur
-Version: 1.2
-Date: 2026-08-17
+Version: 1.3
+Date: 2026-10-13
 Description: 右侧文件浏览器（迭代二方案 §4.7/D6）：懒加载目录树（每层缓存、刷新清缓存）、折叠状态存 localStorage；
              文件预览弹层——代码 highlight.js 高亮（getLanguage 预判降级纯文本、输出过 DOMPurify）、
              .md marked 渲染（渲染/源码切换）、行号列；Esc 经 modalStack 只关栈顶。
              v1.1 取消 PREVIEW_CHAR_LIMIT 预览截断限制，完整渲染文件内容。
              v1.2（markdownRenderUnifyPlan）：渲染模式改调 window.renderMarkdown（breaks:false, highlight:true）；源码模式不动。
+             v1.3（imageFilePreviewPlan）：PNG/JPEG/WebP 走图片接口并在现有弹层预览；当前图片 URL 只在关闭或新预览成功时释放。
 */
 (function () {
   'use strict';
@@ -29,7 +30,8 @@ Description: 右侧文件浏览器（迭代二方案 §4.7/D6）：懒加载目�
   } catch (ignore) { /* 隐私模式 */ }
 
   var dirCache = {};      // path → entries
-  var previewState = null; // { path, content, isMarkdown, mode: 'rendered'|'source' }
+  var previewState = null; // { path, content, isMarkdown, mode } 或 { path, imageUrl, isImage }
+  var previewRequestId = 0;
 
   var languageMap = {
     js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
@@ -70,7 +72,8 @@ Description: 右侧文件浏览器（迭代二方案 §4.7/D6）：懒加载目�
 
     var label = document.createElement('span');
     label.className = 'file-name';
-    label.textContent = (entry.type === 'dir' ? '📁 ' : '📄 ') + entry.name;
+    var icon = entry.type === 'dir' ? '📁 ' : (isImagePath(entry.name) ? '🖼 ' : '📄 ');
+    label.textContent = icon + entry.name;
     label.title = path;
     row.appendChild(label);
     return row;
@@ -201,8 +204,24 @@ Description: 右侧文件浏览器（迭代二方案 §4.7/D6）：懒加载目�
     return el;
   }
 
+  function buildImageView(state) {
+    var wrap = document.createElement('div');
+    wrap.className = 'preview-image-wrap';
+    var image = document.createElement('img');
+    image.className = 'preview-image';
+    image.src = state.imageUrl;
+    image.alt = state.path;
+    wrap.appendChild(image);
+    return wrap;
+  }
+
   function renderPreviewBody() {
     previewBodyEl.innerHTML = '';
+    if (previewState.isImage) {
+      previewBodyEl.appendChild(buildImageView(previewState));
+      previewModeToggle.classList.add('hidden');
+      return;
+    }
     var content = previewState.content;
     if (previewState.isMarkdown && previewState.mode === 'rendered') {
       previewBodyEl.appendChild(buildMarkdownView(content));
@@ -212,30 +231,60 @@ Description: 右侧文件浏览器（迭代二方案 §4.7/D6）：懒加载目�
     previewModeToggle.textContent = previewState.mode === 'rendered' ? '源码' : '渲染';
   }
 
+  function isImagePath(path) {
+    return /\.(png|jpe?g|webp)$/i.test(path || '');
+  }
+
+  function releasePreviewUrl(state) {
+    if (state && state.imageUrl) URL.revokeObjectURL(state.imageUrl);
+  }
+
+  function commitPreview(state) {
+    var wasOpen = previewState !== null;
+    releasePreviewUrl(previewState);
+    previewState = state;
+    previewTitleEl.textContent = state.path;
+    previewTitleEl.title = state.path;
+    previewModeToggle.classList.toggle('hidden', !state.isMarkdown);
+    renderPreviewBody();
+    previewModalEl.classList.remove('hidden');
+    if (!wasOpen) window.appStore.pushModalClose(closePreview); // 弹层已打开时不重复压栈
+  }
+
   function closePreview() {
+    previewRequestId += 1;
     previewModalEl.classList.add('hidden');
+    releasePreviewUrl(previewState);
     previewState = null;
+    previewBodyEl.innerHTML = '';
     window.appStore.removeModalClose(closePreview);
   }
 
   async function openPreview(path) {
     var sessionId = window.appStore.currentSessionId;
     if (!sessionId) return;
+    var requestId = ++previewRequestId;
     try {
+      if (isImagePath(path)) {
+        var blob = await window.api.getFileImage(sessionId, path);
+        var imageUrl = URL.createObjectURL(blob);
+        if (requestId !== previewRequestId) {
+          URL.revokeObjectURL(imageUrl);
+          return;
+        }
+        commitPreview({ path: path, imageUrl: imageUrl, isImage: true });
+        return;
+      }
       var data = await window.api.getFileContent(sessionId, path);
-      previewState = {
+      if (requestId !== previewRequestId) return;
+      commitPreview({
         path: data.path,
         content: data.content || '',
         isMarkdown: ['md', 'markdown'].indexOf(extOf(data.path)) >= 0,
         mode: 'rendered'
-      };
-      previewTitleEl.textContent = data.path;
-      previewTitleEl.title = data.path;
-      previewModeToggle.classList.toggle('hidden', !previewState.isMarkdown);
-      renderPreviewBody();
-      previewModalEl.classList.remove('hidden');
-      window.appStore.pushModalClose(closePreview); // Esc 栈（§4.3）
+      });
     } catch (error) {
+      if (requestId !== previewRequestId) return;
       if (window.toast) window.toast(error.message);
     }
   }

@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.12
-Date: 2026-10-10
-Description: Authenticated fetch wrapper for Web APIs. v1.10 getUsage 只请求 period 单一统计接口，删除 series，并支持 AbortController。v1.11（versionDisplayPlan §4.4）：新增免认证 getVersion（登录门 footer 也要显示）。v1.12（stopDrain409FixPlan T6/T7）：新增 getStreamState 只读收尾探针（idle/active/draining）。
+Version: 1.13
+Date: 2026-10-13
+Description: Authenticated fetch wrapper for Web APIs. v1.10 getUsage 只请求 period 单一统计接口，删除 series，并支持 AbortController。v1.11（versionDisplayPlan §4.4）：新增免认证 getVersion（登录门 footer 也要显示）。v1.12（stopDrain409FixPlan T6/T7）：新增 getStreamState 只读收尾探针（idle/active/draining）。v1.13（imageFilePreviewPlan）：新增 getFileImage，带鉴权获取工作区图片 Blob。
 */
 (function () {
   'use strict';
@@ -147,6 +147,21 @@ Description: Authenticated fetch wrapper for Web APIs. v1.10 getUsage 只请求 
     },
     getFileContent: function (sessionId, path) {
       return request('/api/sessions/' + encodeURIComponent(sessionId) + '/fileContent?path=' + encodeURIComponent(path));
+    },
+    getFileImage: async function (sessionId, path) {
+      var resp = await fetch('/api/sessions/' + encodeURIComponent(sessionId) + '/fileImage?path=' + encodeURIComponent(path), {
+        headers: {
+          'Authorization': window.appStore.token ? ('Bearer ' + window.appStore.token) : '',
+          'Accept': 'image/*'
+        }
+      });
+      if (resp.status === 401) {
+        window.appStore.clearToken();
+        onUnauthorized();
+        throw buildError(401, '未认证或 token 已失效');
+      }
+      if (!resp.ok) throw buildError(resp.status, await parseErrorBody(resp));
+      return resp.blob();
     },
     getSessionImage: async function (sessionId, ref) {
       var resp = await fetch('/api/sessions/' + encodeURIComponent(sessionId) + '/images/' + encodeURIComponent(ref), {

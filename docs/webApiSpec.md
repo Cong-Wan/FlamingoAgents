@@ -1,8 +1,8 @@
 # FlamingoAgents Web —— 前后端接口契约
 
 > Author: wilbur
-> Version: 1.33
-> Date: 2026-10-10
+> Version: 1.34
+> Date: 2026-10-13
 > 目的：定义 Web 程序前后端对接的全部接口（REST + SSE），作为 `docs/webAppPlan.md` v1.1 的接口层细化。前端/后端各自独立开发时以本文档为唯一契约。
 > 上游约束：事件模型对齐 `flamingoAgents/core/types.py` 9 事件；会话日志结构对齐 `core/conversation.py` jsonl 事件；模型配置结构对齐 `config/models.yaml` 与 `models/modelConfig.py` 解析规则。
 > v1.1：按 pi 审核报告修订——H1 新增 pending 查询端点修复「待确认刷新后死锁」；H2 tool DTO 补 details（区分被拒绝/失败）；M1 usage 嵌套字段映射表；M2 modelError/timings 口径；M3 GET models 不用库解析器；M4 建会话预检实现路径；M5 dangling 重放渲染归位；L1-L6 标注不可达项/幂等/初值等。
@@ -39,6 +39,7 @@
 > v1.31（latencyMetricsDisplayPlan）：§3.14 status 新增 `lastTimings`；`usageUpdate` 帧新增 `timings`（缺省 null 容旧）；`toolResult.details` 约定补 `elapsedMs`（Core executeToolCall 打点）；§2.2 assistant DTO 新增 `timings` 透传。
 > v1.32（thinkingPhaseMetricsPlan）：timings 增加 `reasoningStartMs`/`reasoningEndMs`（思考阶段首末时点，非流式路径缺失为 null）；速度行口径拆 Thinking；**TPS 口径 v2**（分母=思考结束后的 Output），与 v1 数值不可比。
 > v1.33（latencyDisplayImplementationPlan）：§3.14 status 新增 `lastStepUsage`（与 `lastTimings` 同源单次调用用量，缺省 null；旧会话无对子时从 JSONL 最近同事件 assistantMessage 只读恢复并进程内缓存）；`completed` 帧与 §2.2 最终 assistant DTO 新增 `totalElapsedMs`（发消息入口 → 最终 completed 整轮耗时，缺省 null）；`toolCallStart` 帧 / assistant DTO 的 toolCall 新增 `argumentsStartedAtMs`（首个非空参数片段到达时点，缺省 null）；`toolResult.details` 约定补 `callElapsedMs`（参数生成开始 → 执行完成，含排队与确认等待）；前端状态栏改为用量行内 TTFT/TPS-only。
+> v1.34（imageFilePreviewPlan）：新增 §3.17.1 `GET /api/sessions/{sessionId}/fileImage`，用于工作区 PNG/JPEG/WebP 图片预览；文本 `fileContent` 行为不变。
 
 ---
 
@@ -467,6 +468,17 @@
 - 200：`{ "path": "src/a.py", "size": 1234, "content": "<utf-8 文本>" }`（`errors='replace'` 解码）；
 - 400：路径越拘禁 / 不是文件 / 含 NUL 字节（二进制）/ 不存在或不可读；404：会话不存在。
 - **与 @ 引用无关**：`@` 发送不走本端点；能引用不等于能预览。
+
+### 3.17.1 GET /api/sessions/{sessionId}/fileImage —— 查看工作区图片（v1.34 新增）
+
+请求：`GET .../fileImage?path=<相对 workDir 路径>`（空 path → 400；前端必须 `encodeURIComponent`）
+
+- 200：图片原始字节；`Content-Type` 由实际格式决定（PNG→`image/png`、JPEG→`image/jpeg`、WebP→`image/webp`）；`Cache-Control: no-store`；
+- 文件名后缀与实际格式必须一致：`.png` 只能是 PNG，`.jpg/.jpeg` 只能是 JPEG，`.webp` 只能是 WebP；
+- 复用图片输入校验：单张最多 5MiB、最多 20,000,000 像素、拒绝多帧/动图；
+- 413：超过大小或像素上限；400：路径越出 workDir、不是文件、后缀不支持、内容损坏、后缀与实际格式不一致、多帧/动图、不存在或不可读；404：会话不存在；401：未认证；
+- 路径统一经 `fileBrowser.resolveInside()` 拘禁，禁止绝对路径和符号链接逃逸；
+- 前端必须使用带 `Authorization` 头的请求获取 Blob，禁止把 token 放进图片 URL。
 
 ### 3.18 POST /api/models/importPi —— 预览用户上传的 pi models.json（不写盘、不读盘）
 

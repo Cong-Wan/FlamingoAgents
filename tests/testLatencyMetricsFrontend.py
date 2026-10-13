@@ -1,11 +1,11 @@
 '''
 Author: wilbur
-Version: 2.1
+Version: 2.2
 Date: 2026-10-13
 Description: latencyUiFixPlan P1 前端 Node 单测——完整 vm 加载 chatView.js + 真实 statusUsage.js，覆盖：
              ①工具卡 Elapsed 回归折叠详情（默认隐藏、展开可见、不在卡片 root）；
              ②模型耗时一次性归属（纯工具轮 usageUpdate 不覆盖文字块脚标）；
-             ③边界（空白 delta / 无 timings 帧 / toolCallStart 清 dirty / retryNotice 复燃 / confirm 恢复不误画）；
+             ③边界（空白 delta / 无 timings 帧 / toolCallStart 清 dirty / retryNotice 复燃 / confirm 恢复不误画）；v2.2 同步 styles cache-bust 到 1.34。
              ④历史回放（纯工具 assistant 无模型脚标；孤儿 toolCallEnd 兜底卡显示 elapsed）；
              ⑤formatSpeedLine 两形态（TTFT/Output/TPS 与 TTFT—/Total/TPS—）。
              v2.0 替换 v1.0 的 extractFunction+eval 截取与恒真断言（复审 M3）。
@@ -655,7 +655,7 @@ function usagePayload(over) {
   // cache-bust 同步（latencyDisplayImplementationPlan §3.3/P2.8）
   const fs = require('fs');
   const indexSource = fs.readFileSync(process.argv[4], 'utf8');
-  assert.ok(indexSource.includes('href="/static/styles.css?v=1.33"'));
+  assert.ok(indexSource.includes('href="/static/styles.css?v=1.34"'));
   assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.33"'));
   assert.ok(indexSource.includes('src="/static/js/statusBar.js?v=1.11"'));
   assert.ok(indexSource.includes('src="/static/js/statusUsage.js?v=1.7"'));

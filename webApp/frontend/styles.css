@@ -1,8 +1,8 @@
 /*
 Author: wilbur
-Version: 1.33
+Version: 1.34
 Date: 2026-10-13
-Description: FlamingoAgents native Web styles. v1.25 用量页改为下拉筛选、四卡常驻、Provider 趋势卡与质量提示，删除会话表和 Chart.js 容器。v1.26（versionDisplayPlan §4.4）：新增 .login-version 与 .sidebar-version 版本号小字样式。v1.27：侧栏版本号移至顶部「新建会话」上方，字号 14px 与按钮同大。v1.28（latencyMetricsDisplayPlan T2.6）：新增 .tool-elapsed/.step-elapsed 耗时样式。v1.29（latencyUiFixPlan §A）：.tool-elapsed 适配 detail 内部（去横向 padding，避免双重内边距）。v1.30（thinkingPhaseMetricsPlan T4）：cache-bust 提版（样式无变更）。v1.31（thinkingBlockMetricsPlan）：新增 .thinking-elapsed（思考块下方兄弟行，折叠态可见）。v1.32（latencyDisplayImplementationPlan）：删 .step-elapsed（模型级 Elapsed）；新增 .tool-call-total/.total-elapsed；#statusSpeed 行随 HTML 删除。v1.33（assistantCardCopyPositionFix）：正文复制按钮定位到正文容器右上角，不占用思考卡片位置。
+Description: FlamingoAgents native Web styles. v1.25 用量页改为下拉筛选、四卡常驻、Provider 趋势卡与质量提示，删除会话表和 Chart.js 容器。v1.26（versionDisplayPlan §4.4）：新增 .login-version 与 .sidebar-version 版本号小字样式。v1.27：侧栏版本号移至顶部「新建会话」上方，字号 14px 与按钮同大。v1.28（latencyMetricsDisplayPlan T2.6）：新增 .tool-elapsed/.step-elapsed 耗时样式。v1.29（latencyUiFixPlan §A）：.tool-elapsed 适配 detail 内部（去横向 padding，避免双重内边距）。v1.30（thinkingPhaseMetricsPlan T4）：cache-bust 提版（样式无变更）。v1.31（thinkingBlockMetricsPlan）：新增 .thinking-elapsed（思考块下方兄弟行，折叠态可见）。v1.32（latencyDisplayImplementationPlan）：删 .step-elapsed（模型级 Elapsed）；新增 .tool-call-total/.total-elapsed；#statusSpeed 行随 HTML 删除。v1.33（assistantCardCopyPositionFix）：正文复制按钮定位到正文容器右上角，不占用思考卡片位置。v1.34（imageFilePreviewPlan）：新增工作区图片预览等比容器。
 */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -569,6 +569,11 @@ img.chat-empty-logo { width: 72px; height: 72px; border-radius: 50%; object-fit:
   font-family: "SF Mono", Menlo, Consolas, monospace; line-height: 1.55;
 }
 .preview-markdown { padding: 14px 18px; }
+.preview-image-wrap {
+  min-height: 100%; display: flex; align-items: center; justify-content: center;
+  padding: 16px; background: var(--gray-block);
+}
+.preview-image { max-width: 100%; max-height: calc(92vh - 140px); object-fit: contain; }
 .modal-title { font-size: 17px; margin-bottom: 16px; }
 .form-label { display: block; font-size: 13px; color: var(--text-dim); margin: 12px 0 5px; }
 .form-input {

@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.2
+Version: 1.3
 Date: 2026-10-13
-Description: 版本号前端静态断言（versionDisplayPlan §5 D2）：登录门与侧栏顶部容器存在、api.js 暴露 getVersion、main.js 启动填充且失败静默。v1.1：侧栏版本号从底部移到顶部「新建会话」上方，断言同步。v1.2：同步 styles cache-bust 到 1.33。
+Description: 版本号前端静态断言（versionDisplayPlan §5 D2）：登录门与侧栏顶部容器存在、api.js 暴露 getVersion、main.js 启动填充且失败静默。v1.1：侧栏版本号从底部移到顶部「新建会话」上方，断言同步。v1.2：同步 styles cache-bust 到 1.33。v1.3（imageFilePreviewPlan）：同步 styles 1.34 与 api 1.13。
 '''
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ def testIndexHasVersionContainers():
     topPos = index.index('class="sidebar-top"')
     assert sidebarStart < versionPos < topPos
     # 静态资源版本参数已递增（破缓存）
-    assert 'styles.css?v=1.33' in index
-    assert 'api.js?v=1.11' in index
+    assert 'styles.css?v=1.34' in index
+    assert 'api.js?v=1.13' in index
 
 
 def testApiExposesGetVersion():

@@ -1,7 +1,7 @@
 '''
 Author: wilbur
-Version: 1.5
-Date: 2026-09-08
+Version: 1.6
+Date: 2026-10-13
 Description: workDir 文件浏览纯函数层（迭代二方案 §3.8）：is_relative_to 路径拘禁、目录列举（目录在前、单条目 stat 失败跳过、
             截断标记）、文本文件读取（二进制校验）；OSError 统一转 RuntimeError 中文消息走 400 透传，不落 fallback 500。
             v1.1 取消 maxFileBytes 单文件大小限制，readTextFile 不再校验文件大小，listDir 中 attachable 始终为 true。
@@ -14,6 +14,7 @@ Description: workDir 文件浏览纯函数层（迭代二方案 §3.8）：is_re
             v1.4（fileMentionPathOnlyPlan）：buildAttachmentMessage 改为仅校验路径并输出真实绝对路径清单，不读正文、不解包、
             不递归目录；删除 expandDirAttachment 与个数/内容预算常量；readTextFile 预览行为不变。
             v1.5（imageInputPlan）：新增 isImageAttachment / readImageAttachment，@ 图片按扩展名识别并以单张 5MiB 上限读取；路径清单行为不变。
+            v1.6（imageFilePreviewPlan）：新增 readImageFile，供工作区图片预览读取 PNG/JPEG/WebP；要求路径拘禁、后缀与实际格式一致，并复用图片大小/像素/多帧校验。
 '''
 
 from __future__ import annotations
@@ -22,10 +23,11 @@ import json
 import os
 from pathlib import Path
 
-from flamingoAgents.core.imageInput import imageInputError, maxImageBytes
+from flamingoAgents.core.imageInput import imageInputError, maxImageBytes, validateImageBytes
 
 maxEntries = 500               # 目录单层列举上限
 imageSuffixes = {'.png', '.jpg', '.jpeg', '.webp'}
+imageSuffixFormats = {'.png': 'png', '.jpg': 'jpg', '.jpeg': 'jpg', '.webp': 'webp'}
 
 
 def resolveInside(workDir: str, relPath: str | None) -> Path:
@@ -106,6 +108,30 @@ def listAbsDirs(absPath: str) -> dict:
     names.sort(key=str.lower)
     truncated = len(names) > maxEntries
     return {'path': str(target), 'entries': [{'name': name, 'type': 'dir'} for name in names[:maxEntries]], 'truncated': truncated}
+
+
+def readImageFile(workDir: str, relPath: str) -> tuple[bytes, str]:
+    target = resolveInside(workDir, relPath)
+    suffix = Path(relPath).suffix.lower()
+    expectedFormat = imageSuffixFormats.get(suffix)
+    if expectedFormat is None:
+        raise RuntimeError(f'不是支持的图片文件：{relPath}')
+    try:
+        if not target.is_file():
+            raise RuntimeError(f'不是文件：{relPath}')
+        if target.stat().st_size > maxImageBytes:
+            raise imageInputError(
+                f'图片超过单张大小上限 {maxImageBytes // 1024 // 1024}MiB：{relPath}',
+                'imageBudgetExceeded',
+            )
+        raw = target.read_bytes()
+    except OSError as error:
+        raise RuntimeError(f'文件不存在或不可读：{relPath}（{error}）')
+    mimeType, _size = validateImageBytes(raw, relPath)
+    actualFormat = 'jpg' if mimeType == 'image/jpeg' else mimeType.removeprefix('image/')
+    if actualFormat != expectedFormat:
+        raise RuntimeError(f'图片内容与文件后缀不一致：{relPath}')
+    return raw, mimeType
 
 
 def isImageAttachment(item: dict) -> bool:
