@@ -1,11 +1,11 @@
 '''
 Author: wilbur
-Version: 1.10
+Version: 1.11
 Date: 2026-10-13
 Description: Node assert coverage for statusUsage helpers and statusBar/chatView deferred races. v1.6 同步 styles cache-bust 到 1.27（版本号功能）。v1.10 同步 styles cache-bust 到 1.34。
   v1.7（stopDrain409FixPlan T7）：chatView 收尾队列/stream-state 探针/409 有限退避用例；cache-bust 同步 chatView v1.25。
   v1.8（assistantCardCopyFix）：同步 chatView cache-bust 到 1.32。
-  v1.9（assistantCardCopyPositionFix）：同步 chatView/styles cache-bust 到 1.33。
+  v1.9（assistantCardCopyPositionFix）：同步 chatView/styles cache-bust 到 1.33。v1.11（assistantCardCopyIdleFix）：同步 chatView cache-bust 到 1.34。
 '''
 
 from __future__ import annotations
@@ -1095,7 +1095,7 @@ def testIndexCacheBustOrder() -> None:
     index = (rootPath / 'webApp/frontend/index.html').read_text(encoding='utf-8')
     usagePos = index.find('src="/static/js/statusUsage.js?v=1.7"')
     barPos = index.find('src="/static/js/statusBar.js?v=1.11"')
-    chatPos = index.find('src="/static/js/chatView.js?v=1.33"')
+    chatPos = index.find('src="/static/js/chatView.js?v=1.34"')
     stylesPos = index.find('href="/static/styles.css?v=1.34"')
     markdownPos = index.find('src="/static/js/markdown.js?v=1.3"')
     assert usagePos != -1 and barPos != -1 and chatPos != -1 and stylesPos != -1 and markdownPos != -1

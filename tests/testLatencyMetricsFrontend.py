@@ -1,6 +1,6 @@
 '''
 Author: wilbur
-Version: 2.2
+Version: 2.3
 Date: 2026-10-13
 Description: latencyUiFixPlan P1 前端 Node 单测——完整 vm 加载 chatView.js + 真实 statusUsage.js，覆盖：
              ①工具卡 Elapsed 回归折叠详情（默认隐藏、展开可见、不在卡片 root）；
@@ -10,6 +10,7 @@ Description: latencyUiFixPlan P1 前端 Node 单测——完整 vm 加载 chatVi
              ⑤formatSpeedLine 两形态（TTFT/Output/TPS 与 TTFT—/Total/TPS—）。
              v2.0 替换 v1.0 的 extractFunction+eval 截取与恒真断言（复审 M3）。
              v2.1：补充多 step 助手卡片均插入文字复制按钮的回归测试。
+             v2.3（assistantCardCopyIdleFix）：真实 innerHTML 渲染下，completed 后的 goIdle flush 不得清掉 copy。
 '''
 
 from __future__ import annotations
@@ -405,6 +406,20 @@ async function flushN(n) { for (let i = 0; i < n; i++) await flush(); }
   assert.deepStrictEqual(buttons.map(button => button._rawMarkdown), ['第一段回答', '第二段回答']);
   assert.strictEqual(buttons[0].textContent, 'copy', 'assistant copy button uses copy label');
   assert.strictEqual(buttons[0].parentNode.className, 'markdown-content', 'copy button belongs to response content');
+
+  // 复现真实 renderMarkdown：终态后 goIdle 的 flush 会 innerHTML 覆盖，不能清掉已挂上的 copy。
+  sandbox.renderMarkdown = function (el, text) { el.innerHTML = '<p>' + text + '</p>'; };
+  ids.composerInput.value = 'idle-flush';
+  ids.sendButton.click();
+  await flushN(4);
+  const idlePost = posts[1];
+  idlePost.onEvent('textDelta', { text: '回答结束' });
+  await flushN(2);
+  idlePost.onEvent('completed', { totalElapsedMs: 12 });
+  await flushN(6);
+  const idleButtons = sandbox.document.querySelectorAll('.msg-copy-btn');
+  assert.strictEqual(idleButtons.length, 3, 'completed idle flush keeps the new copy button');
+  assert.strictEqual(idleButtons[2]._rawMarkdown, '回答结束');
   console.log('multi-step assistant copy: ok');
 })().catch(error => { console.error(error); process.exit(1); });
 '''
@@ -656,11 +671,11 @@ function usagePayload(over) {
   const fs = require('fs');
   const indexSource = fs.readFileSync(process.argv[4], 'utf8');
   assert.ok(indexSource.includes('href="/static/styles.css?v=1.34"'));
-  assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.33"'));
+  assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.34"'));
   assert.ok(indexSource.includes('src="/static/js/statusBar.js?v=1.11"'));
   assert.ok(indexSource.includes('src="/static/js/statusUsage.js?v=1.7"'));
   const chatSource = fs.readFileSync(process.argv[1], 'utf8');
-  assert.ok(chatSource.includes('Version: 1.33'));
+  assert.ok(chatSource.includes('Version: 1.34'));
   const usageSource = fs.readFileSync(process.argv[2], 'utf8');
   assert.ok(usageSource.includes('Version: 1.7'));
   const barSource = fs.readFileSync(process.argv[3], 'utf8');

@@ -1,8 +1,8 @@
 <!--
 Author: wilbur
-Version: 1.35
+Version: 1.36
 Date: 2026-10-13
-Description: FlamingoAgents native Web UI shell. v1.23 用量页改为单一时间范围下拉框、四张汇总卡和 Provider 趋势图，删除会话表与 Chart.js。v1.24（versionDisplayPlan §4.4）：登录门与侧栏底部各加版本号容器，启动时经 /api/version 填充。v1.25：侧栏版本号从底部移到顶部「新建会话」上方，字号 14px 与新会话按钮同大。v1.26：模型设置脚本附版本号，确保思考强度 xhigh 更新后浏览器加载新脚本。v1.27（stopDrain409FixPlan T7）：chatView 收尾队列改标 ?v=1.25。v1.28（latencyMetricsDisplayPlan T2.5）：新增 #statusSpeed 速度行容器；statusUsage/statusBar/chatView/styles cache-bust 提版。v1.29（latencyUiFixPlan §C）：工具耗时回折叠详情，同步 chatView 1.28/statusBar 1.8/statusUsage 1.3/styles 1.29。v1.30（thinkingPhaseMetricsPlan T4）：思考阶段拆分，同步 chatView 1.29/statusBar 1.9/statusUsage 1.4/styles 1.30。v1.31（thinkingBlockMetricsPlan）：思考块独立耗时 + live TTFT，同步 chatView 1.30/statusBar 1.10/statusUsage 1.5/styles 1.31。v1.32（latencyDisplayImplementationPlan）：删除 #statusSpeed（TTFT/TPS 并入用量行），同步 chatView 1.31/statusBar 1.11/statusUsage 1.6/styles 1.32。v1.33（TPS 口径 v3）：statusUsage 1.7（分母 duration−ttfb，分子分母对称含思考）；styles 无变更。v1.33（assistantCardCopyFix）：同步 chatView 1.32，修复多 step 助手卡片复制按钮缺失。v1.34（assistantCardCopyPositionFix）：正文复制按钮移到思考卡片下方的正文右上角，文案改为 copy。v1.35（imageFilePreviewPlan）：同步 styles 1.34、api 1.13、fileExplorer 1.3 缓存版本。
+Description: FlamingoAgents native Web UI shell. v1.23 用量页改为单一时间范围下拉框、四张汇总卡和 Provider 趋势图，删除会话表与 Chart.js。v1.24（versionDisplayPlan §4.4）：登录门与侧栏底部各加版本号容器，启动时经 /api/version 填充。v1.25：侧栏版本号从底部移到顶部「新建会话」上方，字号 14px 与新会话按钮同大。v1.26：模型设置脚本附版本号，确保思考强度 xhigh 更新后浏览器加载新脚本。v1.27（stopDrain409FixPlan T7）：chatView 收尾队列改标 ?v=1.25。v1.28（latencyMetricsDisplayPlan T2.5）：新增 #statusSpeed 速度行容器；statusUsage/statusBar/chatView/styles cache-bust 提版。v1.29（latencyUiFixPlan §C）：工具耗时回折叠详情，同步 chatView 1.28/statusBar 1.8/statusUsage 1.3/styles 1.29。v1.30（thinkingPhaseMetricsPlan T4）：思考阶段拆分，同步 chatView 1.29/statusBar 1.9/statusUsage 1.4/styles 1.30。v1.31（thinkingBlockMetricsPlan）：思考块独立耗时 + live TTFT，同步 chatView 1.30/statusBar 1.10/statusUsage 1.5/styles 1.31。v1.32（latencyDisplayImplementationPlan）：删除 #statusSpeed（TTFT/TPS 并入用量行），同步 chatView 1.31/statusBar 1.11/statusUsage 1.6/styles 1.32。v1.33（TPS 口径 v3）：statusUsage 1.7（分母 duration−ttfb，分子分母对称含思考）；styles 无变更。v1.33（assistantCardCopyFix）：同步 chatView 1.32，修复多 step 助手卡片复制按钮缺失。v1.34（assistantCardCopyPositionFix）：正文复制按钮移到思考卡片下方的正文右上角，文案改为 copy。v1.35（imageFilePreviewPlan）：同步 styles 1.34、api 1.13、fileExplorer 1.3 缓存版本。v1.36（assistantCardCopyIdleFix）：同步 chatView 1.34，修复回答结束后 copy 被尾部重绘清掉。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -311,7 +311,7 @@ Description: FlamingoAgents native Web UI shell. v1.23 用量页改为单一时�
   <script src="/static/js/fileMention.js?v=1.5"></script>
   <script src="/static/js/fileExplorer.js?v=1.3"></script>
   <script src="/static/js/imageInput.js?v=1.2"></script>
-  <script src="/static/js/chatView.js?v=1.33"></script>
+  <script src="/static/js/chatView.js?v=1.34"></script>
   <script src="/static/js/subscriptionModels.js"></script>
   <script src="/static/js/settingsView.js?v=1.13"></script>
   <script src="/static/js/skillsView.js"></script>

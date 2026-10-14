@@ -1,6 +1,6 @@
 /*
 Author: wilbur
-Version: 1.33
+Version: 1.34
 Date: 2026-10-13
 Description: 聊天视图：历史渲染、流式增量、思维链折叠、工具卡片（含 dangling 归位/孤儿 End）、
              确认框、停止；完整落实契约 §5 前端状态机。v1.1：契约引用编号修正（pending 接口 §3.7→§3.8）。
@@ -71,7 +71,8 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
              （details.callElapsedMs，attach/历史同链路）；④最终 completed 后画 Total（帧携带 totalElapsedMs，与历史同值）；
              ⑤usageUpdate.timings 帧权威覆盖本地思考计时。
              v1.32（assistantCardCopyFix）：多 step 的已封口文字块在切换前执行终态渲染，确保每个助手卡片都有复制按钮。
-             v1.33（assistantCardCopyPositionFix）：正文复制按钮挂到 markdown 正文容器，位于思考卡片下方的正文右上角，按钮文案改为 copy。*/
+             v1.33（assistantCardCopyPositionFix）：正文复制按钮挂到 markdown 正文容器，位于思考卡片下方的正文右上角，按钮文案改为 copy。
+             v1.34（assistantCardCopyIdleFix）：goIdle 的尾部 flush 不再用 highlight:false 重绘已封口正文，避免 innerHTML 清掉 copy。*/
 (function () {
   'use strict';
 
@@ -679,8 +680,11 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
       step.live.thinkingContentEl.textContent = step.reasoningBuf;
     }
     if (step.textBuf) {
+      if (step.live.messageCopyEnabled) {
+        // 已终态封口后禁止再用 highlight:false 覆盖：renderMarkdown 会 innerHTML 清掉 copy。
+        return;
+      }
       window.renderMarkdown(step.live.contentEl, step.textBuf, { breaks: true, highlight: false });
-      if (step.live.messageCopyEnabled) attachMessageCopy(step.live.contentEl, step.textBuf);
     }
   }
 
@@ -719,6 +723,7 @@ Description: 聊天视图：历史渲染、流式增量、思维链折叠、工�
   // 终态高亮：只重渲 contentEl，不碰 bodyEl 上的 thinking / 工具卡 / retry / interrupted / inline error
   function renderFinal(step) {
     if (!step || !step.live || !step.live.contentEl || !step.textBuf) return;
+    step.paintScheduled = false; // 终态已落屏，作废尚未执行的 live rAF
     window.renderMarkdown(step.live.contentEl, step.textBuf, { breaks: true, highlight: true });
     step.live.messageCopyEnabled = true;
     attachMessageCopy(step.live.contentEl, step.textBuf);

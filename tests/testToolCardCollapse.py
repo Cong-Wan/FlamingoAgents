@@ -1,8 +1,8 @@
 '''
 Author: wilbur
-Version: 1.10
+Version: 1.11
 Date: 2026-10-13
-Description: Verifies tool collapse behavior/styles and cache-busted loading of the updated frontend assets. v1.6 同步 styles cache-bust 到 1.27（版本号功能）。v1.7 同步 chatView cache-bust 到 1.25（stopDrain409FixPlan T7）。v1.8（assistantCardCopyFix）同步 chatView cache-bust 到 1.32。v1.9（assistantCardCopyPositionFix）同步 chatView/styles cache-bust 到 1.33。v1.10（imageFilePreviewPlan）同步 styles cache-bust 到 1.34。
+Description: Verifies tool collapse behavior/styles and cache-busted loading of the updated frontend assets. v1.6 同步 styles cache-bust 到 1.27（版本号功能）。v1.7 同步 chatView cache-bust 到 1.25（stopDrain409FixPlan T7）。v1.8（assistantCardCopyFix）同步 chatView cache-bust 到 1.32。v1.9（assistantCardCopyPositionFix）同步 chatView/styles cache-bust 到 1.33。v1.10（imageFilePreviewPlan）同步 styles cache-bust 到 1.34。v1.11（assistantCardCopyIdleFix）同步 chatView cache-bust 到 1.34。
 '''
 
 from __future__ import annotations
@@ -158,7 +158,7 @@ assert.ok(toolPreRule && /line-height:\s*1\.55/.test(toolPreRule[1]));
 assert.ok(collapsedRule && /max-height:\s*320px/.test(collapsedRule[1]));
 assert.ok(collapsedRule && /overflow-y:\s*auto/.test(collapsedRule[1]));
 assert.ok(indexSource.includes('href="/static/styles.css?v=1.34"'));
-assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.33"'));
+assert.ok(indexSource.includes('src="/static/js/chatView.js?v=1.34"'));
 assert.ok(indexSource.includes('src="/static/js/markdown.js?v=1.3"'));
 console.log('tool card collapse: ok');
 '''
